@@ -1,4 +1,0 @@
-execution_env=fat
-section=[fat-vla]
-Task_no=TASK-2026-064
-mcap_path=D:\项目文件\MEB\MCAP文件\mcap_15

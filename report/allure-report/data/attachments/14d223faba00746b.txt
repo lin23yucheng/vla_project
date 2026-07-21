@@ -1,4 +1,0 @@
-mcap_dir=D:\项目文件\MEB\MCAP文件\mcap_15
-startTimeNs=1776150112601320964
-endTimeNs=1776150114616320964
-topics=['/sensor/camera_fisheye_l/color/image_raw', '/sensor/camera_fisheye_r/color/image_raw']

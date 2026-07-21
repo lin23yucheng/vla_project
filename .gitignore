@@ -15,6 +15,14 @@ venv/
 Log/*.log
 *.log
 
+# Generated artifacts / large data
+Log/
+report/
+parquet_file/
+image_compare/
+mcap_image/
+parquet_image/
+
 # OS files
 .DS_Store
 Thumbs.db
