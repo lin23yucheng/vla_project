@@ -67,6 +67,56 @@ def test_load_configured_topic_fields(tmp_path: Path):
     ]
 
 
+def test_load_configured_topic_fields_discovers_pose7d_topics(tmp_path: Path):
+    """未指定 topic 时，应从每个 section 的 pose7d 条目发现左右臂配置。"""
+    pose_fields = [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w",
+    ]
+    section_items = [
+        {
+            "name": "left_arm",
+            "group": "left",
+            "topic": "/jbt_arm_L/current_arm_tcp_pose",
+            "fields": pose_fields,
+            "parser": "pose7d",
+        },
+        {
+            "name": "left_gripper",
+            "group": "left",
+            "topic": "/gripper/gripper_l/data",
+            "fields": ["angle"],
+            "parser": "gripper",
+        },
+        {
+            "name": "right_arm",
+            "group": "right",
+            "topic": "/jbt_arm_R/current_arm_tcp_pose",
+            "fields": pose_fields,
+            "parser": "pose7d",
+        },
+    ]
+    config_path = tmp_path / "robot.json"
+    config_path.write_text(
+        json.dumps({"action": section_items, "observation_state": section_items}),
+        encoding="utf-8",
+    )
+
+    result = load_configured_topic_fields(config_path, topics=None)
+
+    assert [(item["section"], item["topic"]) for item in result] == [
+        ("action", "/jbt_arm_L/current_arm_tcp_pose"),
+        ("action", "/jbt_arm_R/current_arm_tcp_pose"),
+        ("observation_state", "/jbt_arm_L/current_arm_tcp_pose"),
+        ("observation_state", "/jbt_arm_R/current_arm_tcp_pose"),
+    ]
+
+
 def test_get_nested_field_value():
     """验证可通过点号路径从嵌套对象中正确读取属性值。"""
     assert get_nested_field_value(Message(), "pose.position.x") == 1.25

@@ -1,4 +1,4 @@
-"""从 Parquet 最近时间行提取 action/state 七维向量。"""
+"""从 Parquet 最近时间行提取 action/state 机器人向量。"""
 
 from pathlib import Path
 from typing import Any
@@ -7,19 +7,82 @@ import pyarrow.parquet as pq
 
 
 VECTOR_LABELS = ["x", "y", "z", "roll", "pitch", "yaw", "angle"]
-PARQUET_VECTOR_MAPPING = {
-    ("action", "left"): ("actions", 0),
-    ("action", "right"): ("actions", 7),
-    ("observation_state", "left"): ("state", 0),
-    ("observation_state", "right"): ("state", 7),
+PARQUET_SECTION_COLUMNS = {
+    "action": ("actions", "ac_display"),
+    "observation_state": ("state", "st_display"),
 }
+
+
+def _infer_display_group(field_name: str) -> str | None:
+    normalized = field_name.lower().replace("-", "_")
+    tokens = normalized.replace(".", "_").split("_")
+    if "left" in tokens or normalized.startswith("left"):
+        return "left"
+    if "right" in tokens or normalized.startswith("right"):
+        return "right"
+    return None
+
+
+def _build_group_layout(
+    source_vector: list[Any],
+    display_values: dict[str, Any],
+    section: str,
+    column: str,
+    display_column: str,
+) -> dict[str, dict[str, Any]]:
+    display_fields = list(display_values)
+    if len(display_fields) != len(source_vector):
+        raise ValueError(
+            f"parquet {column} 与 {display_column} 长度不一致: "
+            f"{len(source_vector)} != {len(display_fields)}"
+        )
+
+    grouped_fields: dict[str, dict[str, tuple[int, str]]] = {"left": {}, "right": {}}
+    for index, field_name in enumerate(display_fields):
+        group = _infer_display_group(field_name)
+        label = field_name.rsplit(".", 1)[-1].lower()
+        if group is None or label not in VECTOR_LABELS:
+            raise ValueError(f"无法识别 parquet {display_column} 字段: {field_name}")
+        if label in grouped_fields[group]:
+            raise ValueError(f"parquet {display_column} 中 {group}/{label} 字段重复")
+        grouped_fields[group][label] = (index, field_name)
+
+    missing_by_group = {
+        group: [label for label in VECTOR_LABELS if label not in fields_by_label]
+        for group, fields_by_label in grouped_fields.items()
+    }
+    if any(missing_by_group.values()):
+        missing_summary = ", ".join(
+            f"{group}缺少={missing}"
+            for group, missing in missing_by_group.items()
+            if missing
+        )
+        raise ValueError(
+            f"parquet 转换数据缺少 {section} 七维字段: {missing_summary}; "
+            f"{column}长度={len(source_vector)}, "
+            f"{display_column}字段={display_fields}"
+        )
+
+    layouts = {}
+    for group, fields_by_label in grouped_fields.items():
+        labels = list(VECTOR_LABELS)
+        indices = [fields_by_label[label][0] for label in labels]
+        field_names = [fields_by_label[label][1] for label in labels]
+        is_contiguous = indices == list(range(min(indices), max(indices) + 1))
+        layouts[group] = {
+            "labels": labels,
+            "indices": indices,
+            "field_names": field_names,
+            "slice": [min(indices), max(indices) + 1] if is_contiguous else None,
+        }
+    return layouts
 
 
 def extract_parquet_robot_vectors_at_time(
     parquet_path: str | Path,
     target_ns: int,
 ) -> dict[str, Any]:
-    """选择最近时间行，按左右各 7 维切分 actions 和 state。"""
+    """选择最近时间行，按 display 字段解析左右臂向量。"""
     parquet_file_path = Path(parquet_path)
     if not parquet_file_path.is_file():
         raise FileNotFoundError(f"parquet 文件不存在: {parquet_file_path}")
@@ -39,36 +102,53 @@ def extract_parquet_robot_vectors_at_time(
     matched_timestamp_ns = nearest_row["original_timestamp_ns"]
 
     vectors = []
-    for (section, group), (column, start_index) in PARQUET_VECTOR_MAPPING.items():
+    for section, (column, display_column) in PARQUET_SECTION_COLUMNS.items():
         source_vector = nearest_row.get(column)
-        if not isinstance(source_vector, list) or len(source_vector) < start_index + 7:
-            raise ValueError(f"parquet {column} 长度不足，无法提取 {section}/{group} 七维向量")
-        vector = [float(value) for value in source_vector[start_index:start_index + 7]]
-        display_column = "ac_display" if section == "action" else "st_display"
         display_values = nearest_row.get(display_column)
-        vectors.append(
-            {
-                "section": section,
-                "group": group,
-                "parquet_column": column,
-                "slice": [start_index, start_index + 7],
-                "vector_labels": VECTOR_LABELS,
-                "vector": vector,
-                "values_by_label": dict(zip(VECTOR_LABELS, vector)),
-                "display_column": display_column,
-                "display_values": display_values,
-                "target_ns": target_ns,
-                "matched_timestamp_ns": matched_timestamp_ns,
-                "diff_ns": abs(matched_timestamp_ns - target_ns),
-            }
-        )
+        if not isinstance(source_vector, list):
+            raise ValueError(f"parquet {column} 不是有效向量")
+        if not isinstance(display_values, dict):
+            raise ValueError(f"parquet {display_column} 不是有效字段映射")
 
+        layouts = _build_group_layout(
+            source_vector,
+            display_values,
+            section,
+            column,
+            display_column,
+        )
+        for group in ("left", "right"):
+            layout = layouts[group]
+            labels = layout["labels"]
+            vector = [float(source_vector[index]) for index in layout["indices"]]
+            vectors.append(
+                {
+                    "section": section,
+                    "group": group,
+                    "parquet_column": column,
+                    "slice": layout["slice"],
+                    "source_indices": layout["indices"],
+                    "vector_labels": labels,
+                    "missing_vector_labels": [label for label in VECTOR_LABELS if label not in labels],
+                    "vector": vector,
+                    "values_by_label": dict(zip(labels, vector)),
+                    "display_column": display_column,
+                    "display_fields": layout["field_names"],
+                    "display_values": display_values,
+                    "target_ns": target_ns,
+                    "matched_timestamp_ns": matched_timestamp_ns,
+                    "diff_ns": abs(matched_timestamp_ns - target_ns),
+                }
+            )
+
+    available_label_sets = {tuple(item["vector_labels"]) for item in vectors}
     return {
         "parquet_file": str(parquet_file_path),
         "target_ns": target_ns,
         "matched_timestamp_ns": matched_timestamp_ns,
         "diff_ns": abs(matched_timestamp_ns - target_ns),
-        "vector_labels": VECTOR_LABELS,
+        "vector_labels": list(next(iter(available_label_sets))) if len(available_label_sets) == 1 else None,
+        "expected_vector_labels": VECTOR_LABELS,
         "vectors": vectors,
     }
 
@@ -100,12 +180,27 @@ def compare_robot_vectors(
             raise ValueError(f"缺少向量，无法比较: section={key[0]}, group={key[1]}")
         mcap_item = mcap_vectors[key]
         parquet_item = parquet_vectors[key]
-        labels = mcap_item["vector_labels"]
-        if labels != parquet_item["vector_labels"]:
-            raise ValueError(f"向量标签不一致: {labels} != {parquet_item['vector_labels']}")
+        mcap_labels = mcap_item["vector_labels"]
+        parquet_labels = parquet_item["vector_labels"]
+        mcap_values = dict(zip(mcap_labels, mcap_item["vector"]))
+        parquet_values = dict(zip(parquet_labels, parquet_item["vector"]))
+        if len(mcap_values) != len(mcap_labels) or len(parquet_values) != len(parquet_labels):
+            raise ValueError(f"向量标签重复: {mcap_labels} / {parquet_labels}")
+        if len(mcap_labels) != len(mcap_item["vector"]) or len(parquet_labels) != len(parquet_item["vector"]):
+            raise ValueError("向量标签与数值长度不一致")
+
+        missing_in_parquet = [label for label in mcap_labels if label not in parquet_values]
+        extra_in_parquet = [label for label in parquet_labels if label not in mcap_values]
+        if missing_in_parquet or extra_in_parquet:
+            raise ValueError(
+                f"向量标签不一致: MCAP={mcap_labels}, Parquet={parquet_labels}, "
+                f"Parquet缺少={missing_in_parquet}, Parquet多出={extra_in_parquet}"
+            )
 
         dimensions = []
-        for label, mcap_value, parquet_value in zip(labels, mcap_item["vector"], parquet_item["vector"]):
+        for label in mcap_labels:
+            mcap_value = mcap_values[label]
+            parquet_value = parquet_values[label]
             difference = abs(float(mcap_value) - float(parquet_value))
             is_consistent = difference <= absolute_tolerance
             all_consistent = all_consistent and is_consistent

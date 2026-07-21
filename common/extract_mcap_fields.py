@@ -17,7 +17,7 @@ DEFAULT_MAX_TOLERANCE_NS = 3_000_000
 def load_configured_topic_fields(
     config_path: str | Path,
     sections: tuple[str, ...] = CONFIG_SECTIONS,
-    topics: tuple[str, ...] = POSE_TOPICS,
+    topics: tuple[str, ...] | None = POSE_TOPICS,
 ) -> list[dict[str, Any]]:
     """读取配置中指定 section/topic 的 fields 列表。"""
     config_file = Path(config_path)
@@ -33,7 +33,19 @@ def load_configured_topic_fields(
         if not isinstance(section_items, list):
             raise ValueError(f"机器人配置缺少 list 类型的 {section}")
 
-        for topic in topics:
+        section_topics = topics
+        if section_topics is None:
+            section_topics = tuple(
+                item.get("topic")
+                for item in section_items
+                if isinstance(item, dict)
+                and item.get("topic")
+                and (
+                    item.get("parser") == "pose7d"
+                    or len(item.get("fields", [])) == 7
+                )
+            )
+        for topic in section_topics:
             matching_items = [item for item in section_items if isinstance(item, dict) and item.get("topic") == topic]
             if len(matching_items) != 1:
                 raise ValueError(f"机器人配置 {section} 中 topic={topic} 应有且仅有一个条目，实际为 {len(matching_items)}")
@@ -363,25 +375,32 @@ def quaternion_to_euler_zyx(qx: float, qy: float, qz: float, qw: float) -> dict[
     return {"yaw": yaw, "pitch": pitch, "roll": roll}
 
 
-def _load_observation_gripper_entries(config_path: str | Path) -> dict[str, dict[str, Any]]:
+def _load_gripper_entries(config_path: str | Path) -> dict[tuple[str, str], dict[str, Any]]:
     with Path(config_path).open("r", encoding="utf-8") as file:
         config_data = json.load(file)
-    entries: dict[str, dict[str, Any]] = {}
-    for item in config_data.get("observation_state", []):
-        if not isinstance(item, dict) or item.get("fields") != ["angle"]:
-            continue
-        group = item.get("group")
-        topic = item.get("topic")
-        if group in {"left", "right"} and isinstance(topic, str):
-            entries[group] = {
-                "name": item.get("name"),
-                "group": group,
-                "topic": topic,
-                "fields": ["angle"],
-            }
-    missing_groups = [group for group in ("left", "right") if group not in entries]
-    if missing_groups:
-        raise ValueError(f"observation_state 缺少夹爪 angle 配置: {missing_groups}")
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for section in CONFIG_SECTIONS:
+        for item in config_data.get(section, []):
+            if not isinstance(item, dict) or item.get("fields") != ["angle"]:
+                continue
+            group = item.get("group")
+            topic = item.get("topic")
+            if group in {"left", "right"} and isinstance(topic, str):
+                entries[(section, group)] = {
+                    "section": section,
+                    "name": item.get("name"),
+                    "group": group,
+                    "topic": topic,
+                    "fields": ["angle"],
+                }
+    expected_keys = [
+        (section, group)
+        for section in CONFIG_SECTIONS
+        for group in ("left", "right")
+    ]
+    missing_keys = [key for key in expected_keys if key not in entries]
+    if missing_keys:
+        raise ValueError(f"机器人配置缺少夹爪 angle 配置: {missing_keys}")
     return entries
 
 
@@ -442,8 +461,11 @@ def extract_robot_vectors_at_time(
         raise ValueError("search_window_ns 不能小于 0")
     if max_tolerance_ns < 0:
         raise ValueError("max_tolerance_ns 不能小于 0")
-    pose_entries = load_configured_topic_fields(config_path)
-    gripper_entries = _load_observation_gripper_entries(config_path)
+    # Pose topics are configuration-specific.  The legacy default remains
+    # available for callers that explicitly request it, while robot-vector
+    # extraction follows the pose7d entries in the supplied JSON.
+    pose_entries = load_configured_topic_fields(config_path, topics=None)
+    gripper_entries = _load_gripper_entries(config_path)
     main_time_topic = _load_main_time_topic(config_path)
     mcap_root = Path(mcap_dir)
     if not mcap_root.is_dir():
@@ -509,9 +531,11 @@ def extract_robot_vectors_at_time(
     vector_labels = ["x", "y", "z", "roll", "pitch", "yaw", "angle"]
     vectors = []
     for pose_entry in pose_entries:
+        section = pose_entry["section"]
         group = pose_entry["group"]
-        if group not in gripper_entries:
-            raise ValueError(f"位姿配置缺少有效 group: {pose_entry}")
+        gripper_key = (section, group)
+        if gripper_key not in gripper_entries:
+            raise ValueError(f"位姿配置缺少对应夹爪配置: {pose_entry}")
         pose_neighbors = neighbors[pose_entry["topic"]]
         pose_strategy, pose_ratio, pose_first, pose_second = _resolve_interpolation(
             pose_neighbors, main_frame_ns, max_tolerance_ns
@@ -535,7 +559,7 @@ def extract_robot_vectors_at_time(
             pose_values["pose.orientation.w"],
         )
 
-        gripper_entry = gripper_entries[group]
+        gripper_entry = gripper_entries[gripper_key]
         gripper_neighbors = neighbors[gripper_entry["topic"]]
         gripper_strategy, gripper_ratio, gripper_first, gripper_second = _resolve_interpolation(
             gripper_neighbors, main_frame_ns, max_tolerance_ns
