@@ -23,6 +23,7 @@ from common.parse_parquet_file import extract_nearest_parquet_images, parse_parq
 from common.parquet_download_service import download_converted_parquet
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
+ROBOT_CONFIG_NAME = "夹爪手持构型.json"
 TASK_ANNOTATION_CONFIG = {
     "baseline_start_time_ns": 1776150106321320964,
     "baseline_end_time_ns": 1776150323218997544,
@@ -73,6 +74,44 @@ def load_task_context():
     mcap_path = config.get(section, "mcap_path", fallback="").strip()
 
     return execution_env, section, task_no, mcap_path
+
+
+def load_robot_config() -> tuple[Path, dict]:
+    """加载夹爪手持构型。"""
+    config_path = Path(__file__).resolve().parent.parent / "Robot_Configuration" / ROBOT_CONFIG_NAME
+    with config_path.open("r", encoding="utf-8") as file:
+        robot_config = json.load(file)
+    if not isinstance(robot_config, dict):
+        raise ValueError(f"机器人构型文件根节点必须是对象: {config_path}")
+    return config_path, robot_config
+
+
+def resolve_robot_topics(robot_config: dict) -> tuple[list[str], str]:
+    """从机器人构型中解析左右相机和主时间 topic。"""
+    cameras = robot_config.get("cameras")
+    if not isinstance(cameras, list):
+        raise ValueError("机器人构型中的 cameras 必须是列表")
+
+    topics_by_group = {}
+    for camera in cameras:
+        if not isinstance(camera, dict):
+            continue
+        group = str(camera.get("group", "")).strip().lower()
+        topic = camera.get("topic")
+        if group not in {"left", "right"} or not isinstance(topic, str) or not topic.strip():
+            continue
+        if group in topics_by_group:
+            raise ValueError(f"机器人构型中存在多个 group={group!r} 的相机 topic")
+        topics_by_group[group] = topic.strip()
+
+    missing_groups = [group for group in ("left", "right") if group not in topics_by_group]
+    if missing_groups:
+        raise ValueError(f"机器人构型缺少相机 topic: {', '.join(missing_groups)}")
+
+    main_time_topic = robot_config.get("main_time_topic")
+    if not isinstance(main_time_topic, str) or not main_time_topic.strip():
+        raise ValueError("机器人构型缺少有效的 main_time_topic")
+    return [topics_by_group["left"], topics_by_group["right"]], main_time_topic.strip()
 
 
 def generate_episode_snowflake_id():
@@ -170,14 +209,14 @@ def build_annotation_text_fields(segment_key: str) -> dict:
     return {"description": description, "prompt": description}
 
 
-def build_playback(current_sequence: int) -> dict:
+def build_playback(current_sequence: int, topic: str) -> dict:
     """由统一任务时间配置生成 playback 数据。"""
     baseline_start_time_ns, baseline_end_time_ns = _get_task_time_range_ns()
     timeline_duration_sec = (
         baseline_end_time_ns - baseline_start_time_ns
     ) / NANOSECONDS_PER_SECOND
     return {
-        "topic": "/sensor/camera_fisheye_r/color/image_raw",
+        "topic": topic,
         "gap_policy": "skip_on_playback",
         "current_sequence": current_sequence,
         "baseline_camera_key": "sensor_fisheye_r_color",
@@ -199,6 +238,8 @@ class TestV2Verify:
         """初始化接口封装实例与配置上下文。"""
         cls.api_all = all_api.ApiAll(global_client)
         cls.execution_env, cls.section, cls.task_no, cls.mcap_path = load_task_context()
+        cls.robot_config_path, cls.robot_config = load_robot_config()
+        cls.camera_topics, cls.main_time_topic = resolve_robot_topics(cls.robot_config)
         cls.task_name = None
         cls.task_status_label = None
         cls.workflow_mode = "normal"
@@ -394,10 +435,7 @@ class TestV2Verify:
         mcap_dir = Path(self.mcap_path)
         assert mcap_dir.exists(), f"配置中的 mcap_path 不存在: {mcap_dir}"
         assert mcap_dir.is_dir(), f"配置中的 mcap_path 不是文件夹: {mcap_dir}"
-        topics = [
-            "/sensor/camera_fisheye_l/color/image_raw",
-            "/sensor/camera_fisheye_r/color/image_raw",
-        ]
+        topics = self.camera_topics
         output_dir = Path(__file__).resolve().parent.parent / "mcap_image"
         allure.attach(
             f"mcap_dir={mcap_dir}\nstartTimeNs={start_time_ns}\nendTimeNs={end_time_ns}\ntopics={topics}",
@@ -584,7 +622,6 @@ class TestV2Verify:
         end_time_ns: int,
     ) -> dict:
         assertions.assert_is_not_none(self.mcap_path, f"配置文件未提供 mcap_path，无法执行步骤{workflow_step}")
-        config_path = Path(__file__).resolve().parent.parent / "Robot_Configuration" / "夹爪手持构型.json"
         results = {}
         for substep, time_key, time_label, target_ns in (
             (f"{workflow_step}.1", "start", "开始时间", start_time_ns),
@@ -592,7 +629,7 @@ class TestV2Verify:
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}MCAP七维向量"):
                 extract_result = extract_robot_vectors_at_time(
-                    config_path=config_path,
+                    config_path=self.robot_config_path,
                     mcap_dir=self.mcap_path,
                     target_ns=target_ns,
                 )
@@ -724,7 +761,13 @@ class TestV2Verify:
     def test_query_task_info(self):
         with allure.step("步骤1：查询任务列表"):
             allure.attach(
-                f"execution_env={self.execution_env}\nsection=[{self.section}]\nTask_no={self.task_no}\nmcap_path={self.mcap_path}",
+                f"execution_env={self.execution_env}\n"
+                f"section=[{self.section}]\n"
+                f"Task_no={self.task_no}\n"
+                f"mcap_path={self.mcap_path}\n"
+                f"robot_config={self.robot_config_path}\n"
+                f"camera_topics={self.camera_topics}\n"
+                f"main_time_topic={self.main_time_topic}",
                 name="前置配置上下文",
                 attachment_type=allure.attachment_type.TEXT,
             )
@@ -878,7 +921,7 @@ class TestV2Verify:
             ]
             TestV2Verify.l1_segment = segments[0]
 
-            playback = build_playback(current_sequence=1)
+            playback = build_playback(current_sequence=1, topic=self.main_time_topic)
             TestV2Verify.submit_playback = playback
 
             print(f"[步骤3] annotation_id: {annotation_id}")
@@ -946,7 +989,7 @@ class TestV2Verify:
             ]
             TestV2Verify.l2_segment_first = segments[0]
 
-            playback = build_playback(current_sequence=2)
+            playback = build_playback(current_sequence=2, topic=self.main_time_topic)
 
             print(f"[步骤4] annotation_id: {annotation_id}")
             print(f"[步骤4] tag_vocabulary(scene_tags): {tag_vocabulary}")
@@ -1014,7 +1057,7 @@ class TestV2Verify:
             ]
             TestV2Verify.l2_segment_second = segments[0]
 
-            playback = build_playback(current_sequence=2)
+            playback = build_playback(current_sequence=2, topic=self.main_time_topic)
 
             print(f"[步骤5] annotation_id: {annotation_id}")
             print(f"[步骤5] tag_vocabulary(scene_tags): {tag_vocabulary}")
