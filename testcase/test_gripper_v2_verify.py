@@ -19,7 +19,11 @@ from common.extract_mcap_image import extract_global_nearest_image_from_mcap_dir
 from common.extract_mcap_fields import extract_robot_vectors_at_time
 from common.image_compare import compare_images
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
-from common.parse_parquet_file import extract_nearest_parquet_images, parse_parquet_file
+from common.parse_parquet_file import (
+    compare_parquet_annotations,
+    extract_nearest_parquet_images,
+    parse_parquet_file,
+)
 from common.parquet_download_service import download_converted_parquet
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -267,6 +271,8 @@ class TestV2Verify:
         cls.step4_parquet_pose_field_extract_results = None
         cls.step5_pose_field_extract_results = None
         cls.step5_parquet_pose_field_extract_results = None
+        cls.submitted_annotation_json = None
+        cls.parquet_annotation_validation_result = None
         cls.image_output_dirs_prepared = False
 
     def _resolve_step3_start_time_ns(self) -> int:
@@ -329,6 +335,41 @@ class TestV2Verify:
             "endTimeNs",
             int(build_annotation_time_fields("l2_second")["endTimeNs"]),
         )
+
+    def _expected_annotation_layers(self) -> list[dict]:
+        if isinstance(self.submitted_annotation_json, dict):
+            layers = self.submitted_annotation_json.get("layers")
+            if isinstance(layers, list) and layers:
+                return layers
+
+        # 已转换任务会跳过标注步骤，使用本用例配置中的同一组标注期望值。
+        return [
+            {
+                "name": "L1 Episode",
+                "type": "episode",
+                "layerId": "l1",
+                "segments": [
+                    {
+                        "layerId": "l1",
+                        **build_annotation_text_fields("l1"),
+                        **build_annotation_time_fields("l1"),
+                    }
+                ],
+            },
+            {
+                "name": "L2 Detail",
+                "type": "detail",
+                "layerId": "l2",
+                "segments": [
+                    {
+                        "layerId": "l2",
+                        **build_annotation_text_fields(segment_key),
+                        **build_annotation_time_fields(segment_key),
+                    }
+                    for segment_key in ("l2_first", "l2_second")
+                ],
+            },
+        ]
 
     def _prepare_image_output_dirs_once(self):
         """首次进入图片提取步骤时，清空图片提取与比较输出目录。"""
@@ -1131,6 +1172,7 @@ class TestV2Verify:
                 "tagVocabulary": tag_vocabulary,
                 "episodeTimeUnit": "episode_sec",
             }
+            TestV2Verify.submitted_annotation_json = annotation_json
 
             submit_payload = {
                 "tag_vocabulary": tag_vocabulary,
@@ -1606,4 +1648,29 @@ class TestV2Verify:
                 annotation_key="step5",
                 annotation_label="步骤5标注",
                 workflow_step="29",
+            )
+
+    @pytest.mark.order(30)
+    @allure.story("步骤30：校验parquet中的L1/L2/L3标注数据")
+    def test_compare_parquet_annotations(self):
+        with allure.step("步骤30：解析parquet并与代码中提交的L1/L2/L3标注逐项对比"):
+            assertions.assert_is_not_none(self.downloaded_parquet_file, "未下载 parquet 文件")
+            expected_layers = self._expected_annotation_layers()
+            result = compare_parquet_annotations(
+                parquet_path=self.downloaded_parquet_file,
+                expected_layers=expected_layers,
+            )
+            TestV2Verify.parquet_annotation_validation_result = result
+            allure.attach(
+                json.dumps(expected_layers, ensure_ascii=False, indent=2),
+                name="步骤30-代码中的期望标注",
+                attachment_type=allure.attachment_type.JSON,
+            )
+            allure.attach(
+                json.dumps(result, ensure_ascii=False, indent=2),
+                name="步骤30-parquet标注校验结果",
+                attachment_type=allure.attachment_type.JSON,
+            )
+            assert result["is_consistent"], "parquet 标注数据与代码中提交的数据不一致:\n" + "\n".join(
+                result["failures"]
             )
