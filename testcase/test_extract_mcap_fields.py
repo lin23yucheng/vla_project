@@ -8,14 +8,18 @@ MCAP 字段提取功能单元测试。
 """
 
 import json
+import math
 from pathlib import Path
 
 import pytest
 
 from common.extract_mcap_fields import (
+    DEFAULT_MAX_TOLERANCE_NS,
     get_nested_field_value,
+    interpolate_pose7d,
     load_configured_topic_fields,
     quaternion_to_euler_zyx,
+    slerp_quaternion,
 )
 
 
@@ -81,3 +85,32 @@ def test_quaternion_to_euler_zyx_identity():
         "pitch": 0.0,
         "roll": 0.0,
     }
+
+
+def test_default_tolerance_is_three_milliseconds_in_nanoseconds():
+    """配置中的 3 ms 在纳秒时间轴上应换算为 3,000,000 ns。"""
+    assert DEFAULT_MAX_TOLERANCE_NS == 3_000_000
+
+
+def test_interpolate_pose7d_uses_linear_position_and_slerp():
+    """位置应线性插值，旋转应沿最短路径做球面线性插值。"""
+    result = interpolate_pose7d(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [10.0, 20.0, 30.0, 0.0, 0.0, 1.0, 0.0],
+        0.5,
+    )
+
+    assert result[:3] == pytest.approx([5.0, 10.0, 15.0])
+    euler = quaternion_to_euler_zyx(*result[3:])
+    assert euler == pytest.approx({"yaw": math.pi / 2.0, "pitch": 0.0, "roll": 0.0})
+
+
+def test_slerp_quaternion_treats_negated_quaternions_as_same_rotation():
+    """q 和 -q 表示同一旋转，插值不应绕远路。"""
+    result = slerp_quaternion(
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, -1.0],
+        0.5,
+    )
+
+    assert result == pytest.approx((0.0, 0.0, 0.0, 1.0))

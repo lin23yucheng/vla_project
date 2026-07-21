@@ -1,5 +1,5 @@
 """
-V2任务校验流程
+夹爪数据V2任务校验流程
 """
 
 import configparser
