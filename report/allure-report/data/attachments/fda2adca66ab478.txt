@@ -1,0 +1,31 @@
+{
+  "parquet_file": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_file\\TASK-2026-064_lerobot_v2.parquet",
+  "target_ns": 1776150112347320964,
+  "matched_row_index": 0,
+  "matched_timestamp_ns": 1776150112357746432,
+  "diff_ns": 10425468,
+  "used_nearest": true,
+  "image_columns": [
+    "wrist_image_left",
+    "wrist_image_right"
+  ],
+  "output_dir": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_image",
+  "saved_files": [
+    {
+      "column": "wrist_image_left",
+      "side": "left",
+      "row_path": "frame_000000.png",
+      "saved_path": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_image\\TASK-2026-064_parquet_left_target_1776150112347320964_matched_1776150112357746432_step3_start.png",
+      "decode_mode": "direct_image_bytes",
+      "bytes_length": 493636
+    },
+    {
+      "column": "wrist_image_right",
+      "side": "right",
+      "row_path": "frame_000000.png",
+      "saved_path": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_image\\TASK-2026-064_parquet_right_target_1776150112347320964_matched_1776150112357746432_step3_start.png",
+      "decode_mode": "direct_image_bytes",
+      "bytes_length": 487744
+    }
+  ]
+}

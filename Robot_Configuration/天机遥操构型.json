@@ -1,0 +1,221 @@
+{
+  "action": [
+    {
+      "name": "left_joint_states",
+      "role": "joint_state",
+      "dtype": "float32",
+      "group": "left",
+      "shape": [
+        7
+      ],
+      "topic": "/jbt_arm_L/current_arm_tcp_pose",
+      "fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "parser": "pose7d",
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "left_gripper",
+      "role": "gripper",
+      "dtype": "float32",
+      "group": "left",
+      "shape": [
+        1
+      ],
+      "topic": "/gripper/gripper_l/data",
+      "fields": [
+        "angle"
+      ],
+      "parser": "gripper",
+      "required": false,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "right_joint_states",
+      "role": "joint_state",
+      "dtype": "float32",
+      "group": "right",
+      "shape": [
+        7
+      ],
+      "topic": "/jbt_arm_R/current_arm_tcp_pose",
+      "fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "parser": "pose7d",
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "right_gripper",
+      "role": "gripper",
+      "dtype": "float32",
+      "group": "right",
+      "shape": [
+        1
+      ],
+      "topic": "/gripper/gripper_r/data",
+      "fields": [
+        "angle"
+      ],
+      "parser": "gripper",
+      "required": false,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    }
+  ],
+  "cameras": [
+    {
+      "key": "observation.images.left_eye",
+      "name": "left_eye",
+      "role": "image",
+      "group": "left",
+      "topic": "/camera/top_left/image_raw",
+      "encoding": "rgb",
+      "required": true,
+      "video_dir": "observation.images.left_eye",
+      "sync_policy": "3",
+      "output_video": true
+    },
+    {
+      "key": "observation.images.right_eye",
+      "name": "right_eye",
+      "role": "image",
+      "group": "right",
+      "topic": "/camera/top_right/image_raw",
+      "encoding": "rgb",
+      "required": true,
+      "video_dir": "observation.images.right_eye",
+      "sync_policy": "exact_frame",
+      "output_video": true
+    },
+    {
+      "key": "observation.images.left_wrist",
+      "name": "left_image",
+      "role": "image",
+      "group": "left",
+      "topic": "/camera/bottom_left/image_raw",
+      "encoding": "rgb",
+      "required": true,
+      "video_dir": "observation.images.left_wrist",
+      "sync_policy": "3",
+      "output_video": true
+    },
+    {
+      "key": "observation.images.right_wrist",
+      "name": "right_image",
+      "role": "image",
+      "group": "right",
+      "topic": "/camera/bottom_right/image_raw",
+      "encoding": "rgb",
+      "required": true,
+      "video_dir": "observation.images.right_wrist",
+      "sync_policy": "exact_frame",
+      "output_video": true
+    }
+  ],
+  "robot_name": "天机",
+  "robot_type": "dual_arm_gripper_v1",
+  "description": "双臂、双腕相机、双夹爪、末端位姿控制",
+  "schema_version": "2.0",
+  "main_time_topic": "/gripper/camera_fisheye_r/color/image_raw",
+  "observation_state": [
+    {
+      "name": "left_joint_states",
+      "role": "joint_state",
+      "dtype": "float32",
+      "group": "left",
+      "shape": [
+        7
+      ],
+      "topic": "/jbt_arm_L/current_arm_tcp_pose",
+      "fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "parser": "pose7d",
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "left_gripper",
+      "role": "gripper",
+      "dtype": "float32",
+      "group": "left",
+      "shape": [
+        1
+      ],
+      "topic": "/gripper/gripper_l/data",
+      "fields": [
+        "angle"
+      ],
+      "parser": "gripper",
+      "required": false,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "right_joint_states",
+      "role": "joint_state",
+      "dtype": "float32",
+      "group": "right",
+      "shape": [
+        7
+      ],
+      "topic": "/jbt_arm_R/current_arm_tcp_pose",
+      "fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "parser": "pose7d",
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    },
+    {
+      "name": "right_gripper",
+      "role": "gripper",
+      "dtype": "float32",
+      "group": "right",
+      "shape": [
+        1
+      ],
+      "topic": "/gripper/gripper_r/data",
+      "fields": [
+        "angle"
+      ],
+      "parser": "gripper",
+      "required": false,
+      "sync_policy": "3",
+      "missing_policy": "zero"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"file": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_file\\TASK-2026-064_lerobot_v2.parquet", "num_rows": 176, "num_columns": 31, "startTimeNs": 1776150112347320964, "endTimeNs": 1776150118194320964}

@@ -1,0 +1,303 @@
+{
+  "config_file": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\Robot_Configuration\\夹爪手持构型.json",
+  "mcap_dir": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15",
+  "target_ns": 1776150114616320964,
+  "search_window_ns": 1000000000,
+  "used_full_scan_fallback": false,
+  "scanned_messages": 900,
+  "vector_labels": [
+    "x",
+    "y",
+    "z",
+    "roll",
+    "pitch",
+    "yaw",
+    "angle"
+  ],
+  "vectors": [
+    {
+      "section": "action",
+      "group": "left",
+      "pose_topic": "/pika_pose_l",
+      "gripper_topic": "/sensor/gripper_l/data",
+      "pose_fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "gripper_fields": [
+        "angle"
+      ],
+      "raw_pose_values": {
+        "pose.position.x": -0.20431066944281193,
+        "pose.position.y": 0.2795135840523433,
+        "pose.position.z": -0.17511785252718698,
+        "pose.orientation.x": 0.4788718299442845,
+        "pose.orientation.y": 0.5177359064518559,
+        "pose.orientation.z": -0.4605627559100518,
+        "pose.orientation.w": 0.538992810271923
+      },
+      "euler_order": "ZYX",
+      "values_by_label": {
+        "x": -0.20431066944281193,
+        "y": 0.2795135840523433,
+        "z": -0.17511785252718698,
+        "yaw": -0.015674458960498665,
+        "pitch": 1.5311180853431345,
+        "roll": 1.4377372677060574,
+        "angle": 0.41
+      },
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.20431066944281193,
+        0.2795135840523433,
+        -0.17511785252718698,
+        1.4377372677060574,
+        1.5311180853431345,
+        -0.015674458960498665,
+        0.41
+      ],
+      "pose_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/pika_pose_l",
+        "schema_name": "geometry_msgs/msg/PoseStamped",
+        "matched_publish_ns": 1776150114617027168,
+        "matched_log_ns": 1776150114617027168,
+        "diff_ns": 706204
+      },
+      "gripper_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/sensor/gripper_l/data",
+        "schema_name": "data_msgs/msg/Gripper",
+        "matched_publish_ns": 1776150114617010539,
+        "matched_log_ns": 1776150114617010539,
+        "diff_ns": 689575
+      }
+    },
+    {
+      "section": "action",
+      "group": "right",
+      "pose_topic": "/pika_pose_r",
+      "gripper_topic": "/sensor/gripper_r/data",
+      "pose_fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "gripper_fields": [
+        "angle"
+      ],
+      "raw_pose_values": {
+        "pose.position.x": -0.09400177499332536,
+        "pose.position.y": -0.08972281313227592,
+        "pose.position.z": -0.02027194842068661,
+        "pose.orientation.x": -0.03139322932619314,
+        "pose.orientation.y": 0.6493080557654618,
+        "pose.orientation.z": 0.11990435158329689,
+        "pose.orientation.w": 0.7503575549975747
+      },
+      "euler_order": "ZYX",
+      "values_by_label": {
+        "x": -0.09400177499332536,
+        "y": -0.08972281313227592,
+        "z": -0.02027194842068661,
+        "yaw": 0.8270273828222973,
+        "pitch": 1.3805346417270976,
+        "roll": 0.6116725281326514,
+        "angle": 1.67
+      },
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.09400177499332536,
+        -0.08972281313227592,
+        -0.02027194842068661,
+        0.6116725281326514,
+        1.3805346417270976,
+        0.8270273828222973,
+        1.67
+      ],
+      "pose_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/pika_pose_r",
+        "schema_name": "geometry_msgs/msg/PoseStamped",
+        "matched_publish_ns": 1776150114617080729,
+        "matched_log_ns": 1776150114617080729,
+        "diff_ns": 759765
+      },
+      "gripper_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/sensor/gripper_r/data",
+        "schema_name": "data_msgs/msg/Gripper",
+        "matched_publish_ns": 1776150114616991838,
+        "matched_log_ns": 1776150114616991838,
+        "diff_ns": 670874
+      }
+    },
+    {
+      "section": "observation_state",
+      "group": "left",
+      "pose_topic": "/pika_pose_l",
+      "gripper_topic": "/sensor/gripper_l/data",
+      "pose_fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "gripper_fields": [
+        "angle"
+      ],
+      "raw_pose_values": {
+        "pose.position.x": -0.20431066944281193,
+        "pose.position.y": 0.2795135840523433,
+        "pose.position.z": -0.17511785252718698,
+        "pose.orientation.x": 0.4788718299442845,
+        "pose.orientation.y": 0.5177359064518559,
+        "pose.orientation.z": -0.4605627559100518,
+        "pose.orientation.w": 0.538992810271923
+      },
+      "euler_order": "ZYX",
+      "values_by_label": {
+        "x": -0.20431066944281193,
+        "y": 0.2795135840523433,
+        "z": -0.17511785252718698,
+        "yaw": -0.015674458960498665,
+        "pitch": 1.5311180853431345,
+        "roll": 1.4377372677060574,
+        "angle": 0.41
+      },
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.20431066944281193,
+        0.2795135840523433,
+        -0.17511785252718698,
+        1.4377372677060574,
+        1.5311180853431345,
+        -0.015674458960498665,
+        0.41
+      ],
+      "pose_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/pika_pose_l",
+        "schema_name": "geometry_msgs/msg/PoseStamped",
+        "matched_publish_ns": 1776150114617027168,
+        "matched_log_ns": 1776150114617027168,
+        "diff_ns": 706204
+      },
+      "gripper_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/sensor/gripper_l/data",
+        "schema_name": "data_msgs/msg/Gripper",
+        "matched_publish_ns": 1776150114617010539,
+        "matched_log_ns": 1776150114617010539,
+        "diff_ns": 689575
+      }
+    },
+    {
+      "section": "observation_state",
+      "group": "right",
+      "pose_topic": "/pika_pose_r",
+      "gripper_topic": "/sensor/gripper_r/data",
+      "pose_fields": [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w"
+      ],
+      "gripper_fields": [
+        "angle"
+      ],
+      "raw_pose_values": {
+        "pose.position.x": -0.09400177499332536,
+        "pose.position.y": -0.08972281313227592,
+        "pose.position.z": -0.02027194842068661,
+        "pose.orientation.x": -0.03139322932619314,
+        "pose.orientation.y": 0.6493080557654618,
+        "pose.orientation.z": 0.11990435158329689,
+        "pose.orientation.w": 0.7503575549975747
+      },
+      "euler_order": "ZYX",
+      "values_by_label": {
+        "x": -0.09400177499332536,
+        "y": -0.08972281313227592,
+        "z": -0.02027194842068661,
+        "yaw": 0.8270273828222973,
+        "pitch": 1.3805346417270976,
+        "roll": 0.6116725281326514,
+        "angle": 1.67
+      },
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.09400177499332536,
+        -0.08972281313227592,
+        -0.02027194842068661,
+        0.6116725281326514,
+        1.3805346417270976,
+        0.8270273828222973,
+        1.67
+      ],
+      "pose_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/pika_pose_r",
+        "schema_name": "geometry_msgs/msg/PoseStamped",
+        "matched_publish_ns": 1776150114617080729,
+        "matched_log_ns": 1776150114617080729,
+        "diff_ns": 759765
+      },
+      "gripper_match": {
+        "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+        "topic": "/sensor/gripper_r/data",
+        "schema_name": "data_msgs/msg/Gripper",
+        "matched_publish_ns": 1776150114616991838,
+        "matched_log_ns": 1776150114616991838,
+        "diff_ns": 670874
+      }
+    }
+  ]
+}

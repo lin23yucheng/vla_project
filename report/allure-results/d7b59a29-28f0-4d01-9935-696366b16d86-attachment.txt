@@ -1,0 +1,47 @@
+{
+  "mcap_dir": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15",
+  "target_ns": 1776150114616320964,
+  "topics": [
+    "/sensor/camera_fisheye_l/color/image_raw",
+    "/sensor/camera_fisheye_r/color/image_raw"
+  ],
+  "output_dir": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\mcap_image",
+  "scanned_messages": 353816,
+  "results": [
+    {
+      "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+      "topic_name": "/sensor/camera_fisheye_l/color/image_raw",
+      "side": "left",
+      "target_ns": 1776150114616320964,
+      "matched_ns": 1776150114623702588,
+      "diff_ns": 7381624,
+      "topic_message_count": 6508,
+      "saved_paths": [
+        "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\mcap_image\\TASK-2026-064_mcap_left_target_1776150114616320964_matched_1776150114623702588_step5_start.png"
+      ],
+      "preview_path": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\mcap_image\\TASK-2026-064_mcap_left_target_1776150114616320964_matched_1776150114623702588_step5_start.png",
+      "preview_error": null,
+      "encoding": "bgr8",
+      "width": 640,
+      "height": 480
+    },
+    {
+      "mcap_file": "D:\\项目文件\\MEB\\MCAP文件\\mcap_15\\EPLAL1_0_part_01.mcap",
+      "topic_name": "/sensor/camera_fisheye_r/color/image_raw",
+      "side": "right",
+      "target_ns": 1776150114616320964,
+      "matched_ns": 1776150114622019816,
+      "diff_ns": 5698852,
+      "topic_message_count": 6508,
+      "saved_paths": [
+        "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\mcap_image\\TASK-2026-064_mcap_right_target_1776150114616320964_matched_1776150114622019816_step5_start.png"
+      ],
+      "preview_path": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\mcap_image\\TASK-2026-064_mcap_right_target_1776150114616320964_matched_1776150114622019816_step5_start.png",
+      "preview_error": null,
+      "encoding": "bgr8",
+      "width": 640,
+      "height": 480
+    }
+  ],
+  "errors": []
+}

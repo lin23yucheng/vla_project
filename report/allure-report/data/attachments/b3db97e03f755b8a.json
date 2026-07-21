@@ -1,0 +1,241 @@
+{
+  "parquet_file": "C:\\Users\\admin\\PycharmProjects\\VLA_Project\\parquet_file\\TASK-2026-064_lerobot_v2.parquet",
+  "target_ns": 1776150114616320964,
+  "matched_timestamp_ns": 1776150114622019840,
+  "diff_ns": 5698876,
+  "vector_labels": [
+    "x",
+    "y",
+    "z",
+    "roll",
+    "pitch",
+    "yaw",
+    "angle"
+  ],
+  "vectors": [
+    {
+      "section": "action",
+      "group": "left",
+      "parquet_column": "actions",
+      "slice": [
+        0,
+        7
+      ],
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.20431067049503326,
+        0.2795135974884033,
+        -0.1751178503036499,
+        1.4377365112304688,
+        1.5311181545257568,
+        -0.015676524490118027,
+        0.4050920903682709
+      ],
+      "values_by_label": {
+        "x": -0.20431067049503326,
+        "y": 0.2795135974884033,
+        "z": -0.1751178503036499,
+        "roll": 1.4377365112304688,
+        "pitch": 1.5311181545257568,
+        "yaw": -0.015676524490118027,
+        "angle": 0.4050920903682709
+      },
+      "display_column": "ac_display",
+      "display_values": {
+        "left_pose.x": -0.20431067049503326,
+        "left_pose.y": 0.2795135974884033,
+        "left_pose.z": -0.1751178503036499,
+        "left_pose.roll": 1.4377365112304688,
+        "left_pose.pitch": 1.5311181545257568,
+        "left_pose.yaw": -0.015676524490118027,
+        "left_gripper.angle": 0.4050920903682709,
+        "right_pose.x": -0.0939442366361618,
+        "right_pose.y": -0.08975282311439514,
+        "right_pose.z": -0.020304270088672638,
+        "right_pose.roll": 0.6115906834602356,
+        "right_pose.pitch": 1.380458950996399,
+        "right_pose.yaw": 0.826840877532959,
+        "right_gripper.angle": 1.6699999570846558
+      },
+      "target_ns": 1776150114616320964,
+      "matched_timestamp_ns": 1776150114622019840,
+      "diff_ns": 5698876
+    },
+    {
+      "section": "action",
+      "group": "right",
+      "parquet_column": "actions",
+      "slice": [
+        7,
+        14
+      ],
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.0939442366361618,
+        -0.08975282311439514,
+        -0.020304270088672638,
+        0.6115906834602356,
+        1.380458950996399,
+        0.826840877532959,
+        1.6699999570846558
+      ],
+      "values_by_label": {
+        "x": -0.0939442366361618,
+        "y": -0.08975282311439514,
+        "z": -0.020304270088672638,
+        "roll": 0.6115906834602356,
+        "pitch": 1.380458950996399,
+        "yaw": 0.826840877532959,
+        "angle": 1.6699999570846558
+      },
+      "display_column": "ac_display",
+      "display_values": {
+        "left_pose.x": -0.20431067049503326,
+        "left_pose.y": 0.2795135974884033,
+        "left_pose.z": -0.1751178503036499,
+        "left_pose.roll": 1.4377365112304688,
+        "left_pose.pitch": 1.5311181545257568,
+        "left_pose.yaw": -0.015676524490118027,
+        "left_gripper.angle": 0.4050920903682709,
+        "right_pose.x": -0.0939442366361618,
+        "right_pose.y": -0.08975282311439514,
+        "right_pose.z": -0.020304270088672638,
+        "right_pose.roll": 0.6115906834602356,
+        "right_pose.pitch": 1.380458950996399,
+        "right_pose.yaw": 0.826840877532959,
+        "right_gripper.angle": 1.6699999570846558
+      },
+      "target_ns": 1776150114616320964,
+      "matched_timestamp_ns": 1776150114622019840,
+      "diff_ns": 5698876
+    },
+    {
+      "section": "observation_state",
+      "group": "left",
+      "parquet_column": "state",
+      "slice": [
+        0,
+        7
+      ],
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.20431067049503326,
+        0.2795135974884033,
+        -0.1751178503036499,
+        1.4377365112304688,
+        1.5311181545257568,
+        -0.015676524490118027,
+        0.4050920903682709
+      ],
+      "values_by_label": {
+        "x": -0.20431067049503326,
+        "y": 0.2795135974884033,
+        "z": -0.1751178503036499,
+        "roll": 1.4377365112304688,
+        "pitch": 1.5311181545257568,
+        "yaw": -0.015676524490118027,
+        "angle": 0.4050920903682709
+      },
+      "display_column": "st_display",
+      "display_values": {
+        "left_joint_states.x": -0.20431067049503326,
+        "left_joint_states.y": 0.2795135974884033,
+        "left_joint_states.z": -0.1751178503036499,
+        "left_joint_states.roll": 1.4377365112304688,
+        "left_joint_states.pitch": 1.5311181545257568,
+        "left_joint_states.yaw": -0.015676524490118027,
+        "left_gripper.angle": 0.4050920903682709,
+        "right_joint_states.x": -0.0939442366361618,
+        "right_joint_states.y": -0.08975282311439514,
+        "right_joint_states.z": -0.020304270088672638,
+        "right_joint_states.roll": 0.6115906834602356,
+        "right_joint_states.pitch": 1.380458950996399,
+        "right_joint_states.yaw": 0.826840877532959,
+        "right_gripper.angle": 1.6699999570846558
+      },
+      "target_ns": 1776150114616320964,
+      "matched_timestamp_ns": 1776150114622019840,
+      "diff_ns": 5698876
+    },
+    {
+      "section": "observation_state",
+      "group": "right",
+      "parquet_column": "state",
+      "slice": [
+        7,
+        14
+      ],
+      "vector_labels": [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "angle"
+      ],
+      "vector": [
+        -0.0939442366361618,
+        -0.08975282311439514,
+        -0.020304270088672638,
+        0.6115906834602356,
+        1.380458950996399,
+        0.826840877532959,
+        1.6699999570846558
+      ],
+      "values_by_label": {
+        "x": -0.0939442366361618,
+        "y": -0.08975282311439514,
+        "z": -0.020304270088672638,
+        "roll": 0.6115906834602356,
+        "pitch": 1.380458950996399,
+        "yaw": 0.826840877532959,
+        "angle": 1.6699999570846558
+      },
+      "display_column": "st_display",
+      "display_values": {
+        "left_joint_states.x": -0.20431067049503326,
+        "left_joint_states.y": 0.2795135974884033,
+        "left_joint_states.z": -0.1751178503036499,
+        "left_joint_states.roll": 1.4377365112304688,
+        "left_joint_states.pitch": 1.5311181545257568,
+        "left_joint_states.yaw": -0.015676524490118027,
+        "left_gripper.angle": 0.4050920903682709,
+        "right_joint_states.x": -0.0939442366361618,
+        "right_joint_states.y": -0.08975282311439514,
+        "right_joint_states.z": -0.020304270088672638,
+        "right_joint_states.roll": 0.6115906834602356,
+        "right_joint_states.pitch": 1.380458950996399,
+        "right_joint_states.yaw": 0.826840877532959,
+        "right_gripper.angle": 1.6699999570846558
+      },
+      "target_ns": 1776150114616320964,
+      "matched_timestamp_ns": 1776150114622019840,
+      "diff_ns": 5698876
+    }
+  ]
+}

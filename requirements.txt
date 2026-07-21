@@ -1,0 +1,21 @@
+# 数据与图像处理
+mcap==1.4.0
+mcap-ros2-support==0.5.7
+numpy==2.2.6
+Pillow==12.3.0
+pyarrow==25.0.0
+
+# 测试框架
+allure-pytest==2.16.0
+allure-python-commons==2.16.0
+pytest==9.1.1
+pytest-html==4.2.0
+pytest-order==1.5.0
+pytest-random-order==1.2.0
+pytest-xdist==3.8.0
+
+# HTTP 请求
+requests==2.34.2
+urllib3==2.7.0
+charset-normalizer==3.4.9
+idna==3.18

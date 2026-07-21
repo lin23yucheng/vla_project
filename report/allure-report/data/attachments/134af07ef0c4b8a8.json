@@ -1,0 +1,239 @@
+{
+  "is_consistent": false,
+  "absolute_tolerance": 1e-05,
+  "vector_labels": [
+    "x",
+    "y",
+    "z",
+    "roll",
+    "pitch",
+    "yaw",
+    "angle"
+  ],
+  "comparisons": [
+    {
+      "section": "action",
+      "group": "left",
+      "is_consistent": false,
+      "dimensions": [
+        {
+          "label": "x",
+          "mcap_value": -0.31440413204744794,
+          "parquet_value": -0.31451672315597534,
+          "absolute_difference": 0.0001125911085274045,
+          "is_consistent": false
+        },
+        {
+          "label": "y",
+          "mcap_value": 0.4405530057453229,
+          "parquet_value": 0.43949568271636963,
+          "absolute_difference": 0.0010573230289532831,
+          "is_consistent": false
+        },
+        {
+          "label": "z",
+          "mcap_value": -0.026278875093803694,
+          "parquet_value": -0.02639855071902275,
+          "absolute_difference": 0.00011967562521905672,
+          "is_consistent": false
+        },
+        {
+          "label": "roll",
+          "mcap_value": -0.2129272498416027,
+          "parquet_value": -0.2376558482646942,
+          "absolute_difference": 0.024728598423091525,
+          "is_consistent": false
+        },
+        {
+          "label": "pitch",
+          "mcap_value": 1.405439280998188,
+          "parquet_value": 1.4058196544647217,
+          "absolute_difference": 0.0003803734665337455,
+          "is_consistent": false
+        },
+        {
+          "label": "yaw",
+          "mcap_value": 0.38277709791257575,
+          "parquet_value": 0.3559747338294983,
+          "absolute_difference": 0.026802364083077457,
+          "is_consistent": false
+        },
+        {
+          "label": "angle",
+          "mcap_value": 1.67,
+          "parquet_value": 1.6699999570846558,
+          "absolute_difference": 4.2915344167226976e-08,
+          "is_consistent": true
+        }
+      ]
+    },
+    {
+      "section": "action",
+      "group": "right",
+      "is_consistent": false,
+      "dimensions": [
+        {
+          "label": "x",
+          "mcap_value": 0.0023302062421918165,
+          "parquet_value": 0.0011212137760594487,
+          "absolute_difference": 0.0012089924661323678,
+          "is_consistent": false
+        },
+        {
+          "label": "y",
+          "mcap_value": -0.09419143630555728,
+          "parquet_value": -0.09356296807527542,
+          "absolute_difference": 0.0006284682302818562,
+          "is_consistent": false
+        },
+        {
+          "label": "z",
+          "mcap_value": 0.00999290569904443,
+          "parquet_value": 0.009436514228582382,
+          "absolute_difference": 0.0005563914704620476,
+          "is_consistent": false
+        },
+        {
+          "label": "roll",
+          "mcap_value": 0.13862615185458182,
+          "parquet_value": 0.22040683031082153,
+          "absolute_difference": 0.08178067845623971,
+          "is_consistent": false
+        },
+        {
+          "label": "pitch",
+          "mcap_value": 1.308989239865117,
+          "parquet_value": 1.311293363571167,
+          "absolute_difference": 0.002304123706049932,
+          "is_consistent": false
+        },
+        {
+          "label": "yaw",
+          "mcap_value": 0.5214520780292483,
+          "parquet_value": 0.5918070077896118,
+          "absolute_difference": 0.0703549297603635,
+          "is_consistent": false
+        },
+        {
+          "label": "angle",
+          "mcap_value": 1.67,
+          "parquet_value": 1.6699999570846558,
+          "absolute_difference": 4.2915344167226976e-08,
+          "is_consistent": true
+        }
+      ]
+    },
+    {
+      "section": "observation_state",
+      "group": "left",
+      "is_consistent": false,
+      "dimensions": [
+        {
+          "label": "x",
+          "mcap_value": -0.31440413204744794,
+          "parquet_value": -0.31451672315597534,
+          "absolute_difference": 0.0001125911085274045,
+          "is_consistent": false
+        },
+        {
+          "label": "y",
+          "mcap_value": 0.4405530057453229,
+          "parquet_value": 0.43949568271636963,
+          "absolute_difference": 0.0010573230289532831,
+          "is_consistent": false
+        },
+        {
+          "label": "z",
+          "mcap_value": -0.026278875093803694,
+          "parquet_value": -0.02639855071902275,
+          "absolute_difference": 0.00011967562521905672,
+          "is_consistent": false
+        },
+        {
+          "label": "roll",
+          "mcap_value": -0.2129272498416027,
+          "parquet_value": -0.2376558482646942,
+          "absolute_difference": 0.024728598423091525,
+          "is_consistent": false
+        },
+        {
+          "label": "pitch",
+          "mcap_value": 1.405439280998188,
+          "parquet_value": 1.4058196544647217,
+          "absolute_difference": 0.0003803734665337455,
+          "is_consistent": false
+        },
+        {
+          "label": "yaw",
+          "mcap_value": 0.38277709791257575,
+          "parquet_value": 0.3559747338294983,
+          "absolute_difference": 0.026802364083077457,
+          "is_consistent": false
+        },
+        {
+          "label": "angle",
+          "mcap_value": 1.67,
+          "parquet_value": 1.6699999570846558,
+          "absolute_difference": 4.2915344167226976e-08,
+          "is_consistent": true
+        }
+      ]
+    },
+    {
+      "section": "observation_state",
+      "group": "right",
+      "is_consistent": false,
+      "dimensions": [
+        {
+          "label": "x",
+          "mcap_value": 0.0023302062421918165,
+          "parquet_value": 0.0011212137760594487,
+          "absolute_difference": 0.0012089924661323678,
+          "is_consistent": false
+        },
+        {
+          "label": "y",
+          "mcap_value": -0.09419143630555728,
+          "parquet_value": -0.09356296807527542,
+          "absolute_difference": 0.0006284682302818562,
+          "is_consistent": false
+        },
+        {
+          "label": "z",
+          "mcap_value": 0.00999290569904443,
+          "parquet_value": 0.009436514228582382,
+          "absolute_difference": 0.0005563914704620476,
+          "is_consistent": false
+        },
+        {
+          "label": "roll",
+          "mcap_value": 0.13862615185458182,
+          "parquet_value": 0.22040683031082153,
+          "absolute_difference": 0.08178067845623971,
+          "is_consistent": false
+        },
+        {
+          "label": "pitch",
+          "mcap_value": 1.308989239865117,
+          "parquet_value": 1.311293363571167,
+          "absolute_difference": 0.002304123706049932,
+          "is_consistent": false
+        },
+        {
+          "label": "yaw",
+          "mcap_value": 0.5214520780292483,
+          "parquet_value": 0.5918070077896118,
+          "absolute_difference": 0.0703549297603635,
+          "is_consistent": false
+        },
+        {
+          "label": "angle",
+          "mcap_value": 1.67,
+          "parquet_value": 1.6699999570846558,
+          "absolute_difference": 4.2915344167226976e-08,
+          "is_consistent": true
+        }
+      ]
+    }
+  ]
+}
