@@ -22,6 +22,29 @@ from common.extract_parquet_fields import compare_robot_vectors, extract_parquet
 from common.parse_parquet_file import extract_nearest_parquet_images, parse_parquet_file
 from common.parquet_download_service import download_converted_parquet
 
+NANOSECONDS_PER_SECOND = 1_000_000_000
+TASK_ANNOTATION_CONFIG = {
+    "baseline_start_time_ns": 1776150106321320964,
+    "baseline_end_time_ns": 1776150323218997544,
+    "segments": {
+        "l1": {
+            "description": "拿笔放笔",
+            "startTimeNs": 1776150112347320964,
+            "endTimeNs": 1776150118194320964,
+        },
+        "l2_first": {
+            "description": "移动夹笔",
+            "startTimeNs": 1776150112601320964,
+            "endTimeNs": 1776150114616320964,
+        },
+        "l2_second": {
+            "description": "夹住放回",
+            "startTimeNs": 1776150114616320964,
+            "endTimeNs": 1776150117885320964,
+        },
+    },
+}
+
 assertions = Assert.Assertions()
 _last_snowflake_13 = 0
 
@@ -80,6 +103,91 @@ def find_conversion_entry(conversion_list, task_id):
     return None
 
 
+def _get_task_time_range_ns() -> tuple[int, int]:
+    try:
+        baseline_start_time_ns = int(TASK_ANNOTATION_CONFIG["baseline_start_time_ns"])
+        baseline_end_time_ns = int(TASK_ANNOTATION_CONFIG["baseline_end_time_ns"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("任务基准时间必须包含有效的起止纳秒值") from exc
+    if baseline_start_time_ns > baseline_end_time_ns:
+        raise ValueError("baseline_start_time_ns 不能晚于 baseline_end_time_ns")
+    return baseline_start_time_ns, baseline_end_time_ns
+
+
+def build_annotation_time_fields(segment_key: str) -> dict:
+    """由任务基准时间与 segment 的绝对纳秒生成全部标注时间字段。"""
+    try:
+        segment_time = TASK_ANNOTATION_CONFIG["segments"][segment_key]
+        start_time_ns = int(segment_time["startTimeNs"])
+        end_time_ns = int(segment_time["endTimeNs"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"标注 {segment_key!r} 缺少有效的绝对起止纳秒值") from exc
+
+    baseline_start_time_ns, baseline_end_time_ns = _get_task_time_range_ns()
+    if start_time_ns > end_time_ns:
+        raise ValueError("startTimeNs 不能晚于 endTimeNs")
+    if start_time_ns < baseline_start_time_ns or end_time_ns > baseline_end_time_ns:
+        raise ValueError(f"标注 {segment_key!r} 的绝对时间超出任务时间轴范围")
+
+    episode_start_time_ns = start_time_ns - baseline_start_time_ns
+    episode_end_time_ns = end_time_ns - baseline_start_time_ns
+
+    episode_start_sec = episode_start_time_ns / NANOSECONDS_PER_SECOND
+    episode_end_sec = episode_end_time_ns / NANOSECONDS_PER_SECOND
+
+    def format_ns_as_seconds(value_ns: int) -> str:
+        seconds, nanoseconds = divmod(value_ns, NANOSECONDS_PER_SECOND)
+        return f"{seconds}.{nanoseconds:09d}"
+
+    return {
+        "startTimeNs": str(start_time_ns),
+        "endTimeNs": str(end_time_ns),
+        "startTimestampNs": str(start_time_ns),
+        "endTimestampNs": str(end_time_ns),
+        "episodeStartTimeNs": str(episode_start_time_ns),
+        "episodeEndTimeNs": str(episode_end_time_ns),
+        "episode_start_time": f"{episode_start_sec:.9f}",
+        "episode_end_time": f"{episode_end_sec:.9f}",
+        "timeline_start_sec": f"{episode_start_sec:.9f}",
+        "timeline_end_sec": f"{episode_end_sec:.9f}",
+        "startSec": episode_start_sec,
+        "endSec": episode_end_sec,
+        "start_time": format_ns_as_seconds(start_time_ns),
+        "end_time": format_ns_as_seconds(end_time_ns),
+    }
+
+
+def build_annotation_text_fields(segment_key: str) -> dict:
+    """使用同一份描述生成 description 和 prompt。"""
+    try:
+        description = str(
+            TASK_ANNOTATION_CONFIG["segments"][segment_key]["description"]
+        ).strip()
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"标注 {segment_key!r} 缺少 description") from exc
+    if not description:
+        raise ValueError(f"标注 {segment_key!r} 的 description 不能为空")
+    return {"description": description, "prompt": description}
+
+
+def build_playback(current_sequence: int) -> dict:
+    """由统一任务时间配置生成 playback 数据。"""
+    baseline_start_time_ns, baseline_end_time_ns = _get_task_time_range_ns()
+    timeline_duration_sec = (
+        baseline_end_time_ns - baseline_start_time_ns
+    ) / NANOSECONDS_PER_SECOND
+    return {
+        "topic": "/sensor/camera_fisheye_r/color/image_raw",
+        "gap_policy": "skip_on_playback",
+        "current_sequence": current_sequence,
+        "baseline_camera_key": "sensor_fisheye_r_color",
+        "baseline_end_time_ns": str(baseline_end_time_ns),
+        "baseline_camera_label": "wrist_image_right",
+        "timeline_duration_sec": f"{timeline_duration_sec:.9f}",
+        "baseline_start_time_ns": str(baseline_start_time_ns),
+    }
+
+
 global_client = create_lazy_yixiu_client()
 
 
@@ -129,7 +237,7 @@ class TestV2Verify:
                     return int(str(start_time_ns))
                 except (TypeError, ValueError):
                     pass
-        return 1776150112347320964
+        return int(build_annotation_time_fields("l1")["startTimeNs"])
 
     def _resolve_step3_end_time_ns(self) -> int:
         """优先取步骤3生成的 endTimeNs；步骤3被跳过时使用默认值。"""
@@ -140,7 +248,7 @@ class TestV2Verify:
                     return int(str(end_time_ns))
                 except (TypeError, ValueError):
                     pass
-        return 1776150118194320964
+        return int(build_annotation_time_fields("l1")["endTimeNs"])
 
     @staticmethod
     def _resolve_segment_time_ns(segment: dict | None, field_name: str, fallback: int) -> int:
@@ -154,16 +262,32 @@ class TestV2Verify:
         return fallback
 
     def _resolve_step4_start_time_ns(self) -> int:
-        return self._resolve_segment_time_ns(self.l2_segment_first, "startTimeNs", 1776150112601320964)
+        return self._resolve_segment_time_ns(
+            self.l2_segment_first,
+            "startTimeNs",
+            int(build_annotation_time_fields("l2_first")["startTimeNs"]),
+        )
 
     def _resolve_step4_end_time_ns(self) -> int:
-        return self._resolve_segment_time_ns(self.l2_segment_first, "endTimeNs", 1776150114616320964)
+        return self._resolve_segment_time_ns(
+            self.l2_segment_first,
+            "endTimeNs",
+            int(build_annotation_time_fields("l2_first")["endTimeNs"]),
+        )
 
     def _resolve_step5_start_time_ns(self) -> int:
-        return self._resolve_segment_time_ns(self.l2_segment_second, "startTimeNs", 1776150114616320964)
+        return self._resolve_segment_time_ns(
+            self.l2_segment_second,
+            "startTimeNs",
+            int(build_annotation_time_fields("l2_second")["startTimeNs"]),
+        )
 
     def _resolve_step5_end_time_ns(self) -> int:
-        return self._resolve_segment_time_ns(self.l2_segment_second, "endTimeNs", 1776150117885320964)
+        return self._resolve_segment_time_ns(
+            self.l2_segment_second,
+            "endTimeNs",
+            int(build_annotation_time_fields("l2_second")["endTimeNs"]),
+        )
 
     def _prepare_image_output_dirs_once(self):
         """首次进入图片提取步骤时，清空图片提取与比较输出目录。"""
@@ -743,41 +867,18 @@ class TestV2Verify:
                     "id": episode_snowflake_id,
                     "layerId": "l1",
                     "category": "episode",
-                    "description": "拿笔放笔",
-                    "prompt": "拿笔放笔",
+                    **build_annotation_text_fields("l1"),
                     "attributes": {
                         "scene": "tabletop",
                         "sceneTags": scene_tags_for_segment,
                     },
-                    "startTimeNs": "1776150112347320964",
-                    "endTimeNs": "1776150118194320964",
-                    "startTimestampNs": "1776150112347320964",
-                    "endTimestampNs": "1776150118194320964",
-                    "episodeStartTimeNs": "6026000000",
-                    "episodeEndTimeNs": "11873000000",
-                    "episode_start_time": "6.026000000",
-                    "episode_end_time": "11.873000000",
-                    "timeline_start_sec": "6.026000000",
-                    "timeline_end_sec": "11.873000000",
+                    **build_annotation_time_fields("l1"),
                     "baseline_camera_key": "sensor_fisheye_r_color",
-                    "startSec": 6.026,
-                    "endSec": 11.873,
-                    "start_time": "1776150112.347320964",
-                    "end_time": "1776150118.194320964",
                 }
             ]
             TestV2Verify.l1_segment = segments[0]
 
-            playback = {
-                "topic": "/sensor/camera_fisheye_r/color/image_raw",
-                "gap_policy": "skip_on_playback",
-                "current_sequence": 1,
-                "baseline_camera_key": "sensor_fisheye_r_color",
-                "baseline_end_time_ns": "1776150323218997544",
-                "baseline_camera_label": "wrist_image_right",
-                "timeline_duration_sec": "216.897676580",
-                "baseline_start_time_ns": "1776150106321320964",
-            }
+            playback = build_playback(current_sequence=1)
             TestV2Verify.submit_playback = playback
 
             print(f"[步骤3] annotation_id: {annotation_id}")
@@ -834,41 +935,18 @@ class TestV2Verify:
                     "id": seg_snowflake_id,
                     "layerId": "l2",
                     "category": "detail",
-                    "description": "移动夹笔",
-                    "prompt": "移动夹笔",
+                    **build_annotation_text_fields("l2_first"),
                     "attributes": {
                         "scene": "tabletop",
                         "sceneTags": scene_tags_for_segment,
                     },
-                    "startTimeNs": "1776150112601320964",
-                    "endTimeNs": "1776150114616320964",
-                    "startTimestampNs": "1776150112601320964",
-                    "endTimestampNs": "1776150114616320964",
-                    "episodeStartTimeNs": "6280000000",
-                    "episodeEndTimeNs": "8295000000",
-                    "episode_start_time": "6.280000000",
-                    "episode_end_time": "8.295000000",
-                    "timeline_start_sec": "6.280000000",
-                    "timeline_end_sec": "8.295000000",
+                    **build_annotation_time_fields("l2_first"),
                     "baseline_camera_key": "sensor_fisheye_r_color",
-                    "startSec": 6.28,
-                    "endSec": 8.295,
-                    "start_time": "1776150112.601320964",
-                    "end_time": "1776150114.616320964",
                 }
             ]
             TestV2Verify.l2_segment_first = segments[0]
 
-            playback = {
-                "topic": "/sensor/camera_fisheye_r/color/image_raw",
-                "gap_policy": "skip_on_playback",
-                "current_sequence": 2,
-                "baseline_camera_key": "sensor_fisheye_r_color",
-                "baseline_end_time_ns": "1776150323218997544",
-                "baseline_camera_label": "wrist_image_right",
-                "timeline_duration_sec": "216.897676580",
-                "baseline_start_time_ns": "1776150106321320964",
-            }
+            playback = build_playback(current_sequence=2)
 
             print(f"[步骤4] annotation_id: {annotation_id}")
             print(f"[步骤4] tag_vocabulary(scene_tags): {tag_vocabulary}")
@@ -925,41 +1003,18 @@ class TestV2Verify:
                     "id": seg_snowflake_id,
                     "layerId": "l2",
                     "category": "detail",
-                    "description": "夹住放回",
-                    "prompt": "夹住放回",
+                    **build_annotation_text_fields("l2_second"),
                     "attributes": {
                         "scene": "tabletop",
                         "sceneTags": scene_tags_for_segment,
                     },
-                    "startTimeNs": "1776150114616320964",
-                    "endTimeNs": "1776150117885320964",
-                    "startTimestampNs": "1776150114616320964",
-                    "endTimestampNs": "1776150117885320964",
-                    "episodeStartTimeNs": "8295000000",
-                    "episodeEndTimeNs": "11564000000",
-                    "episode_start_time": "8.295000000",
-                    "episode_end_time": "11.564000000",
-                    "timeline_start_sec": "8.295000000",
-                    "timeline_end_sec": "11.564000000",
+                    **build_annotation_time_fields("l2_second"),
                     "baseline_camera_key": "sensor_fisheye_r_color",
-                    "startSec": 8.295,
-                    "endSec": 11.564,
-                    "start_time": "1776150114.616320964",
-                    "end_time": "1776150117.885320964",
                 }
             ]
             TestV2Verify.l2_segment_second = segments[0]
 
-            playback = {
-                "topic": "/sensor/camera_fisheye_r/color/image_raw",
-                "gap_policy": "skip_on_playback",
-                "current_sequence": 2,
-                "baseline_camera_key": "sensor_fisheye_r_color",
-                "baseline_end_time_ns": "1776150323218997544",
-                "baseline_camera_label": "wrist_image_right",
-                "timeline_duration_sec": "216.897676580",
-                "baseline_start_time_ns": "1776150106321320964",
-            }
+            playback = build_playback(current_sequence=2)
 
             print(f"[步骤5] annotation_id: {annotation_id}")
             print(f"[步骤5] tag_vocabulary(scene_tags): {tag_vocabulary}")
