@@ -17,7 +17,11 @@ from common.extract_mcap_fields import extract_robot_vectors_at_time
 from common.extract_mcap_image import extract_global_nearest_image_from_mcap_directory
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
 from common.image_compare import compare_images
-from common.parse_parquet_file import extract_nearest_parquet_images, parse_parquet_file
+from common.parse_parquet_file import (
+    compare_parquet_annotations,
+    extract_nearest_parquet_images,
+    parse_parquet_file,
+)
 from common.parquet_download_service import download_converted_parquet
 
 
@@ -106,6 +110,8 @@ class TestShakeV3Verify:
         cls.mcap_image_extract_result = None
         cls.mcap_vector_extract_results = None
         cls.parquet_vector_extract_results = None
+        cls.submitted_annotation_json = None
+        cls.parquet_annotation_validation_result = None
         cls.image_output_dirs_prepared = False
 
     def _resolve_l1_time_ns(self, field_name: str, fallback: int) -> int:
@@ -123,6 +129,29 @@ class TestShakeV3Verify:
 
     def _resolve_l1_end_time_ns(self) -> int:
         return self._resolve_l1_time_ns("endTimeNs", END_TIME_NS)
+
+    def _expected_annotation_layers(self) -> list[dict]:
+        if isinstance(self.submitted_annotation_json, dict):
+            layers = self.submitted_annotation_json.get("layers")
+            if isinstance(layers, list) and layers:
+                return layers
+
+        # 已转换任务会跳过标注步骤，使用本用例中定义的同一组标注期望值。
+        return [
+            {
+                "name": "L1 Episode",
+                "type": "episode",
+                "layerId": "l1",
+                "segments": [
+                    {
+                        "layerId": "l1",
+                        "description": ANNOTATION_DESCRIPTION,
+                        "startTimeNs": str(START_TIME_NS),
+                        "endTimeNs": str(END_TIME_NS),
+                    }
+                ],
+            }
+        ]
 
     def _prepare_image_output_dirs_once(self) -> None:
         if TestShakeV3Verify.image_output_dirs_prepared:
@@ -564,6 +593,7 @@ class TestShakeV3Verify:
                 "tagVocabulary": tag_vocabulary,
                 "episodeTimeUnit": "episode_sec",
             }
+            TestShakeV3Verify.submitted_annotation_json = annotation_json
             allure.attach(
                 json.dumps(annotation_json, ensure_ascii=False, indent=2),
                 name="步骤4提交标注JSON",
@@ -722,3 +752,28 @@ class TestShakeV3Verify:
     def test_compare_l1_robot_vectors(self):
         with allure.step("步骤14：对比L1标注开始和结束时间的MCAP与parquet七维向量"):
             self._compare_vectors("14")
+
+    @pytest.mark.order(15)
+    @allure.story("步骤15：校验parquet中的L1/L2/L3标注数据")
+    def test_compare_parquet_annotations(self):
+        with allure.step("步骤15：解析parquet并与代码中提交的L1/L2/L3标注逐项对比"):
+            assertions.assert_is_not_none(self.downloaded_parquet_file, "未下载 parquet 文件")
+            expected_layers = self._expected_annotation_layers()
+            result = compare_parquet_annotations(
+                parquet_path=self.downloaded_parquet_file,
+                expected_layers=expected_layers,
+            )
+            TestShakeV3Verify.parquet_annotation_validation_result = result
+            allure.attach(
+                json.dumps(expected_layers, ensure_ascii=False, indent=2),
+                name="步骤15-代码中的期望标注",
+                attachment_type=allure.attachment_type.JSON,
+            )
+            allure.attach(
+                json.dumps(result, ensure_ascii=False, indent=2),
+                name="步骤15-parquet标注校验结果",
+                attachment_type=allure.attachment_type.JSON,
+            )
+            assert result["is_consistent"], "parquet 标注数据与代码中提交的数据不一致:\n" + "\n".join(
+                result["failures"]
+            )
