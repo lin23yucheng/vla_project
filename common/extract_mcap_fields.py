@@ -3,9 +3,18 @@
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+from mcap.reader import make_reader
+from mcap_ros2.decoder import DecoderFactory
 from mcap_ros2.reader import read_ros2_messages
+
+from common.mcap_source import (
+    local_mcap_sources,
+    mcap_source_name,
+    open_mcap_source,
+    select_mcap_sources_for_window,
+)
 
 
 POSE_TOPICS = ("/pika_pose_l", "/pika_pose_r")
@@ -82,42 +91,53 @@ def get_nested_field_value(message: Any, field_path: str) -> Any:
 
 
 def _scan_nearest_messages(
-    mcap_files: list[Path],
+    mcap_files: Sequence[Any],
     topics: list[str],
     target_ns: int,
     start_time: int | None,
     end_time: int | None,
+    require_chunk_indexes: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], int]:
     nearest: dict[str, dict[str, Any]] = {}
     scanned_messages = 0
-    for mcap_file in mcap_files:
-        for decoded in read_ros2_messages(
-            mcap_file,
-            topics=topics,
-            start_time=start_time,
-            end_time=end_time,
-        ):
-            scanned_messages += 1
-            topic = decoded.channel.topic
-            diff_ns = abs(decoded.publish_time_ns - target_ns)
-            current = nearest.get(topic)
-            if current is None or diff_ns < current["diff_ns"]:
-                nearest[topic] = {
-                    "mcap_file": str(mcap_file),
-                    "topic": topic,
-                    "schema_name": decoded.schema.name,
-                    "matched_publish_ns": decoded.publish_time_ns,
-                    "matched_log_ns": decoded.log_time_ns,
-                    "diff_ns": diff_ns,
-                    "ros_message": decoded.ros_msg,
-                }
+    selected_sources = select_mcap_sources_for_window(mcap_files, start_time, end_time)
+    for mcap_file in selected_sources:
+        with open_mcap_source(mcap_file) as stream:
+            reader = make_reader(stream, decoder_factories=[DecoderFactory()])
+            if require_chunk_indexes:
+                summary = reader.get_summary()
+                if summary is None or not summary.chunk_indexes:
+                    raise ValueError(
+                        f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
+                        f"{mcap_source_name(mcap_file)}"
+                    )
+            for decoded in read_ros2_messages(
+                reader,
+                topics=topics,
+                start_time=start_time,
+                end_time=end_time,
+            ):
+                scanned_messages += 1
+                topic = decoded.channel.topic
+                diff_ns = abs(decoded.publish_time_ns - target_ns)
+                current = nearest.get(topic)
+                if current is None or diff_ns < current["diff_ns"]:
+                    nearest[topic] = {
+                        "mcap_file": mcap_source_name(mcap_file),
+                        "topic": topic,
+                        "schema_name": decoded.schema.name,
+                        "matched_publish_ns": decoded.publish_time_ns,
+                        "matched_log_ns": decoded.log_time_ns,
+                        "diff_ns": diff_ns,
+                        "ros_message": decoded.ros_msg,
+                    }
     return nearest, scanned_messages
 
 
-def _message_record(decoded: Any, mcap_file: Path, target_ns: int) -> dict[str, Any]:
+def _message_record(decoded: Any, mcap_file: Any, target_ns: int) -> dict[str, Any]:
     publish_ns = int(decoded.publish_time_ns)
     return {
-        "mcap_file": str(mcap_file),
+        "mcap_file": mcap_source_name(mcap_file),
         "topic": decoded.channel.topic,
         "schema_name": decoded.schema.name,
         "matched_publish_ns": publish_ns,
@@ -128,11 +148,12 @@ def _message_record(decoded: Any, mcap_file: Path, target_ns: int) -> dict[str, 
 
 
 def _scan_interpolation_neighbors(
-    mcap_files: list[Path],
+    mcap_files: Sequence[Any],
     topics: list[str],
     target_ns: int,
     start_time: int | None,
     end_time: int | None,
+    require_chunk_indexes: bool = False,
 ) -> tuple[dict[str, dict[str, dict[str, Any] | None]], int]:
     """为每个 topic 收集目标时间最近点及左右两个插值端点。"""
     neighbors = {
@@ -140,34 +161,44 @@ def _scan_interpolation_neighbors(
         for topic in topics
     }
     scanned_messages = 0
-    for mcap_file in mcap_files:
-        for decoded in read_ros2_messages(
-            mcap_file,
-            topics=topics,
-            start_time=start_time,
-            end_time=end_time,
-        ):
-            scanned_messages += 1
-            topic = decoded.channel.topic
-            publish_ns = int(decoded.publish_time_ns)
-            record = _message_record(decoded, mcap_file, target_ns)
-            topic_neighbors = neighbors[topic]
-
-            nearest = topic_neighbors["nearest"]
-            if nearest is None or record["diff_ns"] < nearest["diff_ns"]:
-                topic_neighbors["nearest"] = record
-
-            before = topic_neighbors["before"]
-            if publish_ns <= target_ns and (
-                before is None or publish_ns > before["matched_publish_ns"]
+    selected_sources = select_mcap_sources_for_window(mcap_files, start_time, end_time)
+    for mcap_file in selected_sources:
+        with open_mcap_source(mcap_file) as stream:
+            reader = make_reader(stream, decoder_factories=[DecoderFactory()])
+            if require_chunk_indexes:
+                summary = reader.get_summary()
+                if summary is None or not summary.chunk_indexes:
+                    raise ValueError(
+                        f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
+                        f"{mcap_source_name(mcap_file)}"
+                    )
+            for decoded in read_ros2_messages(
+                reader,
+                topics=topics,
+                start_time=start_time,
+                end_time=end_time,
             ):
-                topic_neighbors["before"] = record
+                scanned_messages += 1
+                topic = decoded.channel.topic
+                publish_ns = int(decoded.publish_time_ns)
+                record = _message_record(decoded, mcap_file, target_ns)
+                topic_neighbors = neighbors[topic]
 
-            after = topic_neighbors["after"]
-            if publish_ns >= target_ns and (
-                after is None or publish_ns < after["matched_publish_ns"]
-            ):
-                topic_neighbors["after"] = record
+                nearest = topic_neighbors["nearest"]
+                if nearest is None or record["diff_ns"] < nearest["diff_ns"]:
+                    topic_neighbors["nearest"] = record
+
+                before = topic_neighbors["before"]
+                if publish_ns <= target_ns and (
+                    before is None or publish_ns > before["matched_publish_ns"]
+                ):
+                    topic_neighbors["before"] = record
+
+                after = topic_neighbors["after"]
+                if publish_ns >= target_ns and (
+                    after is None or publish_ns < after["matched_publish_ns"]
+                ):
+                    topic_neighbors["after"] = record
     return neighbors, scanned_messages
 
 
@@ -451,28 +482,40 @@ def _merge_neighbors(
 
 def extract_robot_vectors_at_time(
     config_path: str | Path,
-    mcap_dir: str | Path,
+    mcap_dir: str | Path | None,
     target_ns: int,
     search_window_ns: int = 1_000_000_000,
     max_tolerance_ns: int = DEFAULT_MAX_TOLERANCE_NS,
+    *,
+    mcap_sources: Sequence[Any] | None = None,
+    mcap_source_label: str | None = None,
+    require_chunk_indexes: bool = False,
+    allow_full_scan_fallback: bool = True,
 ) -> dict[str, Any]:
     """按主相机帧同步并插值 MCAP 数据，生成四组机器人七维向量。"""
     if search_window_ns < 0:
         raise ValueError("search_window_ns 不能小于 0")
     if max_tolerance_ns < 0:
         raise ValueError("max_tolerance_ns 不能小于 0")
+    if require_chunk_indexes and allow_full_scan_fallback:
+        raise ValueError(
+            "远端 indexed MCAP 模式禁止 allow_full_scan_fallback，避免读取完整对象"
+        )
     # Pose topics are configuration-specific.  The legacy default remains
     # available for callers that explicitly request it, while robot-vector
     # extraction follows the pose7d entries in the supplied JSON.
     pose_entries = load_configured_topic_fields(config_path, topics=None)
     gripper_entries = _load_gripper_entries(config_path)
     main_time_topic = _load_main_time_topic(config_path)
-    mcap_root = Path(mcap_dir)
-    if not mcap_root.is_dir():
-        raise FileNotFoundError(f"mcap 目录不存在: {mcap_root}")
-    mcap_files = sorted(path for path in mcap_root.glob("*.mcap") if path.is_file())
-    if not mcap_files:
-        raise FileNotFoundError(f"mcap 目录下未找到 .mcap 文件: {mcap_root}")
+    if mcap_sources is None:
+        if mcap_dir is None:
+            raise ValueError("mcap_dir 和 mcap_sources 不能同时为空")
+        mcap_files, resolved_source_label = local_mcap_sources(mcap_dir)
+    else:
+        mcap_files = list(mcap_sources)
+        if not mcap_files:
+            raise ValueError("mcap_sources 不能为空")
+        resolved_source_label = mcap_source_label or "remote-mcap-sources"
 
     topics = list(dict.fromkeys(
         [entry["topic"] for entry in pose_entries]
@@ -486,14 +529,21 @@ def extract_robot_vectors_at_time(
         target_ns,
         target_ns - search_window_ns,
         target_ns + search_window_ns + 1,
+        require_chunk_indexes=require_chunk_indexes,
     )
-    used_full_scan_fallback = main_time_topic not in main_nearest
-    if main_time_topic not in main_nearest:
+    used_full_scan_fallback = False
+    if main_time_topic not in main_nearest and allow_full_scan_fallback:
         fallback_main, fallback_count = _scan_nearest_messages(
-            mcap_files, [main_time_topic], target_ns, None, None
+            mcap_files,
+            [main_time_topic],
+            target_ns,
+            None,
+            None,
+            require_chunk_indexes=require_chunk_indexes,
         )
         main_nearest.update(fallback_main)
         scanned_messages += fallback_count
+        used_full_scan_fallback = True
     if main_time_topic not in main_nearest:
         raise ValueError(f"多个 mcap 文件中未找到主相机 topic: {main_time_topic}")
 
@@ -505,6 +555,7 @@ def extract_robot_vectors_at_time(
         main_frame_ns,
         main_frame_ns - search_window_ns,
         main_frame_ns + search_window_ns + 1,
+        require_chunk_indexes=require_chunk_indexes,
     )
     scanned_messages += sensor_scan_count
     incomplete_topics = []
@@ -516,9 +567,14 @@ def extract_robot_vectors_at_time(
             topic_neighbors["before"] is None or topic_neighbors["after"] is None
         )):
             incomplete_topics.append(topic)
-    if incomplete_topics:
+    if incomplete_topics and allow_full_scan_fallback:
         fallback_neighbors, fallback_count = _scan_interpolation_neighbors(
-            mcap_files, incomplete_topics, main_frame_ns, None, None
+            mcap_files,
+            incomplete_topics,
+            main_frame_ns,
+            None,
+            None,
+            require_chunk_indexes=require_chunk_indexes,
         )
         _merge_neighbors(neighbors, fallback_neighbors, incomplete_topics)
         scanned_messages += fallback_count
@@ -615,7 +671,8 @@ def extract_robot_vectors_at_time(
 
     return {
         "config_file": str(Path(config_path)),
-        "mcap_dir": str(mcap_root),
+        "mcap_dir": resolved_source_label,
+        "mcap_source_count": len(mcap_files),
         "target_ns": target_ns,
         "main_time_topic": main_time_topic,
         "main_frame_ns": main_frame_ns,

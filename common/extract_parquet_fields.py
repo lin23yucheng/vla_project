@@ -1,9 +1,11 @@
 """从 Parquet 最近时间行提取 action/state 机器人向量。"""
 
-from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
+from common.parquet_source import (
+    find_nearest_parquet_row,
+    read_matched_parquet_row,
+)
 
 
 VECTOR_LABELS = ["x", "y", "z", "roll", "pitch", "yaw", "angle"]
@@ -79,26 +81,14 @@ def _build_group_layout(
 
 
 def extract_parquet_robot_vectors_at_time(
-    parquet_path: str | Path,
+    parquet_path: Any,
     target_ns: int,
 ) -> dict[str, Any]:
-    """选择最近时间行，按 display 字段解析左右臂向量。"""
-    parquet_file_path = Path(parquet_path)
-    if not parquet_file_path.is_file():
-        raise FileNotFoundError(f"parquet 文件不存在: {parquet_file_path}")
-
+    """跨本地或远端 parquet 源选择最近时间行并解析左右臂向量。"""
     required_columns = ["original_timestamp_ns", "actions", "state", "ac_display", "st_display"]
-    parquet_file = pq.ParquetFile(parquet_file_path)
-    missing_columns = [column for column in required_columns if column not in parquet_file.schema_arrow.names]
-    if missing_columns:
-        raise ValueError(f"parquet 缺少机器人向量列: {missing_columns}")
-
-    rows = parquet_file.read(columns=required_columns).to_pylist()
     target_ns = int(target_ns)
-    usable_rows = [row for row in rows if isinstance(row.get("original_timestamp_ns"), int)]
-    if not usable_rows:
-        raise ValueError("parquet 中没有有效 original_timestamp_ns 数据")
-    nearest_row = min(usable_rows, key=lambda row: abs(row["original_timestamp_ns"] - target_ns))
+    match = find_nearest_parquet_row(parquet_path, target_ns)
+    nearest_row, _ = read_matched_parquet_row(match, required_columns)
     matched_timestamp_ns = nearest_row["original_timestamp_ns"]
 
     vectors = []
@@ -143,7 +133,9 @@ def extract_parquet_robot_vectors_at_time(
 
     available_label_sets = {tuple(item["vector_labels"]) for item in vectors}
     return {
-        "parquet_file": str(parquet_file_path),
+        "parquet_file": match["source_name"],
+        "matched_row_group_index": match["row_group_index"],
+        "matched_row_index": match["row_index"],
         "target_ns": target_ns,
         "matched_timestamp_ns": matched_timestamp_ns,
         "diff_ns": abs(matched_timestamp_ns - target_ns),

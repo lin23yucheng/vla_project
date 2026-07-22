@@ -14,6 +14,14 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from common.parquet_source import (
+    find_nearest_parquet_row,
+    normalize_parquet_sources,
+    open_parquet_file,
+    parquet_source_name,
+    read_matched_parquet_row,
+)
+
 
 def _find_latest_parquet(parquet_dir: Path) -> Path:
     parquet_files = sorted(
@@ -103,17 +111,14 @@ def _hierarchy_value(item: dict[str, Any], snake_name: str, camel_name: str) -> 
     return item.get(camel_name) if value in (None, "") else value
 
 
-def extract_parquet_annotation_summary(parquet_path: str | Path) -> dict[str, Any]:
-    """读取 V3 parquet 标注列，并汇总唯一的 L1/L2/L3 分段。"""
-    parquet_file_path = Path(parquet_path)
-    if not parquet_file_path.is_file():
-        raise FileNotFoundError(f"parquet 文件不存在: {parquet_file_path}")
-
-    parquet_file = pq.ParquetFile(parquet_file_path)
-    available_columns = set(parquet_file.schema_arrow.names)
-    missing_columns = [name for name in ANNOTATION_COLUMNS if name not in available_columns]
-    read_columns = [name for name in ANNOTATION_COLUMNS if name in available_columns]
-    rows = parquet_file.read(columns=read_columns).to_pylist()
+def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str, Any]:
+    """独立校验单个 episode parquet，保留其局部行号语义。"""
+    source_name = parquet_source_name(parquet_source)
+    with open_parquet_file(parquet_source) as parquet_file:
+        available_columns = set(parquet_file.schema_arrow.names)
+        missing_columns = [name for name in ANNOTATION_COLUMNS if name not in available_columns]
+        read_columns = [name for name in ANNOTATION_COLUMNS if name in available_columns]
+        rows = parquet_file.read(columns=read_columns, use_threads=False).to_pylist()
 
     validation_errors: list[str] = []
     validation_error_count = 0
@@ -321,7 +326,7 @@ def extract_parquet_annotation_summary(parquet_path: str | Path) -> dict[str, An
             f"另有 {validation_error_count - len(validation_errors)} 条校验错误未展示"
         )
     return {
-        "file": str(parquet_file_path),
+        "file": source_name,
         "num_rows": len(rows),
         "annotation_columns": read_columns,
         "missing_columns": missing_columns,
@@ -329,6 +334,90 @@ def extract_parquet_annotation_summary(parquet_path: str | Path) -> dict[str, An
         "annotations": annotation_list,
         "episode_count": len(episodes),
         "validation_error_count": validation_error_count,
+        "validation_errors": validation_errors,
+    }
+
+
+def extract_parquet_annotation_summary(parquet_path: Any) -> dict[str, Any]:
+    """逐个校验所有 episode parquet，并汇总唯一的 L1/L2/L3 分段。"""
+    file_summaries = [
+        _extract_parquet_annotation_summary_single(source)
+        for source in normalize_parquet_sources(parquet_path)
+    ]
+
+    merged_annotations: dict[tuple[Any, ...], dict[str, Any]] = {}
+    validation_errors: list[str] = []
+    annotation_columns: set[str] = set()
+    missing_columns: set[str] = set()
+    for summary in file_summaries:
+        source_name = summary["file"]
+        annotation_columns.update(summary["annotation_columns"])
+        missing_columns.update(summary["missing_columns"])
+        validation_errors.extend(
+            f"[{source_name}] {message}"
+            for message in summary["validation_errors"]
+        )
+        for item in summary["annotations"]:
+            key = (
+                item["level"],
+                item["layer_id"],
+                item["id"],
+                item["name"],
+                item["start_timestamp_ns"],
+                item["end_timestamp_ns"],
+            )
+            existing = merged_annotations.get(key)
+            if existing is None:
+                existing = {**item, "source_files": [source_name]}
+                merged_annotations[key] = existing
+                continue
+            existing["row_count"] += item["row_count"]
+            existing["source_files"].append(source_name)
+            first_timestamps = [
+                value
+                for value in (
+                    existing.get("first_timestamp_ns"),
+                    item.get("first_timestamp_ns"),
+                )
+                if value is not None
+            ]
+            last_timestamps = [
+                value
+                for value in (
+                    existing.get("last_timestamp_ns"),
+                    item.get("last_timestamp_ns"),
+                )
+                if value is not None
+            ]
+            existing["first_timestamp_ns"] = min(first_timestamps) if first_timestamps else None
+            existing["last_timestamp_ns"] = max(last_timestamps) if last_timestamps else None
+
+    annotation_list = sorted(
+        merged_annotations.values(),
+        key=lambda item: (
+            item["level"] if item["level"] is not None else 999,
+            item["start_timestamp_ns"] if item["start_timestamp_ns"] is not None else -1,
+            item["id"],
+        ),
+    )
+    levels = {item["level"] for item in annotation_list if item["level"] is not None}
+    level_counts = {
+        f"L{level}": sum(1 for item in annotation_list if item["level"] == level)
+        for level in sorted({1, 2, 3, *levels})
+    }
+    return {
+        "file": [summary["file"] for summary in file_summaries],
+        "file_count": len(file_summaries),
+        "file_summaries": file_summaries,
+        "num_rows": sum(summary["num_rows"] for summary in file_summaries),
+        "annotation_columns": sorted(annotation_columns),
+        "missing_columns": sorted(missing_columns),
+        "level_counts": level_counts,
+        "annotations": annotation_list,
+        "episode_count": sum(summary["episode_count"] for summary in file_summaries),
+        "validation_error_count": sum(
+            summary["validation_error_count"] for summary in file_summaries
+        ),
         "validation_errors": validation_errors,
     }
 
@@ -367,7 +456,7 @@ def _normalize_expected_annotations(expected_layers: list[dict[str, Any]]) -> li
 
 
 def compare_parquet_annotations(
-    parquet_path: str | Path,
+    parquet_path: Any,
     expected_layers: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """将代码中提交的 layers/segments 与 parquet 标注元数据逐层比较。"""
@@ -532,20 +621,18 @@ def _save_preview_image(image_bytes: bytes, output_png_path: Path) -> tuple[Path
 
 
 def extract_nearest_parquet_images(
-    parquet_path: str | Path,
+    parquet_path: Any,
     target_ns: int,
     output_dir: str | Path,
     image_columns: list[str] | None = None,
     name_prefix: str | None = None,
     extra_name_parts: list[str] | None = None,
 ) -> dict[str, Any]:
-    """按目标纳秒时间在 parquet 中寻找最近帧并导出图片。"""
-    parquet_file_path = Path(parquet_path)
-    if not parquet_file_path.exists():
-        raise FileNotFoundError(f"parquet 文件不存在: {parquet_file_path}")
-
-    parquet_file = pq.ParquetFile(parquet_file_path)
-    schema = parquet_file.schema_arrow
+    """跨本地或远端 parquet 源寻找最近帧并导出图片。"""
+    target_ns = int(target_ns)
+    match = find_nearest_parquet_row(parquet_path, target_ns)
+    with open_parquet_file(match["source"]) as parquet_file:
+        schema = parquet_file.schema_arrow
     all_column_names = set(schema.names)
 
     discovered_image_columns = _discover_image_columns(schema)
@@ -562,28 +649,10 @@ def extract_nearest_parquet_images(
         raise ValueError("parquet 缺少 original_timestamp_ns 列，无法做纳秒时间匹配")
 
     read_columns = [timestamp_column, *selected_image_columns]
-    table = parquet_file.read(columns=read_columns)
-    rows = table.to_pylist()
-
-    target_ns = int(target_ns)
-    nearest_index = None
-    nearest_timestamp_ns = None
-    nearest_diff_ns = None
-
-    for index, row in enumerate(rows):
-        row_ns = _to_int_ns(row.get(timestamp_column))
-        if row_ns is None:
-            continue
-        diff_ns = abs(row_ns - target_ns)
-        if nearest_diff_ns is None or diff_ns < nearest_diff_ns:
-            nearest_index = index
-            nearest_timestamp_ns = row_ns
-            nearest_diff_ns = diff_ns
-
-    if nearest_index is None or nearest_timestamp_ns is None or nearest_diff_ns is None:
-        raise ValueError("parquet 中没有可用于时间匹配的 original_timestamp_ns 数据")
-
-    nearest_row = rows[nearest_index]
+    nearest_row, _ = read_matched_parquet_row(match, read_columns)
+    nearest_index = int(match["row_index"])
+    nearest_timestamp_ns = int(match["timestamp_ns"])
+    nearest_diff_ns = int(match["diff_ns"])
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -607,7 +676,15 @@ def extract_nearest_parquet_images(
         name_parts = []
         if name_prefix:
             name_parts.append(_sanitize_filename_component(name_prefix))
-        name_parts.extend(["parquet", side_label, f"target_{target_ns}", f"matched_{nearest_timestamp_ns}"])
+        name_parts.extend(
+            [
+                "parquet",
+                side_label,
+                _sanitize_filename_component(column_name),
+                f"target_{target_ns}",
+                f"matched_{nearest_timestamp_ns}",
+            ]
+        )
         for extra in extra_name_parts or []:
             if extra:
                 name_parts.append(_sanitize_filename_component(extra))
@@ -628,7 +705,8 @@ def extract_nearest_parquet_images(
         raise ValueError("最近时间行未提取到有效图片 bytes")
 
     return {
-        "parquet_file": str(parquet_file_path),
+        "parquet_file": match["source_name"],
+        "matched_row_group_index": match["row_group_index"],
         "target_ns": target_ns,
         "matched_row_index": nearest_index,
         "matched_timestamp_ns": nearest_timestamp_ns,

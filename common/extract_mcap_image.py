@@ -11,9 +11,16 @@ import struct
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, Sequence, TypedDict
 
 from mcap.reader import make_reader
+
+from common.mcap_source import (
+    local_mcap_sources,
+    mcap_source_name,
+    open_mcap_source,
+    select_mcap_sources_for_window,
+)
 
 
 class ParsedImageInfo(TypedDict):
@@ -415,51 +422,128 @@ def extract_global_nearest_image_from_mcap_directory(
     extra_name_parts: list[str] | None = None,
 ) -> dict[str, Any]:
     """在目录全部 mcap 文件中，按每个 topic 全局找最近的一帧（每个 topic 只输出一张图）。"""
-    mcap_root = Path(mcap_dir)
-    if not mcap_root.exists():
-        raise FileNotFoundError(f"mcap 目录不存在: {mcap_root}")
+    mcap_files, source_label = local_mcap_sources(mcap_dir)
+    return extract_global_nearest_image_from_mcap_sources(
+        mcap_sources=mcap_files,
+        mcap_source_label=source_label,
+        topics=topics,
+        target_ns=target_ns,
+        output_dir=output_dir,
+        name_prefix=name_prefix,
+        extra_name_parts=extra_name_parts,
+        search_window_ns=None,
+        allow_full_scan_fallback=True,
+        require_chunk_indexes=False,
+    )
 
-    mcap_files = sorted([p for p in mcap_root.glob("*.mcap") if p.is_file()])
+
+def extract_global_nearest_image_from_mcap_sources(
+    mcap_sources: Sequence[Any],
+    mcap_source_label: str,
+    topics: list[str],
+    target_ns: int,
+    output_dir: str | Path,
+    name_prefix: str | None = None,
+    extra_name_parts: list[str] | None = None,
+    search_window_ns: int | None = 1_000_000_000,
+    allow_full_scan_fallback: bool = False,
+    require_chunk_indexes: bool = True,
+) -> dict[str, Any]:
+    """从本地或远端 MCAP 源按索引提取目标时间附近的多路图片。"""
+    mcap_files = list(mcap_sources)
     if not mcap_files:
-        raise FileNotFoundError(f"mcap 目录下未找到 .mcap 文件: {mcap_root}")
+        raise ValueError("mcap_sources 不能为空")
 
     if not topics:
         raise ValueError("topics 不能为空")
+    if search_window_ns is not None and search_window_ns < 0:
+        raise ValueError("search_window_ns 不能小于 0")
+    if require_chunk_indexes and search_window_ns is None:
+        raise ValueError("远端 indexed MCAP 模式必须设置有限的 search_window_ns")
+    if require_chunk_indexes and allow_full_scan_fallback:
+        raise ValueError(
+            "远端 indexed MCAP 模式禁止 allow_full_scan_fallback，避免读取完整对象"
+        )
 
-    scanned_messages = 0
+    target_ns = int(target_ns)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    best_by_topic: dict[str, dict[str, Any]] = {}
+    topic_message_counts = {topic: 0 for topic in topics}
+    scanned_messages = 0
+
+    def scan(
+        scan_topics: list[str],
+        start_time: int | None,
+        end_time: int | None,
+    ) -> None:
+        nonlocal scanned_messages
+        selected_sources = select_mcap_sources_for_window(
+            mcap_files,
+            start_time,
+            end_time,
+        )
+        for mcap_file in selected_sources:
+            with open_mcap_source(mcap_file) as stream:
+                reader = make_reader(stream)
+                if require_chunk_indexes:
+                    summary = reader.get_summary()
+                    if summary is None or not summary.chunk_indexes:
+                        raise ValueError(
+                            f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
+                            f"{mcap_source_name(mcap_file)}"
+                        )
+                for _, channel, message in reader.iter_messages(
+                    topics=scan_topics,
+                    start_time=start_time,
+                    end_time=end_time,
+                ):
+                    scanned_messages += 1
+                    topic_name = channel.topic
+                    topic_message_counts[topic_name] += 1
+                    diff_ns = abs(int(message.publish_time) - target_ns)
+                    current = best_by_topic.get(topic_name)
+                    if current is None or diff_ns < current["diff_ns"]:
+                        best_by_topic[topic_name] = {
+                            "mcap_file": mcap_source_name(mcap_file),
+                            "matched_ns": int(message.publish_time),
+                            "diff_ns": diff_ns,
+                            "data": bytes(message.data),
+                        }
+
+    if search_window_ns is None:
+        scan(topics, None, None)
+    else:
+        scan(
+            topics,
+            target_ns - search_window_ns,
+            target_ns + search_window_ns + 1,
+        )
+    missing_topics = [topic for topic in topics if topic not in best_by_topic]
+    used_full_scan_fallback = False
+    if missing_topics and allow_full_scan_fallback and search_window_ns is not None:
+        scan(missing_topics, None, None)
+        used_full_scan_fallback = True
+
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-
     for topic_name in topics:
-        best_diff: Optional[int] = None
-        best_publish_ns: Optional[int] = None
-        best_mcap_file: Optional[Path] = None
-        best_data: Optional[bytes] = None
-        topic_message_count = 0
-
-        for mcap_file in mcap_files:
-            with open(mcap_file, "rb") as f:
-                reader = make_reader(f)
-                for schema, channel, message in reader.iter_messages():
-                    scanned_messages += 1
-                    if channel.topic != topic_name:
-                        continue
-                    topic_message_count += 1
-                    diff = abs(message.publish_time - int(target_ns))
-                    if best_diff is None or diff < best_diff:
-                        best_diff = diff
-                        best_publish_ns = int(message.publish_time)
-                        best_mcap_file = mcap_file
-                        best_data = bytes(message.data)
-
-        if best_data is None or best_mcap_file is None or best_diff is None or best_publish_ns is None:
-            errors.append({"topic_name": topic_name, "error": f"在目录 {mcap_root} 中未找到 topic={topic_name} 的可用图像消息"})
+        best = best_by_topic.get(topic_name)
+        if best is None:
+            errors.append(
+                {
+                    "topic_name": topic_name,
+                    "error": (
+                        f"在 {mcap_source_label} 的"
+                        f"{'全部数据' if search_window_ns is None else f'目标时间 ±{search_window_ns}ns 内'}"
+                        f"未找到 topic={topic_name} 的可用图像消息"
+                    ),
+                }
+            )
             continue
 
-        img_info = parse_ros2_image(best_data)
+        img_info = parse_ros2_image(best["data"])
         if not img_info:
             errors.append({"topic_name": topic_name, "error": f"topic={topic_name} 的最近消息无法解析为 ROS2 Image"})
             continue
@@ -472,8 +556,9 @@ def extract_global_nearest_image_from_mcap_directory(
             [
                 "mcap",
                 side_label,
-                f"target_{int(target_ns)}",
-                f"matched_{best_publish_ns}",
+                _sanitize_filename_component(topic_name),
+                f"target_{target_ns}",
+                f"matched_{best['matched_ns']}",
             ]
         )
         for extra in extra_name_parts or []:
@@ -490,13 +575,13 @@ def extract_global_nearest_image_from_mcap_directory(
         )
         results.append(
             {
-                "mcap_file": str(best_mcap_file),
+                "mcap_file": best["mcap_file"],
                 "topic_name": topic_name,
                 "side": side_label,
-                "target_ns": int(target_ns),
-                "matched_ns": best_publish_ns,
-                "diff_ns": best_diff,
-                "topic_message_count": topic_message_count,
+                "target_ns": target_ns,
+                "matched_ns": best["matched_ns"],
+                "diff_ns": best["diff_ns"],
+                "topic_message_count": topic_message_counts[topic_name],
                 "saved_paths": save_result["saved_paths"],
                 "preview_path": save_result["preview_path"],
                 "preview_error": save_result["preview_error"],
@@ -507,13 +592,16 @@ def extract_global_nearest_image_from_mcap_directory(
         )
 
     if not results:
-        raise ValueError(f"在目录 {mcap_root} 中未提取到任何 topic={topics} 的图片")
+        raise ValueError(f"在 {mcap_source_label} 中未提取到任何 topic={topics} 的图片")
 
     return {
-        "mcap_dir": str(mcap_root),
-        "target_ns": int(target_ns),
+        "mcap_dir": mcap_source_label,
+        "mcap_source_count": len(mcap_files),
+        "target_ns": target_ns,
         "topics": topics,
         "output_dir": str(output_root),
+        "search_window_ns": search_window_ns,
+        "used_full_scan_fallback": used_full_scan_fallback,
         "scanned_messages": scanned_messages,
         "results": results,
         "errors": errors,

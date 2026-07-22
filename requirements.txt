@@ -4,6 +4,7 @@ mcap-ros2-support==0.5.7
 numpy==2.2.6
 Pillow==12.3.0
 pyarrow==25.0.0
+minio==7.2.20
 
 # 测试框架
 allure-pytest==2.16.0

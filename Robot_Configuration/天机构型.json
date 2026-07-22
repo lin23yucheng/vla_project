@@ -135,7 +135,7 @@
   "robot_type": "dual_arm_gripper_v1",
   "description": "双臂、双腕相机、双夹爪、末端位姿控制",
   "schema_version": "2.0",
-  "main_time_topic": "/gripper/camera_fisheye_r/color/image_raw",
+  "main_time_topic": "/camera/bottom_right/image_raw",
   "observation_state": [
     {
       "name": "left_joint_states",

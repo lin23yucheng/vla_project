@@ -2,6 +2,7 @@
 
 import configparser
 import json
+import os
 import random
 import shutil
 import time
@@ -14,15 +15,15 @@ from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
 from common.extract_mcap_fields import extract_robot_vectors_at_time
-from common.extract_mcap_image import extract_global_nearest_image_from_mcap_directory
+from common.extract_mcap_image import extract_global_nearest_image_from_mcap_sources
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
 from common.image_compare import compare_images
 from common.parse_parquet_file import (
     compare_parquet_annotations,
     extract_nearest_parquet_images,
-    parse_parquet_file,
 )
-from common.parquet_download_service import download_converted_parquet
+from common.s3_mcap import S3McapConfig, S3McapStore
+from common.s3_parquet import S3ParquetStore
 
 
 START_TIME_NS = 1768893104830136738
@@ -36,8 +37,8 @@ assertions = Assert.Assertions()
 _last_snowflake_13 = 0
 
 
-def load_task_context() -> tuple[str, str, str, str]:
-    """读取当前环境的任务编号和摇操 MCAP 目录。"""
+def load_task_context() -> tuple[str, str, str, S3McapConfig]:
+    """读取当前环境的任务编号和 MinIO 连接配置。"""
     project_root = Path(__file__).resolve().parent.parent
     config_path = project_root / "config" / "env_config.ini"
     config = configparser.ConfigParser()
@@ -51,13 +52,39 @@ def load_task_context() -> tuple[str, str, str, str]:
     if not config.has_section(section):
         raise ValueError(f"配置文件缺少节: [{section}]")
 
-    task_no = config.get(section, "Task_no", fallback="").strip()
+    task_no = config.get(section, "shake_task_no", fallback="").strip()
     if not task_no:
-        raise ValueError(f"配置文件节 [{section}] 中缺少 Task_no")
-    shake_path = config.get(section, "shake_path", fallback="").strip()
-    if not shake_path:
-        raise ValueError(f"配置文件节 [{section}] 中缺少 shake_path")
-    return execution_env, section, task_no, shake_path
+        raise ValueError(f"配置文件节 [{section}] 中缺少 shake_task_no")
+
+    endpoint_url = config.get(section, "s3_endpoint", fallback="").strip()
+    access_key = (
+        os.environ.get("VLA_S3_ACCESS_KEY")
+        or config.get(section, "s3_access_key", fallback="").strip()
+    )
+    secret_key = (
+        os.environ.get("VLA_S3_SECRET_KEY")
+        or config.get(section, "s3_secret_key", fallback="")
+    )
+    bucket = config.get(section, "s3_bucket", fallback="").strip()
+    s3_config = S3McapConfig(
+        endpoint_url=endpoint_url,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        prefix=f"{task_no}/original-data",
+        region=config.get(section, "s3_region", fallback="").strip() or None,
+        read_ahead_bytes=config.getint(
+            section,
+            "s3_read_ahead_bytes",
+            fallback=1024 * 1024,
+        ),
+        max_range_request_bytes=config.getint(
+            section,
+            "s3_max_range_request_bytes",
+            fallback=1024 * 1024 * 1024,
+        ),
+    )
+    return execution_env, section, task_no, s3_config
 
 
 def generate_episode_snowflake_id() -> str:
@@ -92,7 +119,10 @@ class TestShakeV3Verify:
     @classmethod
     def setup_class(cls):
         cls.api_all = all_api.ApiAll(global_client)
-        cls.execution_env, cls.section, cls.task_no, cls.shake_path = load_task_context()
+        cls.execution_env, cls.section, cls.task_no, cls.s3_config = load_task_context()
+        cls.mcap_store = S3McapStore(cls.s3_config)
+        cls.mcap_sources = cls.mcap_store.list_indexed_mcap_sources()
+        cls.mcap_source_label = cls.mcap_store.source_label
         cls.task_name = None
         cls.task_status_label = None
         cls.workflow_mode = "normal"
@@ -105,7 +135,8 @@ class TestShakeV3Verify:
         cls.target_format = None
         cls.active_conversion_entry = None
         cls.finished_conversion_entry = None
-        cls.downloaded_parquet_file = None
+        cls.parquet_store = None
+        cls.parquet_sources = []
         cls.parquet_image_extract_result = None
         cls.mcap_image_extract_result = None
         cls.mcap_vector_extract_results = None
@@ -201,20 +232,12 @@ class TestShakeV3Verify:
         raise AssertionError(f"mcap 提取结果中未找到 {side} 相机图片")
 
     def _extract_parquet_images(self, workflow_step: str) -> dict:
-        assertions.assert_is_not_none(
-            self.downloaded_parquet_file,
-            f"未下载 parquet 文件，无法执行步骤{workflow_step}",
-        )
-        parquet_path = Path(self.downloaded_parquet_file)
-        assert parquet_path.is_file(), f"下载的 parquet 文件不存在: {parquet_path}"
-        parquet_info = parse_parquet_file(parquet_path=parquet_path, preview_rows=1)
+        assert self.parquet_sources, f"步骤9未发现远端 parquet 文件，无法执行步骤{workflow_step}"
         allure.attach(
             json.dumps(
                 {
-                    "file": parquet_info.get("file"),
-                    "num_rows": parquet_info.get("num_rows"),
-                    "num_columns": parquet_info.get("num_columns"),
-                    "num_row_groups": parquet_info.get("num_row_groups"),
+                    "parquet_source": self.parquet_store.source_label,
+                    "parquet_files": [str(source) for source in self.parquet_sources],
                     "startTimeNs": self._resolve_l1_start_time_ns(),
                     "endTimeNs": self._resolve_l1_end_time_ns(),
                 },
@@ -233,7 +256,7 @@ class TestShakeV3Verify:
         ):
             with allure.step(f"步骤{substep}：提取L1标注{time_label} parquet 图片"):
                 result = extract_nearest_parquet_images(
-                    parquet_path=parquet_path,
+                    parquet_path=self.parquet_sources,
                     target_ns=target_ns,
                     output_dir=output_dir,
                     name_prefix=self.task_no,
@@ -251,8 +274,7 @@ class TestShakeV3Verify:
         return results
 
     def _extract_mcap_images(self, workflow_step: str) -> dict:
-        mcap_dir = Path(self.shake_path)
-        assert mcap_dir.is_dir(), f"配置中的 shake_path 不是有效目录: {mcap_dir}"
+        assert self.mcap_sources, f"S3 original-data 下未发现 MCAP，无法执行步骤{workflow_step}"
         assertions.assert_is_not_none(
             self.parquet_image_extract_result,
             f"未提取 parquet 图片，无法执行步骤{workflow_step}的同步取帧",
@@ -276,8 +298,9 @@ class TestShakeV3Verify:
                     f"L1标注{time_label} parquet 提取结果缺少 matched_timestamp_ns",
                 )
                 mcap_target_ns = int(parquet_matched_ns)
-                result = extract_global_nearest_image_from_mcap_directory(
-                    mcap_dir=mcap_dir,
+                result = extract_global_nearest_image_from_mcap_sources(
+                    mcap_sources=self.mcap_sources,
+                    mcap_source_label=self.mcap_source_label,
                     topics=topics,
                     target_ns=mcap_target_ns,
                     output_dir=output_dir,
@@ -368,8 +391,12 @@ class TestShakeV3Verify:
             with allure.step(f"步骤{substep}：提取L1标注{time_label} MCAP 七维向量"):
                 result = extract_robot_vectors_at_time(
                     config_path=config_path,
-                    mcap_dir=self.shake_path,
+                    mcap_dir=None,
                     target_ns=target_ns,
+                    mcap_sources=self.mcap_sources,
+                    mcap_source_label=self.mcap_source_label,
+                    require_chunk_indexes=True,
+                    allow_full_scan_fallback=False,
                 )
                 results[time_key] = result
                 vectors = result.get("vectors", [])
@@ -390,7 +417,7 @@ class TestShakeV3Verify:
         return results
 
     def _extract_parquet_vectors(self, workflow_step: str) -> dict:
-        assertions.assert_is_not_none(self.downloaded_parquet_file, "未下载 parquet 文件")
+        assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
         results = {}
         for substep, time_key, time_label, target_ns in (
             (f"{workflow_step}.1", "start", "开始时间", self._resolve_l1_start_time_ns()),
@@ -398,7 +425,7 @@ class TestShakeV3Verify:
         ):
             with allure.step(f"步骤{substep}：提取L1标注{time_label} parquet 机器人向量"):
                 result = extract_parquet_robot_vectors_at_time(
-                    parquet_path=self.downloaded_parquet_file,
+                    parquet_path=self.parquet_sources,
                     target_ns=target_ns,
                 )
                 results[time_key] = result
@@ -447,13 +474,25 @@ class TestShakeV3Verify:
         )
         assert not failures, "L1 标注机器人向量不一致:\n" + "\n".join(failures)
 
+    @classmethod
+    def _discover_remote_parquet_sources(cls):
+        parquet_prefix = (
+            f"{cls.task_no}/final-data/lerobot_v3/data/chunk-000"
+        )
+        cls.parquet_store = S3ParquetStore(cls.s3_config, parquet_prefix)
+        cls.parquet_sources = cls.parquet_store.list_parquet_sources()
+        return cls.parquet_sources
+
     @pytest.mark.order(1)
     @allure.story("步骤1：查询任务列表")
     def test_query_task_info(self):
         with allure.step("步骤1：查询任务列表"):
             allure.attach(
                 f"execution_env={self.execution_env}\nsection=[{self.section}]\n"
-                f"Task_no={self.task_no}\nshake_path={self.shake_path}",
+                f"Task_no={self.task_no}\n"
+                f"mcap_source={self.mcap_source_label}\n"
+                f"mcap_count={len(self.mcap_sources)}\n"
+                f"mcap_total_size={sum(source.size_bytes for source in self.mcap_sources)} bytes",
                 name="前置配置上下文",
                 attachment_type=allure.attachment_type.TEXT,
             )
@@ -673,19 +712,22 @@ class TestShakeV3Verify:
             TestShakeV3Verify.finished_conversion_entry = entry
 
     @pytest.mark.order(9)
-    @allure.story("步骤9：下载parquet文件")
-    def test_download_parquet_file(self):
-        with allure.step("步骤9：下载parquet文件"):
+    @allure.story("步骤9：发现S3中的全部V3 parquet文件")
+    def test_discover_remote_parquet_files(self):
+        with allure.step("步骤9：枚举chunk-000中的全部远端parquet文件"):
             if self.workflow_mode != "converted":
                 assertions.assert_is_not_none(self.finished_conversion_entry, "尚未确认转换完成")
             assertions.assert_is_not_none(self.target_format, "缺少转换格式")
-            downloaded_file = download_converted_parquet(
-                task_no=self.task_no,
-                folder=self.target_format,
+            assert self.target_format == "lerobot_v3", (
+                f"摇操转换格式应为 lerobot_v3，实际为 {self.target_format!r}"
             )
-            assertions.assert_is_not_none(downloaded_file, "下载 parquet 未返回文件路径")
-            assert Path(downloaded_file).is_file(), f"下载后的 parquet 文件不存在: {downloaded_file}"
-            TestShakeV3Verify.downloaded_parquet_file = Path(downloaded_file)
+            parquet_sources = self._discover_remote_parquet_sources()
+            assert parquet_sources, "S3 chunk-000 中未发现 parquet 文件"
+            allure.attach(
+                "\n".join(str(source) for source in parquet_sources),
+                name="步骤9远端parquet文件列表",
+                attachment_type=allure.attachment_type.TEXT,
+            )
 
     @pytest.mark.order(10)
     @allure.story("步骤10：按L1标注开始和结束时间提取parquet图片")
@@ -695,9 +737,9 @@ class TestShakeV3Verify:
             TestShakeV3Verify.parquet_image_extract_result = self._extract_parquet_images("10")
 
     @pytest.mark.order(11)
-    @allure.story("步骤11：按L1标注开始和结束时间从shake_path提取MCAP图片")
+    @allure.story("步骤11：按L1标注开始和结束时间从S3 MCAP提取图片")
     def test_extract_l1_mcap_images(self):
-        with allure.step("步骤11：按L1标注开始和结束时间从shake_path提取MCAP图片"):
+        with allure.step("步骤11：按L1标注开始和结束时间从S3 MCAP提取图片"):
             self._prepare_image_output_dirs_once()
             TestShakeV3Verify.mcap_image_extract_result = self._extract_mcap_images("11")
 
@@ -757,10 +799,10 @@ class TestShakeV3Verify:
     @allure.story("步骤15：校验parquet中的L1/L2/L3标注数据")
     def test_compare_parquet_annotations(self):
         with allure.step("步骤15：解析parquet并与代码中提交的L1/L2/L3标注逐项对比"):
-            assertions.assert_is_not_none(self.downloaded_parquet_file, "未下载 parquet 文件")
+            assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
             expected_layers = self._expected_annotation_layers()
             result = compare_parquet_annotations(
-                parquet_path=self.downloaded_parquet_file,
+                parquet_path=self.parquet_sources,
                 expected_layers=expected_layers,
             )
             TestShakeV3Verify.parquet_annotation_validation_result = result
