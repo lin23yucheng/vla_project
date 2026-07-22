@@ -9,17 +9,16 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from common.parquet_source import (
-    find_nearest_parquet_row,
+    find_nearest_parquet_rows,
     normalize_parquet_sources,
     open_parquet_file,
     parquet_source_name,
-    read_matched_parquet_row,
 )
 
 
@@ -620,42 +619,19 @@ def _save_preview_image(image_bytes: bytes, output_png_path: Path) -> tuple[Path
     return bin_path, "raw_bin_fallback"
 
 
-def extract_nearest_parquet_images(
-    parquet_path: Any,
+def _build_parquet_image_result(
+    match: dict[str, Any],
+    nearest_row: dict[str, Any],
     target_ns: int,
-    output_dir: str | Path,
-    image_columns: list[str] | None = None,
-    name_prefix: str | None = None,
-    extra_name_parts: list[str] | None = None,
+    selected_image_columns: list[str],
+    output_root: Path,
+    name_prefix: str | None,
+    extra_name_parts: list[str] | None,
+    batch_row_group_target_count: int,
 ) -> dict[str, Any]:
-    """跨本地或远端 parquet 源寻找最近帧并导出图片。"""
-    target_ns = int(target_ns)
-    match = find_nearest_parquet_row(parquet_path, target_ns)
-    with open_parquet_file(match["source"]) as parquet_file:
-        schema = parquet_file.schema_arrow
-    all_column_names = set(schema.names)
-
-    discovered_image_columns = _discover_image_columns(schema)
-    if image_columns is None:
-        selected_image_columns = discovered_image_columns
-    else:
-        selected_image_columns = [name for name in image_columns if name in discovered_image_columns]
-
-    if not selected_image_columns:
-        raise ValueError("parquet 中未找到可用图片列（期望 struct<bytes, path>）")
-
-    timestamp_column = "original_timestamp_ns" if "original_timestamp_ns" in all_column_names else None
-    if timestamp_column is None:
-        raise ValueError("parquet 缺少 original_timestamp_ns 列，无法做纳秒时间匹配")
-
-    read_columns = [timestamp_column, *selected_image_columns]
-    nearest_row, _ = read_matched_parquet_row(match, read_columns)
     nearest_index = int(match["row_index"])
     nearest_timestamp_ns = int(match["timestamp_ns"])
     nearest_diff_ns = int(match["diff_ns"])
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-
     saved_files: list[dict[str, Any]] = []
     for column_name in selected_image_columns:
         image_struct = nearest_row.get(column_name)
@@ -714,8 +690,125 @@ def extract_nearest_parquet_images(
         "used_nearest": nearest_diff_ns != 0,
         "image_columns": selected_image_columns,
         "output_dir": str(output_root),
+        "batch_row_group_target_count": batch_row_group_target_count,
         "saved_files": saved_files,
     }
+
+
+def extract_nearest_parquet_images_batch(
+    parquet_path: Any,
+    target_requests: Sequence[dict[str, Any]],
+    output_dir: str | Path,
+    image_columns: list[str] | None = None,
+    name_prefix: str | None = None,
+) -> dict[str, Any]:
+    """批量匹配多个时间点，并让每个图片 row group 只读取一次。"""
+    requests = []
+    request_keys = set()
+    for request in target_requests:
+        key = request.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValueError("每个 target_request 必须包含非空字符串 key")
+        if key in request_keys:
+            raise ValueError(f"target_request key 重复: {key}")
+        request_keys.add(key)
+        requests.append(
+            {
+                "key": key,
+                "target_ns": int(request["target_ns"]),
+                "extra_name_parts": list(request.get("extra_name_parts") or []),
+            }
+        )
+    if not requests:
+        raise ValueError("target_requests 不能为空")
+
+    matches = find_nearest_parquet_rows(
+        parquet_path,
+        [request["target_ns"] for request in requests],
+    )
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    source_batches: dict[str, dict[str, Any]] = {}
+    for request, match in zip(requests, matches):
+        source_name = match["source_name"]
+        source_batch = source_batches.setdefault(
+            source_name,
+            {"source": match["source"], "row_groups": defaultdict(list)},
+        )
+        source_batch["row_groups"][int(match["row_group_index"])].append((request, match))
+
+    results: dict[str, dict[str, Any]] = {}
+    row_groups_read = 0
+    for source_batch in source_batches.values():
+        with open_parquet_file(source_batch["source"]) as parquet_file:
+            schema = parquet_file.schema_arrow
+            discovered_image_columns = _discover_image_columns(schema)
+            if image_columns is None:
+                selected_image_columns = discovered_image_columns
+            else:
+                selected_image_columns = [
+                    name for name in image_columns if name in discovered_image_columns
+                ]
+            if not selected_image_columns:
+                raise ValueError("parquet 中未找到可用图片列（期望 struct<bytes, path>）")
+
+            for row_group_index, grouped_requests in source_batch["row_groups"].items():
+                table = parquet_file.read_row_group(
+                    row_group_index,
+                    columns=selected_image_columns,
+                    use_threads=False,
+                )
+                row_groups_read += 1
+                for request, match in grouped_requests:
+                    row_in_group = int(match["row_in_group"])
+                    if row_in_group >= table.num_rows:
+                        raise IndexError(
+                            f"parquet row group 行号越界: {row_in_group} >= {table.num_rows}"
+                        )
+                    nearest_row = table.slice(row_in_group, 1).to_pylist()[0]
+                    results[request["key"]] = _build_parquet_image_result(
+                        match=match,
+                        nearest_row=nearest_row,
+                        target_ns=request["target_ns"],
+                        selected_image_columns=selected_image_columns,
+                        output_root=output_root,
+                        name_prefix=name_prefix,
+                        extra_name_parts=request["extra_name_parts"],
+                        batch_row_group_target_count=len(grouped_requests),
+                    )
+
+    return {
+        "target_count": len(requests),
+        "source_count": len(source_batches),
+        "row_groups_read": row_groups_read,
+        "output_dir": str(output_root),
+        "results": {request["key"]: results[request["key"]] for request in requests},
+    }
+
+
+def extract_nearest_parquet_images(
+    parquet_path: Any,
+    target_ns: int,
+    output_dir: str | Path,
+    image_columns: list[str] | None = None,
+    name_prefix: str | None = None,
+    extra_name_parts: list[str] | None = None,
+) -> dict[str, Any]:
+    """跨本地或远端 parquet 源寻找最近帧并导出图片。"""
+    batch_result = extract_nearest_parquet_images_batch(
+        parquet_path=parquet_path,
+        target_requests=[
+            {
+                "key": "single",
+                "target_ns": int(target_ns),
+                "extra_name_parts": extra_name_parts or [],
+            }
+        ],
+        output_dir=output_dir,
+        image_columns=image_columns,
+        name_prefix=name_prefix,
+    )
+    return batch_result["results"]["single"]
 
 
 def _build_parser() -> argparse.ArgumentParser:

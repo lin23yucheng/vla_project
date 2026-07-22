@@ -10,9 +10,12 @@ from mcap_ros2.decoder import DecoderFactory
 from mcap_ros2.reader import read_ros2_messages
 
 from common.mcap_source import (
+    DEFAULT_INITIAL_SEARCH_WINDOW_NS,
+    adaptive_search_windows,
     local_mcap_sources,
     mcap_source_name,
     open_mcap_source,
+    read_mcap_window_messages,
     select_mcap_sources_for_window,
 )
 
@@ -145,6 +148,122 @@ def _message_record(decoded: Any, mcap_file: Any, target_ns: int) -> dict[str, A
         "diff_ns": abs(publish_ns - target_ns),
         "ros_message": decoded.ros_msg,
     }
+
+
+def _scan_main_frame_and_sensor_messages(
+    mcap_files: Sequence[Any],
+    main_time_topic: str,
+    sensor_topics: list[str],
+    target_ns: int,
+    start_time: int,
+    end_time: int,
+    require_chunk_indexes: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, list[dict[str, Any]]], int, bool]:
+    """单次读取中定位主帧并收集传感器消息，避免解码主相机图像。"""
+    main_nearest: dict[str, Any] | None = None
+    sensor_records = {topic: [] for topic in sensor_topics}
+    scanned_messages = 0
+    scan_topics = list(dict.fromkeys([main_time_topic, *sensor_topics]))
+    window_records, cache_hit = read_mcap_window_messages(
+        mcap_files,
+        scan_topics,
+        start_time,
+        end_time,
+        require_chunk_indexes=require_chunk_indexes,
+    )
+    decoder_factories: dict[str, DecoderFactory] = {}
+    for window_record in window_records:
+        scanned_messages += 1
+        schema = window_record["schema"]
+        channel = window_record["channel"]
+        message = window_record["message"]
+        mcap_file = window_record["mcap_file"]
+        if schema is None:
+            raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_file}")
+
+        publish_ns = int(message.publish_time)
+        topic = channel.topic
+        if topic == main_time_topic:
+            candidate = {
+                "mcap_file": mcap_file,
+                "topic": topic,
+                "schema_name": schema.name,
+                "matched_publish_ns": publish_ns,
+                "matched_log_ns": int(message.log_time),
+                "diff_ns": abs(publish_ns - target_ns),
+            }
+            if main_nearest is None or candidate["diff_ns"] < main_nearest["diff_ns"]:
+                main_nearest = candidate
+
+        if topic not in sensor_records:
+            continue
+        decoder_factory = decoder_factories.setdefault(mcap_file, DecoderFactory())
+        decoder = decoder_factory.decoder_for(channel.message_encoding, schema)
+        if decoder is None:
+            raise ValueError(f"MCAP topic={topic} 无法按 ROS2 CDR 解码: {mcap_file}")
+        sensor_records[topic].append(
+            {
+                "mcap_file": mcap_file,
+                "topic": topic,
+                "schema_name": schema.name,
+                "matched_publish_ns": publish_ns,
+                "matched_log_ns": int(message.log_time),
+                "ros_message": decoder(message.data),
+            }
+        )
+
+    return main_nearest, sensor_records, scanned_messages, cache_hit
+
+
+def _build_interpolation_neighbors(
+    records_by_topic: dict[str, list[dict[str, Any]]],
+    topics: list[str],
+    target_ns: int,
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """从已读取的传感器记录构建最近值和插值两侧端点。"""
+    neighbors = {
+        topic: {"nearest": None, "before": None, "after": None}
+        for topic in topics
+    }
+    for topic in topics:
+        for raw_record in records_by_topic.get(topic, []):
+            publish_ns = int(raw_record["matched_publish_ns"])
+            record = {**raw_record, "diff_ns": abs(publish_ns - target_ns)}
+            topic_neighbors = neighbors[topic]
+
+            nearest = topic_neighbors["nearest"]
+            if nearest is None or record["diff_ns"] < nearest["diff_ns"]:
+                topic_neighbors["nearest"] = record
+
+            before = topic_neighbors["before"]
+            if publish_ns <= target_ns and (
+                before is None or publish_ns > before["matched_publish_ns"]
+            ):
+                topic_neighbors["before"] = record
+
+            after = topic_neighbors["after"]
+            if publish_ns >= target_ns and (
+                after is None or publish_ns < after["matched_publish_ns"]
+            ):
+                topic_neighbors["after"] = record
+    return neighbors
+
+
+def _incomplete_interpolation_topics(
+    neighbors: dict[str, dict[str, dict[str, Any] | None]],
+    topics: list[str],
+    max_tolerance_ns: int,
+) -> list[str]:
+    incomplete_topics = []
+    for topic in topics:
+        topic_neighbors = neighbors[topic]
+        nearest = topic_neighbors["nearest"]
+        needs_bracket = nearest is not None and nearest["diff_ns"] > max_tolerance_ns
+        if nearest is None or (needs_bracket and (
+            topic_neighbors["before"] is None or topic_neighbors["after"] is None
+        )):
+            incomplete_topics.append(topic)
+    return incomplete_topics
 
 
 def _scan_interpolation_neighbors(
@@ -444,6 +563,18 @@ def _load_main_time_topic(config_path: str | Path) -> str:
     return main_time_topic
 
 
+def load_robot_vector_topics(config_path: str | Path) -> list[str]:
+    """返回主时间、位姿和夹爪 topic，供相同窗口的其他提取流程预取。"""
+    pose_entries = load_configured_topic_fields(config_path, topics=None)
+    gripper_entries = _load_gripper_entries(config_path)
+    main_time_topic = _load_main_time_topic(config_path)
+    return list(dict.fromkeys(
+        [main_time_topic]
+        + [entry["topic"] for entry in pose_entries]
+        + [entry["topic"] for entry in gripper_entries.values()]
+    ))
+
+
 def _public_message_metadata(message: dict[str, Any] | None) -> dict[str, Any] | None:
     if message is None:
         return None
@@ -474,10 +605,29 @@ def _merge_neighbors(
     topics: list[str],
 ) -> None:
     for topic in topics:
-        for position in ("nearest", "before", "after"):
-            candidate = fallback[topic][position]
-            if candidate is not None:
-                current[topic][position] = candidate
+        candidate_nearest = fallback[topic]["nearest"]
+        current_nearest = current[topic]["nearest"]
+        if candidate_nearest is not None and (
+            current_nearest is None
+            or candidate_nearest["diff_ns"] < current_nearest["diff_ns"]
+        ):
+            current[topic]["nearest"] = candidate_nearest
+
+        candidate_before = fallback[topic]["before"]
+        current_before = current[topic]["before"]
+        if candidate_before is not None and (
+            current_before is None
+            or candidate_before["matched_publish_ns"] > current_before["matched_publish_ns"]
+        ):
+            current[topic]["before"] = candidate_before
+
+        candidate_after = fallback[topic]["after"]
+        current_after = current[topic]["after"]
+        if candidate_after is not None and (
+            current_after is None
+            or candidate_after["matched_publish_ns"] < current_after["matched_publish_ns"]
+        ):
+            current[topic]["after"] = candidate_after
 
 
 def extract_robot_vectors_at_time(
@@ -487,6 +637,7 @@ def extract_robot_vectors_at_time(
     search_window_ns: int = 1_000_000_000,
     max_tolerance_ns: int = DEFAULT_MAX_TOLERANCE_NS,
     *,
+    initial_search_window_ns: int = DEFAULT_INITIAL_SEARCH_WINDOW_NS,
     mcap_sources: Sequence[Any] | None = None,
     mcap_source_label: str | None = None,
     require_chunk_indexes: bool = False,
@@ -523,16 +674,53 @@ def extract_robot_vectors_at_time(
     ))
     target_ns = int(target_ns)
 
-    main_nearest, scanned_messages = _scan_nearest_messages(
-        mcap_files,
-        [main_time_topic],
-        target_ns,
-        target_ns - search_window_ns,
-        target_ns + search_window_ns + 1,
-        require_chunk_indexes=require_chunk_indexes,
-    )
+    scanned_messages = 0
+    window_cache_hits = 0
     used_full_scan_fallback = False
-    if main_time_topic not in main_nearest and allow_full_scan_fallback:
+    used_sensor_window_extension = False
+    search_attempt_windows_ns: list[int] = []
+    effective_search_window_ns: int | None = None
+    main_message: dict[str, Any] | None = None
+    neighbors: dict[str, dict[str, dict[str, Any] | None]] | None = None
+    incomplete_topics: list[str] = []
+
+    for window_ns in adaptive_search_windows(
+        search_window_ns,
+        initial_search_window_ns,
+    ):
+        search_attempt_windows_ns.append(window_ns)
+        effective_search_window_ns = window_ns
+        candidate_main, sensor_records, scan_count, cache_hit = _scan_main_frame_and_sensor_messages(
+            mcap_files,
+            main_time_topic,
+            topics,
+            target_ns,
+            target_ns - window_ns,
+            target_ns + window_ns + 1,
+            require_chunk_indexes=require_chunk_indexes,
+        )
+        scanned_messages += scan_count
+        window_cache_hits += int(cache_hit)
+        if candidate_main is None:
+            continue
+
+        candidate_neighbors = _build_interpolation_neighbors(
+            sensor_records,
+            topics,
+            int(candidate_main["matched_publish_ns"]),
+        )
+        candidate_incomplete_topics = _incomplete_interpolation_topics(
+            candidate_neighbors,
+            topics,
+            max_tolerance_ns,
+        )
+        main_message = candidate_main
+        neighbors = candidate_neighbors
+        incomplete_topics = candidate_incomplete_topics
+        if not incomplete_topics:
+            break
+
+    if main_message is None and allow_full_scan_fallback:
         fallback_main, fallback_count = _scan_nearest_messages(
             mcap_files,
             [main_time_topic],
@@ -541,32 +729,46 @@ def extract_robot_vectors_at_time(
             None,
             require_chunk_indexes=require_chunk_indexes,
         )
-        main_nearest.update(fallback_main)
         scanned_messages += fallback_count
         used_full_scan_fallback = True
-    if main_time_topic not in main_nearest:
+        main_message = fallback_main.get(main_time_topic)
+    if main_message is None:
         raise ValueError(f"多个 mcap 文件中未找到主相机 topic: {main_time_topic}")
 
-    main_message = main_nearest[main_time_topic]
     main_frame_ns = int(main_message["matched_publish_ns"])
-    neighbors, sensor_scan_count = _scan_interpolation_neighbors(
-        mcap_files,
-        topics,
-        main_frame_ns,
-        main_frame_ns - search_window_ns,
-        main_frame_ns + search_window_ns + 1,
-        require_chunk_indexes=require_chunk_indexes,
-    )
-    scanned_messages += sensor_scan_count
-    incomplete_topics = []
-    for topic in topics:
-        topic_neighbors = neighbors[topic]
-        nearest = topic_neighbors["nearest"]
-        needs_bracket = nearest is not None and nearest["diff_ns"] > max_tolerance_ns
-        if nearest is None or (needs_bracket and (
-            topic_neighbors["before"] is None or topic_neighbors["after"] is None
-        )):
-            incomplete_topics.append(topic)
+    if neighbors is None:
+        neighbors, sensor_scan_count = _scan_interpolation_neighbors(
+            mcap_files,
+            topics,
+            main_frame_ns,
+            main_frame_ns - search_window_ns,
+            main_frame_ns + search_window_ns + 1,
+            require_chunk_indexes=require_chunk_indexes,
+        )
+        scanned_messages += sensor_scan_count
+        incomplete_topics = _incomplete_interpolation_topics(
+            neighbors,
+            topics,
+            max_tolerance_ns,
+        )
+    elif incomplete_topics:
+        extension_neighbors, extension_count = _scan_interpolation_neighbors(
+            mcap_files,
+            incomplete_topics,
+            main_frame_ns,
+            main_frame_ns - search_window_ns,
+            main_frame_ns + search_window_ns + 1,
+            require_chunk_indexes=require_chunk_indexes,
+        )
+        _merge_neighbors(neighbors, extension_neighbors, incomplete_topics)
+        scanned_messages += extension_count
+        used_sensor_window_extension = True
+        incomplete_topics = _incomplete_interpolation_topics(
+            neighbors,
+            topics,
+            max_tolerance_ns,
+        )
+
     if incomplete_topics and allow_full_scan_fallback:
         fallback_neighbors, fallback_count = _scan_interpolation_neighbors(
             mcap_files,
@@ -678,8 +880,13 @@ def extract_robot_vectors_at_time(
         "main_frame_ns": main_frame_ns,
         "main_frame_match": _public_message_metadata(main_message),
         "search_window_ns": search_window_ns,
+        "initial_search_window_ns": initial_search_window_ns,
+        "effective_search_window_ns": effective_search_window_ns,
+        "search_attempt_windows_ns": search_attempt_windows_ns,
         "max_tolerance_ns": max_tolerance_ns,
         "used_full_scan_fallback": used_full_scan_fallback,
+        "used_sensor_window_extension": used_sensor_window_extension,
+        "window_cache_hits": window_cache_hits,
         "scanned_messages": scanned_messages,
         "vector_labels": vector_labels,
         "vectors": vectors,

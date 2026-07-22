@@ -19,9 +19,6 @@ section = f"{env}-vla"
 if not config.has_section(section):
     raise ValueError(f"配置文件缺少节: [{section}]")
 
-admin_account = config.get(section, "admin_account")
-admin_password = config.get(section, "admin_password")
-
 env_login_map = {
     "prod": {
         "token_url": "",
@@ -38,8 +35,8 @@ env_login_map = {
 }
 
 token_url = env_login_map[env]["token_url"]
-username = admin_account
-password = admin_password
+username = "admin"
+password = "123456"
 url = env_login_map[env]["url"]
 
 

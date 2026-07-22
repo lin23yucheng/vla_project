@@ -13,12 +13,12 @@ from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
 from common.extract_mcap_image import extract_global_nearest_image_from_mcap_sources
-from common.extract_mcap_fields import extract_robot_vectors_at_time
+from common.extract_mcap_fields import extract_robot_vectors_at_time, load_robot_vector_topics
 from common.image_compare import compare_images
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
 from common.parse_parquet_file import (
     compare_parquet_annotations,
-    extract_nearest_parquet_images,
+    extract_nearest_parquet_images_batch,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -270,6 +270,7 @@ class TestV2Verify:
         cls.mcap_source_label = cls.mcap_store.source_label
         cls.robot_config_path, cls.robot_config = load_robot_config()
         cls.camera_topics, cls.main_time_topic = resolve_robot_topics(cls.robot_config)
+        cls.mcap_prefetch_topics = load_robot_vector_topics(cls.robot_config_path)
         cls.task_name = None
         cls.task_status_label = None
         cls.workflow_mode = "normal"
@@ -287,6 +288,7 @@ class TestV2Verify:
         cls.parquet_store = None
         cls.parquet_sources = []
         cls.parquet_image_extract_result = None
+        cls.parquet_image_batch_extract_results = None
         cls.mcap_image_extract_result = None
         cls.step4_parquet_image_extract_result = None
         cls.step4_mcap_image_extract_result = None
@@ -460,19 +462,17 @@ class TestV2Verify:
             attachment_type=allure.attachment_type.TEXT,
         )
 
-        output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
+        batch_results = self._ensure_parquet_image_batch_extract_results()
         extract_results = {}
         for substep, result_key, time_key, time_label, target_ns in (
                 (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", start_time_ns),
                 (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}parquet图片（左/右各一张）"):
-                extract_result = extract_nearest_parquet_images(
-                    parquet_path=self.parquet_sources,
-                    target_ns=target_ns,
-                    output_dir=output_dir,
-                    name_prefix=self.task_no,
-                    extra_name_parts=[annotation_key, time_key],
+                extract_result = batch_results[annotation_key][result_key]
+                assert extract_result["target_ns"] == target_ns, (
+                    f"步骤{substep}批量图片目标时间不一致: "
+                    f"{extract_result['target_ns']} != {target_ns}"
                 )
                 extract_results[result_key] = extract_result
                 allure.attach(
@@ -486,6 +486,63 @@ class TestV2Verify:
                     saved_path = Path(file_info.get("saved_path", ""))
                     assert saved_path.exists(), f"步骤{substep}提取的文件不存在: {saved_path}"
         return extract_results
+
+    def _ensure_parquet_image_batch_extract_results(self) -> dict:
+        if TestV2Verify.parquet_image_batch_extract_results is not None:
+            return TestV2Verify.parquet_image_batch_extract_results
+
+        annotation_times = [
+            ("step3", self._resolve_step3_start_time_ns(), self._resolve_step3_end_time_ns()),
+            ("step4", self._resolve_step4_start_time_ns(), self._resolve_step4_end_time_ns()),
+            ("step5", self._resolve_step5_start_time_ns(), self._resolve_step5_end_time_ns()),
+        ]
+        target_requests = []
+        for annotation_key, start_time_ns, end_time_ns in annotation_times:
+            target_requests.extend(
+                [
+                    {
+                        "key": f"{annotation_key}_start",
+                        "target_ns": start_time_ns,
+                        "extra_name_parts": [annotation_key, "start"],
+                    },
+                    {
+                        "key": f"{annotation_key}_end",
+                        "target_ns": end_time_ns,
+                        "extra_name_parts": [annotation_key, "end"],
+                    },
+                ]
+            )
+
+        output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
+        batch_result = extract_nearest_parquet_images_batch(
+            parquet_path=self.parquet_sources,
+            target_requests=target_requests,
+            output_dir=output_dir,
+            name_prefix=self.task_no,
+        )
+        mapped_results = {
+            annotation_key: {
+                "start_time_extract": batch_result["results"][f"{annotation_key}_start"],
+                "end_time_extract": batch_result["results"][f"{annotation_key}_end"],
+            }
+            for annotation_key, _, _ in annotation_times
+        }
+        TestV2Verify.parquet_image_batch_extract_results = mapped_results
+        allure.attach(
+            json.dumps(
+                {
+                    "target_count": batch_result["target_count"],
+                    "source_count": batch_result["source_count"],
+                    "row_groups_read": batch_result["row_groups_read"],
+                    "output_dir": batch_result["output_dir"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="parquet图片批量读取汇总",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        return mapped_results
 
     def _extract_mcap_images_for_annotation(
             self,
@@ -522,6 +579,7 @@ class TestV2Verify:
                     extra_name_parts=[annotation_key, time_key],
                     allow_full_scan_fallback=False,
                     require_chunk_indexes=True,
+                    additional_cache_topics=self.mcap_prefetch_topics,
                 )
                 extract_results[result_key] = extract_result
                 allure.attach(

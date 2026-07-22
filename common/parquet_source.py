@@ -61,8 +61,23 @@ def find_nearest_parquet_row(
     timestamp_column: str = "original_timestamp_ns",
 ) -> dict[str, Any]:
     """仅读取时间戳列，在所有 parquet/row group 中定位全局最近行。"""
-    target_ns = int(target_ns)
-    best: dict[str, Any] | None = None
+    return find_nearest_parquet_rows(
+        sources,
+        [target_ns],
+        timestamp_column=timestamp_column,
+    )[0]
+
+
+def find_nearest_parquet_rows(
+    sources: Any,
+    target_ns_values: Sequence[int],
+    timestamp_column: str = "original_timestamp_ns",
+) -> list[dict[str, Any]]:
+    """一次扫描时间戳列，为多个目标时间定位全局最近行。"""
+    targets = [int(target_ns) for target_ns in target_ns_values]
+    if not targets:
+        raise ValueError("target_ns_values 不能为空")
+    best_matches: list[dict[str, Any] | None] = [None] * len(targets)
 
     for source in normalize_parquet_sources(sources):
         source_name = parquet_source_name(source)
@@ -84,24 +99,26 @@ def find_nearest_parquet_row(
                         row_ns = int(raw_value)
                     except (TypeError, ValueError):
                         continue
-                    diff_ns = abs(row_ns - target_ns)
-                    if best is None or diff_ns < best["diff_ns"]:
-                        best = {
-                            "source": source,
-                            "source_name": source_name,
-                            "row_group_index": row_group_index,
-                            "row_in_group": row_in_group,
-                            "row_index": global_row_offset + row_in_group,
-                            "timestamp_ns": row_ns,
-                            "diff_ns": diff_ns,
-                        }
+                    for target_index, target_ns in enumerate(targets):
+                        diff_ns = abs(row_ns - target_ns)
+                        best = best_matches[target_index]
+                        if best is None or diff_ns < best["diff_ns"]:
+                            best_matches[target_index] = {
+                                "source": source,
+                                "source_name": source_name,
+                                "row_group_index": row_group_index,
+                                "row_in_group": row_in_group,
+                                "row_index": global_row_offset + row_in_group,
+                                "timestamp_ns": row_ns,
+                                "diff_ns": diff_ns,
+                            }
                 global_row_offset += len(values)
 
-    if best is None:
+    if any(match is None for match in best_matches):
         raise ValueError(
             f"parquet 中没有可用于时间匹配的 {timestamp_column} 数据"
         )
-    return best
+    return [match for match in best_matches if match is not None]
 
 
 def read_matched_parquet_row(

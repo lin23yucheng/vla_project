@@ -15,12 +15,16 @@ import pytest
 
 from common.extract_mcap_fields import (
     DEFAULT_MAX_TOLERANCE_NS,
+    _build_interpolation_neighbors,
+    _incomplete_interpolation_topics,
+    extract_robot_vectors_at_time,
     get_nested_field_value,
     interpolate_pose7d,
     load_configured_topic_fields,
     quaternion_to_euler_zyx,
     slerp_quaternion,
 )
+from common.mcap_source import adaptive_search_windows
 
 
 class Position:
@@ -164,3 +168,103 @@ def test_slerp_quaternion_treats_negated_quaternions_as_same_rotation():
     )
 
     assert result == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+def test_adaptive_search_windows_expand_to_configured_maximum():
+    assert adaptive_search_windows(1_000, 100) == [100, 200, 400, 800, 1_000]
+
+
+def test_build_interpolation_neighbors_collects_nearest_and_bracket():
+    records = {
+        "/pose": [
+            {"matched_publish_ns": 90, "ros_message": object()},
+            {"matched_publish_ns": 110, "ros_message": object()},
+        ]
+    }
+
+    neighbors = _build_interpolation_neighbors(records, ["/pose"], target_ns=100)
+
+    assert neighbors["/pose"]["nearest"]["matched_publish_ns"] == 90
+    assert neighbors["/pose"]["before"]["matched_publish_ns"] == 90
+    assert neighbors["/pose"]["after"]["matched_publish_ns"] == 110
+    assert _incomplete_interpolation_topics(neighbors, ["/pose"], max_tolerance_ns=5) == []
+
+
+def test_robot_vector_extraction_uses_one_combined_window_scan(monkeypatch):
+    target_ns = 1_000_000_000
+    pose_fields = [
+        "pose.position.x",
+        "pose.position.y",
+        "pose.position.z",
+        "pose.orientation.x",
+        "pose.orientation.y",
+        "pose.orientation.z",
+        "pose.orientation.w",
+    ]
+    pose_entries = [
+        {"section": section, "group": group, "topic": pose_topic, "fields": pose_fields}
+        for section in ("action", "observation_state")
+        for group, pose_topic in (("left", "/pose_l"), ("right", "/pose_r"))
+    ]
+    gripper_entries = {
+        (section, group): {"topic": gripper_topic, "fields": ["angle"]}
+        for section in ("action", "observation_state")
+        for group, gripper_topic in (("left", "/gripper_l"), ("right", "/gripper_r"))
+    }
+    pose_message = {
+        "pose": {
+            "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+    }
+    calls = []
+
+    monkeypatch.setattr("common.extract_mcap_fields.load_configured_topic_fields", lambda *args, **kwargs: pose_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_gripper_entries", lambda *args, **kwargs: gripper_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_main_time_topic", lambda *args, **kwargs: "/main")
+
+    def fake_scan(mcap_files, main_time_topic, sensor_topics, scan_target_ns, start_time, end_time, **kwargs):
+        calls.append((main_time_topic, sensor_topics, scan_target_ns, start_time, end_time))
+        records = {}
+        for topic in sensor_topics:
+            records[topic] = [{
+                "mcap_file": "fake.mcap",
+                "topic": topic,
+                "schema_name": "fake",
+                "matched_publish_ns": target_ns,
+                "matched_log_ns": target_ns,
+                "ros_message": pose_message if topic.startswith("/pose") else {"angle": 1.5},
+            }]
+        return (
+            {
+                "mcap_file": "fake.mcap",
+                "topic": "/main",
+                "schema_name": "sensor_msgs/msg/Image",
+                "matched_publish_ns": target_ns,
+                "matched_log_ns": target_ns,
+                "diff_ns": 0,
+            },
+            records,
+            5,
+            False,
+        )
+
+    monkeypatch.setattr("common.extract_mcap_fields._scan_main_frame_and_sensor_messages", fake_scan)
+
+    result = extract_robot_vectors_at_time(
+        config_path="unused.json",
+        mcap_dir=None,
+        target_ns=target_ns,
+        mcap_sources=[object()],
+        mcap_source_label="test",
+        require_chunk_indexes=True,
+        allow_full_scan_fallback=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][3:] == (target_ns - 100_000_000, target_ns + 100_000_000 + 1)
+    assert result["scanned_messages"] == 5
+    assert result["search_attempt_windows_ns"] == [100_000_000]
+    assert result["used_sensor_window_extension"] is False
+    assert result["window_cache_hits"] == 0
+    assert len(result["vectors"]) == 4

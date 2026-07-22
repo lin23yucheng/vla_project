@@ -16,9 +16,12 @@ from typing import Any, Optional, Sequence, TypedDict
 from mcap.reader import make_reader
 
 from common.mcap_source import (
+    DEFAULT_INITIAL_SEARCH_WINDOW_NS,
+    adaptive_search_windows,
     local_mcap_sources,
     mcap_source_name,
     open_mcap_source,
+    read_mcap_window_messages,
     select_mcap_sources_for_window,
 )
 
@@ -448,6 +451,8 @@ def extract_global_nearest_image_from_mcap_sources(
     search_window_ns: int | None = 1_000_000_000,
     allow_full_scan_fallback: bool = False,
     require_chunk_indexes: bool = True,
+    initial_search_window_ns: int = DEFAULT_INITIAL_SEARCH_WINDOW_NS,
+    additional_cache_topics: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """从本地或远端 MCAP 源按索引提取目标时间附近的多路图片。"""
     mcap_files = list(mcap_sources)
@@ -472,13 +477,46 @@ def extract_global_nearest_image_from_mcap_sources(
     best_by_topic: dict[str, dict[str, Any]] = {}
     topic_message_counts = {topic: 0 for topic in topics}
     scanned_messages = 0
+    window_cache_hits = 0
 
     def scan(
         scan_topics: list[str],
         start_time: int | None,
         end_time: int | None,
     ) -> None:
-        nonlocal scanned_messages
+        nonlocal scanned_messages, window_cache_hits
+        if start_time is not None and end_time is not None:
+            read_topics = list(dict.fromkeys([
+                *scan_topics,
+                *(additional_cache_topics or []),
+            ]))
+            window_records, cache_hit = read_mcap_window_messages(
+                mcap_files,
+                read_topics,
+                start_time,
+                end_time,
+                require_chunk_indexes=require_chunk_indexes,
+            )
+            window_cache_hits += int(cache_hit)
+            for window_record in window_records:
+                channel = window_record["channel"]
+                message = window_record["message"]
+                topic_name = channel.topic
+                if topic_name not in scan_topics:
+                    continue
+                scanned_messages += 1
+                topic_message_counts[topic_name] += 1
+                diff_ns = abs(int(message.publish_time) - target_ns)
+                current = best_by_topic.get(topic_name)
+                if current is None or diff_ns < current["diff_ns"]:
+                    best_by_topic[topic_name] = {
+                        "mcap_file": window_record["mcap_file"],
+                        "matched_ns": int(message.publish_time),
+                        "diff_ns": diff_ns,
+                        "data": bytes(message.data),
+                    }
+            return
+
         selected_sources = select_mcap_sources_for_window(
             mcap_files,
             start_time,
@@ -512,14 +550,27 @@ def extract_global_nearest_image_from_mcap_sources(
                             "data": bytes(message.data),
                         }
 
+    search_attempt_windows_ns: list[int | None] = []
+    effective_search_window_ns: int | None = None
     if search_window_ns is None:
+        search_attempt_windows_ns.append(None)
         scan(topics, None, None)
     else:
-        scan(
-            topics,
-            target_ns - search_window_ns,
-            target_ns + search_window_ns + 1,
-        )
+        missing_topics = list(topics)
+        for window_ns in adaptive_search_windows(
+            search_window_ns,
+            initial_search_window_ns,
+        ):
+            search_attempt_windows_ns.append(window_ns)
+            effective_search_window_ns = window_ns
+            scan(
+                missing_topics,
+                target_ns - window_ns,
+                target_ns + window_ns + 1,
+            )
+            missing_topics = [topic for topic in topics if topic not in best_by_topic]
+            if not missing_topics:
+                break
     missing_topics = [topic for topic in topics if topic not in best_by_topic]
     used_full_scan_fallback = False
     if missing_topics and allow_full_scan_fallback and search_window_ns is not None:
@@ -601,7 +652,11 @@ def extract_global_nearest_image_from_mcap_sources(
         "topics": topics,
         "output_dir": str(output_root),
         "search_window_ns": search_window_ns,
+        "initial_search_window_ns": initial_search_window_ns if search_window_ns is not None else None,
+        "effective_search_window_ns": effective_search_window_ns,
+        "search_attempt_windows_ns": search_attempt_windows_ns,
         "used_full_scan_fallback": used_full_scan_fallback,
+        "window_cache_hits": window_cache_hits,
         "scanned_messages": scanned_messages,
         "results": results,
         "errors": errors,
