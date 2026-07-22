@@ -36,7 +36,7 @@
         "angle"
       ],
       "parser": "gripper",
-      "required": false,
+      "required": true,
       "sync_policy": "3",
       "missing_policy": "zero"
     },
@@ -76,7 +76,7 @@
         "angle"
       ],
       "parser": "gripper",
-      "required": false,
+      "required": true,
       "sync_policy": "3",
       "missing_policy": "zero"
     }
@@ -173,7 +173,7 @@
         "angle"
       ],
       "parser": "gripper",
-      "required": false,
+      "required": true,
       "sync_policy": "3",
       "missing_policy": "zero"
     },
@@ -213,7 +213,7 @@
         "angle"
       ],
       "parser": "gripper",
-      "required": false,
+      "required": true,
       "sync_policy": "3",
       "missing_policy": "zero"
     }
