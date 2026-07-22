@@ -1,6 +1,4 @@
-"""
-夹爪数据V2任务校验流程
-"""
+"""夹爪数据 V2 任务校验流程。"""
 
 import configparser
 import json
@@ -217,8 +215,8 @@ def build_playback(current_sequence: int, topic: str) -> dict:
     """由统一任务时间配置生成 playback 数据。"""
     baseline_start_time_ns, baseline_end_time_ns = _get_task_time_range_ns()
     timeline_duration_sec = (
-        baseline_end_time_ns - baseline_start_time_ns
-    ) / NANOSECONDS_PER_SECOND
+                                    baseline_end_time_ns - baseline_start_time_ns
+                            ) / NANOSECONDS_PER_SECOND
     return {
         "topic": topic,
         "gap_policy": "skip_on_playback",
@@ -411,14 +409,15 @@ class TestV2Verify:
         raise AssertionError(f"mcap 提取结果中未找到 {side} 相机图片")
 
     def _extract_parquet_images_for_annotation(
-        self,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
-        start_time_ns: int,
-        end_time_ns: int,
+            self,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
+            start_time_ns: int,
+            end_time_ns: int,
     ) -> dict:
-        assertions.assert_is_not_none(self.downloaded_parquet_file, f"步骤11未下载 parquet 文件，无法执行步骤{workflow_step}")
+        assertions.assert_is_not_none(self.downloaded_parquet_file,
+                                      f"步骤11未下载 parquet 文件，无法执行步骤{workflow_step}")
         parquet_path = Path(self.downloaded_parquet_file)
         assert parquet_path.exists(), f"步骤11下载的 parquet 文件不存在: {parquet_path}"
         parquet_info = parse_parquet_file(parquet_path=parquet_path, preview_rows=1)
@@ -440,8 +439,8 @@ class TestV2Verify:
         output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
         extract_results = {}
         for substep, result_key, time_key, time_label, target_ns in (
-            (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", start_time_ns),
-            (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
+                (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", start_time_ns),
+                (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}parquet图片（左/右各一张）"):
                 extract_result = extract_nearest_parquet_images(
@@ -465,12 +464,12 @@ class TestV2Verify:
         return extract_results
 
     def _extract_mcap_images_for_annotation(
-        self,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
-        start_time_ns: int,
-        end_time_ns: int,
+            self,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
+            start_time_ns: int,
+            end_time_ns: int,
     ) -> dict:
         assertions.assert_is_not_none(self.mcap_path, f"配置文件未提供 mcap_path，无法执行步骤{workflow_step}")
         mcap_dir = Path(self.mcap_path)
@@ -486,8 +485,8 @@ class TestV2Verify:
 
         extract_results = {}
         for substep, result_key, time_key, time_label, target_ns in (
-            (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", start_time_ns),
-            (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
+                (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", start_time_ns),
+                (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}mcap图片（左/右各一张）"):
                 extract_result = extract_global_nearest_image_from_mcap_directory(
@@ -513,16 +512,16 @@ class TestV2Verify:
         return extract_results
 
     def _compare_camera_pair(
-        self,
-        mcap_extract_result: dict,
-        parquet_extract_result: dict,
-        time_key: str,
-        time_label: str,
-        side: str,
-        side_label: str,
-        target_ns: int,
-        substep: str,
-        annotation_key: str,
+            self,
+            mcap_extract_result: dict,
+            parquet_extract_result: dict,
+            time_key: str,
+            time_label: str,
+            side: str,
+            side_label: str,
+            target_ns: int,
+            substep: str,
+            annotation_key: str,
     ) -> tuple[dict, str]:
         """比较一组 MCAP/Parquet 相机图片并附加 Allure 证据。"""
         parquet_image = self._find_parquet_image(parquet_extract_result, side)
@@ -587,14 +586,14 @@ class TestV2Verify:
         return comparison, result_message
 
     def _compare_annotation_image_results(
-        self,
-        parquet_results: dict,
-        mcap_results: dict,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
-        start_time_ns: int,
-        end_time_ns: int,
+            self,
+            parquet_results: dict,
+            mcap_results: dict,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
+            start_time_ns: int,
+            end_time_ns: int,
     ) -> None:
         comparison_cases = [
             (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", "left", "左相机", start_time_ns),
@@ -655,18 +654,18 @@ class TestV2Verify:
         )
 
     def _extract_mcap_vectors_for_annotation(
-        self,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
-        start_time_ns: int,
-        end_time_ns: int,
+            self,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
+            start_time_ns: int,
+            end_time_ns: int,
     ) -> dict:
         assertions.assert_is_not_none(self.mcap_path, f"配置文件未提供 mcap_path，无法执行步骤{workflow_step}")
         results = {}
         for substep, time_key, time_label, target_ns in (
-            (f"{workflow_step}.1", "start", "开始时间", start_time_ns),
-            (f"{workflow_step}.2", "end", "结束时间", end_time_ns),
+                (f"{workflow_step}.1", "start", "开始时间", start_time_ns),
+                (f"{workflow_step}.2", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}MCAP七维向量"):
                 extract_result = extract_robot_vectors_at_time(
@@ -694,18 +693,19 @@ class TestV2Verify:
         return results
 
     def _extract_parquet_vectors_for_annotation(
-        self,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
-        start_time_ns: int,
-        end_time_ns: int,
+            self,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
+            start_time_ns: int,
+            end_time_ns: int,
     ) -> dict:
-        assertions.assert_is_not_none(self.downloaded_parquet_file, f"步骤11未下载 parquet 文件，无法执行步骤{workflow_step}")
+        assertions.assert_is_not_none(self.downloaded_parquet_file,
+                                      f"步骤11未下载 parquet 文件，无法执行步骤{workflow_step}")
         results = {}
         for substep, time_key, time_label, target_ns in (
-            (f"{workflow_step}.1", "start", "开始时间", start_time_ns),
-            (f"{workflow_step}.2", "end", "结束时间", end_time_ns),
+                (f"{workflow_step}.1", "start", "开始时间", start_time_ns),
+                (f"{workflow_step}.2", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}parquet七维向量"):
                 extract_result = extract_parquet_robot_vectors_at_time(
@@ -734,25 +734,26 @@ class TestV2Verify:
         return results
 
     def _compare_vectors_for_annotation(
-        self,
-        mcap_results: dict,
-        parquet_results: dict,
-        annotation_key: str,
-        annotation_label: str,
-        workflow_step: str,
+            self,
+            mcap_results: dict,
+            parquet_results: dict,
+            annotation_key: str,
+            annotation_label: str,
+            workflow_step: str,
     ) -> None:
         comparison_results = {}
         failures = []
         for substep, time_key, time_label in (
-            (f"{workflow_step}.1", "start", "开始时间"),
-            (f"{workflow_step}.2", "end", "结束时间"),
+                (f"{workflow_step}.1", "start", "开始时间"),
+                (f"{workflow_step}.2", "end", "结束时间"),
         ):
             with allure.step(f"步骤{substep}：对比{annotation_label}{time_label}七维向量"):
                 try:
                     mcap_result = mcap_results.get(time_key)
                     parquet_result = parquet_results.get(time_key)
                     assertions.assert_is_not_none(mcap_result, f"未提取{annotation_label}{time_label}MCAP七维向量")
-                    assertions.assert_is_not_none(parquet_result, f"未提取{annotation_label}{time_label}parquet七维向量")
+                    assertions.assert_is_not_none(parquet_result,
+                                                  f"未提取{annotation_label}{time_label}parquet七维向量")
                     comparison = compare_robot_vectors(mcap_result=mcap_result, parquet_result=parquet_result)
                     comparison_results[time_key] = comparison
                     for item in comparison["comparisons"]:
