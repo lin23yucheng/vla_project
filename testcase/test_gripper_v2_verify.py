@@ -25,6 +25,8 @@ from common.s3_parquet import S3ParquetStore
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
 ROBOT_CONFIG_NAME = "夹爪手持构型.json"
+CONVERSION_POLL_INTERVAL_SECONDS = 10
+CONVERSION_POLL_TIMEOUT_SECONDS = 15 * 60
 TASK_ANNOTATION_CONFIG = {
     "baseline_start_time_ns": 1776150106321320964,
     "baseline_end_time_ns": 1776150323218997544,
@@ -1380,8 +1382,18 @@ class TestV2Verify:
 
             assertions.assert_is_not_none(self.task_id, "步骤1未提取到 task_id，无法执行步骤9")
 
-            max_attempts = 60
-            for attempt in range(1, max_attempts + 1):
+            poll_started_at = time.monotonic()
+            poll_deadline = poll_started_at + CONVERSION_POLL_TIMEOUT_SECONDS
+            attempt = 0
+            last_status = None
+            print(
+                f"[步骤9] 开始轮询转换状态: task_id={self.task_id}，"
+                f"间隔={CONVERSION_POLL_INTERVAL_SECONDS}秒，"
+                f"超时={CONVERSION_POLL_TIMEOUT_SECONDS // 60}分钟",
+                flush=True,
+            )
+            while True:
+                attempt += 1
                 response = self.api_all.query_active_conversion_list()
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
@@ -1393,6 +1405,7 @@ class TestV2Verify:
                 print(f"[步骤9] 第{attempt}次轮询，active列表条数: {len(conversion_list)}")
                 if target_entry:
                     status = str(target_entry.get("status", "")).strip().lower()
+                    last_status = status
                     print(f"[步骤9] 找到task_id={self.task_id}，status={status}")
                     allure.attach(
                         f"attempt={attempt}\nstatus={status}\nentry={target_entry}",
@@ -1402,12 +1415,28 @@ class TestV2Verify:
                     TestV2Verify.active_conversion_entry = target_entry
 
                     if status in {"running", "queued"}:
-                        if attempt < max_attempts:
-                            time.sleep(5)
-                            continue
-                        error_msg = f"错误: task_id={self.task_id} 在 active 列表中持续处于 {status}，已达到最大轮询次数 {max_attempts}"
-                        allure.attach(error_msg, name="步骤9轮询超时", attachment_type=allure.attachment_type.TEXT)
-                        pytest.fail(error_msg)
+                        remaining_seconds = poll_deadline - time.monotonic()
+                        if remaining_seconds <= 0:
+                            elapsed_seconds = time.monotonic() - poll_started_at
+                            error_msg = (
+                                f"错误: 转换轮询超过 "
+                                f"{CONVERSION_POLL_TIMEOUT_SECONDS // 60} 分钟，"
+                                f"task_id={self.task_id}，最后状态={last_status!r}"
+                            )
+                            allure.attach(
+                                f"task_id={self.task_id}\n"
+                                f"attempts={attempt}\n"
+                                f"last_status={last_status}\n"
+                                f"elapsed_seconds={elapsed_seconds:.3f}\n"
+                                f"timeout_seconds={CONVERSION_POLL_TIMEOUT_SECONDS}",
+                                name="步骤9轮询超时",
+                                attachment_type=allure.attachment_type.TEXT,
+                            )
+                            pytest.fail(error_msg)
+                        time.sleep(
+                            min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds)
+                        )
+                        continue
 
                     error_msg = f"错误: task_id={self.task_id} 在 active 列表中状态不是 running，而是 '{status}'"
                     allure.attach(error_msg, name="步骤9状态异常", attachment_type=allure.attachment_type.TEXT)

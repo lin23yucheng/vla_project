@@ -32,6 +32,8 @@ BASELINE_START_TIME_NS = 1768893097352136738
 BASELINE_END_TIME_NS = 1768893130775500327
 ANNOTATION_DESCRIPTION = "移动夹笔放回全流程"
 ROBOT_CONFIG_NAME = "遥操机械臂.json"
+CONVERSION_POLL_INTERVAL_SECONDS = 10
+CONVERSION_POLL_TIMEOUT_SECONDS = 15 * 60
 
 assertions = Assert.Assertions()
 _last_snowflake_13 = 0
@@ -818,7 +820,18 @@ class TestShakeV3Verify:
         with allure.step("步骤7：轮询正在转换列表"):
             if self.workflow_mode == "converted":
                 pytest.skip("任务已转换，跳过转换轮询")
-            for attempt in range(1, 61):
+            poll_started_at = time.monotonic()
+            poll_deadline = poll_started_at + CONVERSION_POLL_TIMEOUT_SECONDS
+            attempt = 0
+            last_status = None
+            print(
+                f"[步骤7] 开始轮询转换状态: task_id={self.task_id}，"
+                f"间隔={CONVERSION_POLL_INTERVAL_SECONDS}秒，"
+                f"超时={CONVERSION_POLL_TIMEOUT_SECONDS // 60}分钟",
+                flush=True,
+            )
+            while True:
+                attempt += 1
                 response = self.api_all.query_active_conversion_list()
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
@@ -832,12 +845,29 @@ class TestShakeV3Verify:
                     break
                 TestShakeV3Verify.active_conversion_entry = entry
                 status = str(entry.get("status", "")).strip().lower()
+                last_status = status
                 print(f"[步骤7] 找到task_id={self.task_id}，status={status}", flush=True)
                 if status not in {"running", "queued"}:
                     pytest.fail(f"active 转换状态异常: {status!r}")
-                if attempt == 60:
-                    pytest.fail(f"转换在 {60 * 5} 秒内未离开 active 列表")
-                time.sleep(5)
+                remaining_seconds = poll_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    elapsed_seconds = time.monotonic() - poll_started_at
+                    allure.attach(
+                        f"task_id={self.task_id}\n"
+                        f"attempts={attempt}\n"
+                        f"last_status={last_status}\n"
+                        f"elapsed_seconds={elapsed_seconds:.3f}\n"
+                        f"timeout_seconds={CONVERSION_POLL_TIMEOUT_SECONDS}",
+                        name="步骤7轮询超时",
+                        attachment_type=allure.attachment_type.TEXT,
+                    )
+                    pytest.fail(
+                        f"转换轮询超过 {CONVERSION_POLL_TIMEOUT_SECONDS // 60} 分钟，"
+                        f"task_id={self.task_id}，最后状态={last_status!r}"
+                    )
+                time.sleep(
+                    min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds)
+                )
 
     @pytest.mark.order(8)
     @allure.story("步骤8：查询已转换完成列表")

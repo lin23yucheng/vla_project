@@ -15,7 +15,7 @@ import pytest
 from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
-from common.extract_mcap_fields import extract_robot_vectors_at_time
+from common.extract_mcap_fields import extract_robot_vectors_at_time, load_robot_vector_topics
 from common.extract_mcap_image import extract_global_nearest_image_from_mcap_sources
 from common.extract_parquet_fields import (
     compare_robot_vectors,
@@ -24,7 +24,7 @@ from common.extract_parquet_fields import (
 from common.image_compare import compare_images
 from common.parse_parquet_file import (
     compare_parquet_annotations,
-    extract_nearest_parquet_images,
+    extract_nearest_parquet_images_batch,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -475,6 +475,7 @@ class TestTianjiV2Verify:
         cls.mcap_source_label = cls.s3_store.source_label
         cls.robot_config_path, cls.robot_config = load_robot_config()
         cls.cameras, cls.main_time_topic = resolve_robot_cameras(cls.robot_config)
+        cls.mcap_prefetch_topics = load_robot_vector_topics(cls.robot_config_path)
         cls.baseline_camera = next(
             (camera for camera in cls.cameras if camera["name"] == BASELINE_CAMERA_NAME),
             None,
@@ -521,11 +522,31 @@ class TestTianjiV2Verify:
         cls.finished_conversion_entry = None
         cls.parquet_store = None
         cls.parquet_sources = []
+        cls.parquet_image_batch_extract_results = None
         cls.submitted_annotation_json = None
         cls.image_validation_results = {}
         cls.vector_validation_results = {}
         cls.parquet_annotation_validation_result = None
         cls.output_dirs_prepared = False
+
+    @staticmethod
+    def _step_label(method) -> str:
+        for marker in getattr(method, "pytestmark", ()):
+            if marker.name == "order" and marker.args:
+                return str(marker.args[0])
+        return method.__name__
+
+    def setup_method(self, method):
+        self._step_started_at = time.perf_counter()
+        self._step_number = self._step_label(method)
+        print(f"[步骤{self._step_number}] 开始执行: {method.__name__}", flush=True)
+
+    def teardown_method(self, method):
+        elapsed_seconds = time.perf_counter() - self._step_started_at
+        print(
+            f"[步骤{self._step_number}] 执行结束: {method.__name__}，耗时 {elapsed_seconds:.3f}s",
+            flush=True,
+        )
 
     def _build_playback(self, current_sequence: int) -> dict[str, Any]:
         baseline_start_ns, baseline_end_ns = get_task_time_range_ns()
@@ -647,13 +668,12 @@ class TestTianjiV2Verify:
         assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
         project_root = Path(__file__).resolve().parent.parent
         common_name_parts = [segment_key, time_key]
-        parquet_result = extract_nearest_parquet_images(
-            parquet_path=self.parquet_sources,
-            target_ns=target_ns,
-            output_dir=project_root / "parquet_image",
-            image_columns=[camera["key"] for camera in self.cameras],
-            name_prefix=self.task_no,
-            extra_name_parts=common_name_parts,
+        parquet_result = self._ensure_parquet_image_batch_extract_results()[
+            f"{segment_key}_{time_key}"
+        ]
+        assert parquet_result["target_ns"] == target_ns, (
+            f"{segment_key}/{time_key} parquet 批量图片目标时间不一致: "
+            f"{parquet_result['target_ns']} != {target_ns}"
         )
         mcap_result = extract_global_nearest_image_from_mcap_sources(
             mcap_sources=self.mcap_sources,
@@ -665,6 +685,7 @@ class TestTianjiV2Verify:
             extra_name_parts=common_name_parts,
             allow_full_scan_fallback=False,
             require_chunk_indexes=True,
+            additional_cache_topics=self.mcap_prefetch_topics,
         )
         allure.attach(
             json.dumps(
@@ -679,6 +700,53 @@ class TestTianjiV2Verify:
             attachment_type=allure.attachment_type.JSON,
         )
         return parquet_result, mcap_result
+
+    def _ensure_parquet_image_batch_extract_results(self) -> dict[str, dict[str, Any]]:
+        """一次匹配全部标注时间点，避免重复读取相同 parquet row group。"""
+        if TestTianjiV2Verify.parquet_image_batch_extract_results is not None:
+            return TestTianjiV2Verify.parquet_image_batch_extract_results
+
+        target_requests = []
+        for _, _, definition in iter_layer_segments():
+            segment_key = definition["key"]
+            for time_key, field_name in (("start", "startTimeNs"), ("end", "endTimeNs")):
+                target_requests.append(
+                    {
+                        "key": f"{segment_key}_{time_key}",
+                        "target_ns": self._resolve_segment_time_ns(segment_key, field_name),
+                        "extra_name_parts": [segment_key, time_key],
+                    }
+                )
+
+        batch_result = extract_nearest_parquet_images_batch(
+            parquet_path=self.parquet_sources,
+            target_requests=target_requests,
+            output_dir=Path(__file__).resolve().parent.parent / "parquet_image",
+            image_columns=[camera["key"] for camera in self.cameras],
+            name_prefix=self.task_no,
+        )
+        TestTianjiV2Verify.parquet_image_batch_extract_results = batch_result["results"]
+        print(
+            f"[步骤10] parquet图片批量提取完成: 时间点={batch_result['target_count']}，"
+            f"源文件={batch_result['source_count']}，"
+            f"实际读取row group={batch_result['row_groups_read']}",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {
+                    "target_count": batch_result["target_count"],
+                    "source_count": batch_result["source_count"],
+                    "row_groups_read": batch_result["row_groups_read"],
+                    "output_dir": batch_result["output_dir"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="步骤10 parquet图片批量读取汇总",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        return TestTianjiV2Verify.parquet_image_batch_extract_results
 
     def _verify_one_camera_image(
         self,
@@ -1320,6 +1388,13 @@ class TestTianjiV2Verify:
         with allure.step("步骤11：校验9段标注起止时间的MCAP与parquet七维向量"):
             failures: list[str] = []
             results: dict[str, Any] = {}
+            total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
+            print(
+                f"[步骤11] 开始校验: {total_time_points}个时间点，"
+                "每个时间点对比4组MCAP与parquet七维向量",
+                flush=True,
+            )
+            time_point_index = 0
             for _, _, definition in iter_layer_segments():
                 segment_key = definition["key"]
                 segment_results = {}
@@ -1327,13 +1402,29 @@ class TestTianjiV2Verify:
                     ("start", "startTimeNs", "开始时间"),
                     ("end", "endTimeNs", "结束时间"),
                 ):
+                    time_point_index += 1
                     target_ns = self._resolve_segment_time_ns(segment_key, field_name)
+                    print(
+                        f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+                        f"{segment_key}/{time_key} target_ns={target_ns}，开始校验七维向量",
+                        flush=True,
+                    )
                     with allure.step(f"{segment_key}{time_label}七维向量对比"):
                         try:
-                            segment_results[time_key] = self._verify_one_robot_vector_time(
+                            result = self._verify_one_robot_vector_time(
                                 segment_key=segment_key,
                                 time_key=time_key,
                                 target_ns=target_ns,
+                            )
+                            segment_results[time_key] = result
+                            comparison = result["comparison"]
+                            print(
+                                f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+                                f"{segment_key}/{time_key} consistent="
+                                f"{comparison['is_consistent']}，"
+                                f"MCAP缓存命中="
+                                f"{result['mcap_result'].get('window_cache_hits', 0)}",
+                                flush=True,
                             )
                         except (
                             AssertionError,
@@ -1346,6 +1437,11 @@ class TestTianjiV2Verify:
                             error_message = f"{segment_key}/{time_key} 七维向量校验失败: {exc}"
                             segment_results[time_key] = {"error": str(exc)}
                             failures.append(error_message)
+                            print(
+                                f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+                                f"{error_message}",
+                                flush=True,
+                            )
                             allure.attach(
                                 error_message,
                                 name=f"{segment_key}-{time_key}-异常",
@@ -1357,6 +1453,11 @@ class TestTianjiV2Verify:
                 json.dumps(results, ensure_ascii=False, indent=2),
                 name="步骤11全部七维向量校验汇总",
                 attachment_type=allure.attachment_type.JSON,
+            )
+            print(
+                f"[步骤11] 七维向量校验完成: 时间点={total_time_points}，"
+                f"失败={len(failures)}",
+                flush=True,
             )
             assert not failures, "全部标注七维向量校验存在失败:\n" + "\n".join(failures)
 
