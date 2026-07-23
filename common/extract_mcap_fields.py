@@ -7,7 +7,6 @@ from typing import Any, Sequence
 
 from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
-from mcap_ros2.reader import read_ros2_messages
 
 from common.mcap_source import (
     DEFAULT_INITIAL_SEARCH_WINDOW_NS,
@@ -114,39 +113,48 @@ def _scan_nearest_messages(
                         f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
                         f"{mcap_source_name(mcap_file)}"
                     )
-            for decoded in read_ros2_messages(
-                reader,
+            for schema, channel, message, ros_message in reader.iter_decoded_messages(
                 topics=topics,
                 start_time=start_time,
                 end_time=end_time,
             ):
+                if schema is None:
+                    raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_source_name(mcap_file)}")
                 scanned_messages += 1
-                topic = decoded.channel.topic
-                diff_ns = abs(decoded.publish_time_ns - target_ns)
+                topic = channel.topic
+                publish_ns = int(message.publish_time)
+                diff_ns = abs(publish_ns - target_ns)
                 current = nearest.get(topic)
                 if current is None or diff_ns < current["diff_ns"]:
                     nearest[topic] = {
                         "mcap_file": mcap_source_name(mcap_file),
                         "topic": topic,
-                        "schema_name": decoded.schema.name,
-                        "matched_publish_ns": decoded.publish_time_ns,
-                        "matched_log_ns": decoded.log_time_ns,
+                        "schema_name": schema.name,
+                        "matched_publish_ns": publish_ns,
+                        "matched_log_ns": int(message.log_time),
                         "diff_ns": diff_ns,
-                        "ros_message": decoded.ros_msg,
+                        "ros_message": ros_message,
                     }
     return nearest, scanned_messages
 
 
-def _message_record(decoded: Any, mcap_file: Any, target_ns: int) -> dict[str, Any]:
-    publish_ns = int(decoded.publish_time_ns)
+def _message_record(
+    schema: Any,
+    channel: Any,
+    message: Any,
+    ros_message: Any,
+    mcap_file: Any,
+    target_ns: int,
+) -> dict[str, Any]:
+    publish_ns = int(message.publish_time)
     return {
         "mcap_file": mcap_source_name(mcap_file),
-        "topic": decoded.channel.topic,
-        "schema_name": decoded.schema.name,
+        "topic": channel.topic,
+        "schema_name": schema.name,
         "matched_publish_ns": publish_ns,
-        "matched_log_ns": int(decoded.log_time_ns),
+        "matched_log_ns": int(message.log_time),
         "diff_ns": abs(publish_ns - target_ns),
-        "ros_message": decoded.ros_msg,
+        "ros_message": ros_message,
     }
 
 
@@ -291,16 +299,24 @@ def _scan_interpolation_neighbors(
                         f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
                         f"{mcap_source_name(mcap_file)}"
                     )
-            for decoded in read_ros2_messages(
-                reader,
+            for schema, channel, message, ros_message in reader.iter_decoded_messages(
                 topics=topics,
                 start_time=start_time,
                 end_time=end_time,
             ):
+                if schema is None:
+                    raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_source_name(mcap_file)}")
                 scanned_messages += 1
-                topic = decoded.channel.topic
-                publish_ns = int(decoded.publish_time_ns)
-                record = _message_record(decoded, mcap_file, target_ns)
+                topic = channel.topic
+                publish_ns = int(message.publish_time)
+                record = _message_record(
+                    schema,
+                    channel,
+                    message,
+                    ros_message,
+                    mcap_file,
+                    target_ns,
+                )
                 topic_neighbors = neighbors[topic]
 
                 nearest = topic_neighbors["nearest"]

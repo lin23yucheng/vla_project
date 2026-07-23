@@ -14,13 +14,13 @@ import pytest
 from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
-from common.extract_mcap_fields import extract_robot_vectors_at_time
+from common.extract_mcap_fields import extract_robot_vectors_at_time, load_robot_vector_topics
 from common.extract_mcap_image import extract_global_nearest_image_from_mcap_sources
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
 from common.image_compare import compare_images
 from common.parse_parquet_file import (
     compare_parquet_annotations,
-    extract_nearest_parquet_images,
+    extract_nearest_parquet_images_batch,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -116,6 +116,24 @@ global_client = create_lazy_yixiu_client()
 @pytest.mark.annotation_v3
 @allure.feature("场景：摇操数据-V3格式信息校验")
 class TestShakeV3Verify:
+    _TEST_STEP_NAMES = {
+        "test_query_task_info": "1",
+        "test_query_annotation_workspace": "2",
+        "test_create_l1_annotation_segment": "3",
+        "test_submit_l1_annotation": "4",
+        "test_complete_task_qc": "5",
+        "test_create_conversion": "6",
+        "test_poll_active_conversion": "7",
+        "test_check_finished_conversion": "8",
+        "test_discover_remote_parquet_files": "9",
+        "test_extract_l1_parquet_images": "10",
+        "test_extract_l1_mcap_images": "11",
+        "test_compare_l1_camera_images": "12",
+        "test_extract_l1_robot_vectors": "13",
+        "test_compare_l1_robot_vectors": "14",
+        "test_compare_parquet_annotations": "15",
+    }
+
     @classmethod
     def setup_class(cls):
         cls.api_all = all_api.ApiAll(global_client)
@@ -123,6 +141,9 @@ class TestShakeV3Verify:
         cls.mcap_store = S3McapStore(cls.s3_config)
         cls.mcap_sources = cls.mcap_store.list_indexed_mcap_sources()
         cls.mcap_source_label = cls.mcap_store.source_label
+        cls.robot_config_path, cls.robot_config = load_robot_config()
+        cls.camera_topics = cls._resolve_camera_topics(cls.robot_config)
+        cls.mcap_prefetch_topics = load_robot_vector_topics(cls.robot_config_path)
         cls.task_name = None
         cls.task_status_label = None
         cls.workflow_mode = "normal"
@@ -138,12 +159,25 @@ class TestShakeV3Verify:
         cls.parquet_store = None
         cls.parquet_sources = []
         cls.parquet_image_extract_result = None
+        cls.parquet_image_batch_extract_results = None
         cls.mcap_image_extract_result = None
         cls.mcap_vector_extract_results = None
         cls.parquet_vector_extract_results = None
         cls.submitted_annotation_json = None
         cls.parquet_annotation_validation_result = None
         cls.image_output_dirs_prepared = False
+
+    def setup_method(self, method):
+        self._step_started_at = time.perf_counter()
+        self._step_number = self._TEST_STEP_NAMES.get(method.__name__, method.__name__)
+        print(f"[步骤{self._step_number}] 开始执行: {method.__name__}", flush=True)
+
+    def teardown_method(self, method):
+        elapsed_seconds = time.perf_counter() - self._step_started_at
+        print(
+            f"[步骤{self._step_number}] 执行结束: {method.__name__}，耗时 {elapsed_seconds:.3f}s",
+            flush=True,
+        )
 
     def _resolve_l1_time_ns(self, field_name: str, fallback: int) -> int:
         if isinstance(self.l1_segment, dict):
@@ -199,8 +233,7 @@ class TestShakeV3Verify:
         TestShakeV3Verify.image_output_dirs_prepared = True
 
     @staticmethod
-    def _camera_topics() -> list[str]:
-        _, robot_config = load_robot_config()
+    def _resolve_camera_topics(robot_config: dict) -> list[str]:
         topics_by_group = {
             item.get("group"): item.get("topic")
             for item in robot_config.get("cameras", [])
@@ -248,21 +281,27 @@ class TestShakeV3Verify:
             attachment_type=allure.attachment_type.JSON,
         )
 
-        results = {}
         output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
+        batch_results = self._ensure_parquet_image_batch_extract_results()
+        results = {}
         for substep, result_key, time_key, time_label, target_ns in (
             (f"{workflow_step}.1", "start_time_extract", "start", "开始时间", self._resolve_l1_start_time_ns()),
             (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", self._resolve_l1_end_time_ns()),
         ):
             with allure.step(f"步骤{substep}：提取L1标注{time_label} parquet 图片"):
-                result = extract_nearest_parquet_images(
-                    parquet_path=self.parquet_sources,
-                    target_ns=target_ns,
-                    output_dir=output_dir,
-                    name_prefix=self.task_no,
-                    extra_name_parts=["l1", time_key],
+                result = batch_results[result_key]
+                assert result["target_ns"] == target_ns, (
+                    f"步骤{substep}批量图片目标时间不一致: "
+                    f"{result['target_ns']} != {target_ns}"
                 )
                 results[result_key] = result
+                print(
+                    f"[步骤{substep}] parquet图片 target_ns={target_ns} "
+                    f"matched_timestamp_ns={result.get('matched_timestamp_ns')} "
+                    f"diff_ns={result.get('diff_ns')} "
+                    f"saved_files={len(result.get('saved_files', []))}",
+                    flush=True,
+                )
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-图片提取结果",
@@ -273,13 +312,53 @@ class TestShakeV3Verify:
                     assert Path(item["saved_path"]).is_file(), f"提取文件不存在: {item['saved_path']}"
         return results
 
+    def _ensure_parquet_image_batch_extract_results(self) -> dict:
+        if TestShakeV3Verify.parquet_image_batch_extract_results is not None:
+            return TestShakeV3Verify.parquet_image_batch_extract_results
+
+        target_requests = [
+            {
+                "key": "start_time_extract",
+                "target_ns": self._resolve_l1_start_time_ns(),
+                "extra_name_parts": ["l1", "start"],
+            },
+            {
+                "key": "end_time_extract",
+                "target_ns": self._resolve_l1_end_time_ns(),
+                "extra_name_parts": ["l1", "end"],
+            },
+        ]
+        output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
+        batch_result = extract_nearest_parquet_images_batch(
+            parquet_path=self.parquet_sources,
+            target_requests=target_requests,
+            output_dir=output_dir,
+            name_prefix=self.task_no,
+        )
+        TestShakeV3Verify.parquet_image_batch_extract_results = batch_result["results"]
+        allure.attach(
+            json.dumps(
+                {
+                    "target_count": batch_result["target_count"],
+                    "source_count": batch_result["source_count"],
+                    "row_groups_read": batch_result["row_groups_read"],
+                    "output_dir": batch_result["output_dir"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="parquet图片批量读取汇总",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        return TestShakeV3Verify.parquet_image_batch_extract_results
+
     def _extract_mcap_images(self, workflow_step: str) -> dict:
         assert self.mcap_sources, f"S3 original-data 下未发现 MCAP，无法执行步骤{workflow_step}"
         assertions.assert_is_not_none(
             self.parquet_image_extract_result,
             f"未提取 parquet 图片，无法执行步骤{workflow_step}的同步取帧",
         )
-        topics = self._camera_topics()
+        topics = self.camera_topics
         output_dir = Path(__file__).resolve().parent.parent / "mcap_image"
         results = {}
         for substep, result_key, time_key, time_label, annotation_target_ns in (
@@ -306,10 +385,18 @@ class TestShakeV3Verify:
                     output_dir=output_dir,
                     name_prefix=self.task_no,
                     extra_name_parts=["l1", time_key],
+                    additional_cache_topics=self.mcap_prefetch_topics,
                 )
                 result["annotation_target_ns"] = annotation_target_ns
                 result["parquet_matched_timestamp_ns"] = mcap_target_ns
                 results[result_key] = result
+                print(
+                    f"[步骤{substep}] MCAP图片 annotation_target_ns={annotation_target_ns} "
+                    f"parquet_matched_timestamp_ns={mcap_target_ns} "
+                    f"scanned_messages={result.get('scanned_messages')} "
+                    f"window_cache_hits={result.get('window_cache_hits')}",
+                    flush=True,
+                )
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-图片提取结果",
@@ -352,6 +439,13 @@ class TestShakeV3Verify:
                         diff_output_path=diff_path,
                     )
                     comparisons[f"{time_key}_{side}"] = comparison
+                    print(
+                        f"[步骤{substep}] {time_label}时间{side_label}相机 "
+                        f"consistent={comparison['is_consistent']} "
+                        f"diff_pixels={comparison.get('diff_pixels')} "
+                        f"diff_ratio={comparison.get('diff_ratio')}",
+                        flush=True,
+                    )
                     allure.attach.file(str(mcap_image), name=f"步骤{substep}-MCAP", attachment_type=allure.attachment_type.PNG)
                     allure.attach.file(str(parquet_image), name=f"步骤{substep}-Parquet", attachment_type=allure.attachment_type.PNG)
                     if comparison.get("diff_path"):
@@ -409,6 +503,13 @@ class TestShakeV3Verify:
                     assert item["pose_fields"] == expected_pose_fields
                     assert item["gripper_topic"] == gripper_topic
                     assert item["gripper_fields"] == ["angle"]
+                    print(
+                        f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
+                        f"pose_topic={item['pose_topic']} gripper_topic={item['gripper_topic']}",
+                        flush=True,
+                    )
+                    print(f"  labels = {item['vector_labels']}", flush=True)
+                    print(f"  vector = {item['vector']}", flush=True)
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-MCAP七维向量",
@@ -434,6 +535,14 @@ class TestShakeV3Verify:
                 for item in vectors:
                     assert item["vector_labels"] == ["x", "y", "z", "roll", "pitch", "yaw", "angle"]
                     assert len(item["vector"]) == 7
+                    print(
+                        f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
+                        f"target_ns={item['target_ns']} matched_timestamp_ns={item['matched_timestamp_ns']} "
+                        f"diff_ns={item['diff_ns']} parquet_column={item['parquet_column']}",
+                        flush=True,
+                    )
+                    print(f"  labels = {item['vector_labels']}", flush=True)
+                    print(f"  vector = {item['vector']}", flush=True)
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-Parquet机器人向量",
@@ -457,7 +566,19 @@ class TestShakeV3Verify:
                     comparison = compare_robot_vectors(mcap_result=mcap_result, parquet_result=parquet_result)
                     results[time_key] = comparison
                     for item in comparison.get("comparisons", []):
+                        print(
+                            f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
+                            f"consistent={item['is_consistent']}",
+                            flush=True,
+                        )
                         for dimension in item.get("dimensions", []):
+                            print(
+                                f"  {dimension['label']}: mcap={dimension['mcap_value']} "
+                                f"parquet={dimension['parquet_value']} "
+                                f"diff={dimension['absolute_difference']} "
+                                f"consistent={dimension['is_consistent']}",
+                                flush=True,
+                            )
                             if not dimension["is_consistent"]:
                                 failures.append(
                                     f"{time_label}/{item['section']}/{item['group']}/{dimension['label']}: "
@@ -515,6 +636,10 @@ class TestShakeV3Verify:
             TestShakeV3Verify.task_status_label = target_task.get("status_label")
             TestShakeV3Verify.task_id = target_task.get("id")
             TestShakeV3Verify.scene_tags = target_task.get("scene_tags", [])
+            print(f"[步骤1] task_name: {self.task_name}", flush=True)
+            print(f"[步骤1] status_label: {self.task_status_label}", flush=True)
+            print(f"[步骤1] task_id: {self.task_id}", flush=True)
+            print(f"[步骤1] scene_tags: {self.scene_tags}", flush=True)
             if self.task_status_label == "已转换":
                 TestShakeV3Verify.workflow_mode = "converted"
             elif self.task_status_label != "已采集":
@@ -534,6 +659,10 @@ class TestShakeV3Verify:
             assertions.assert_text(str(data.get("task_no", "")).strip(), self.task_no)
             TestShakeV3Verify.annotation_id = data.get("annotation", {}).get("annotation_id")
             TestShakeV3Verify.episode_id = data.get("episode", {}).get("episode_id")
+            print(f"[步骤2] config task_no: {self.task_no}", flush=True)
+            print(f"[步骤2] workspace task_no: {data.get('task_no')}", flush=True)
+            print(f"[步骤2] annotation_id: {self.annotation_id}", flush=True)
+            print(f"[步骤2] episode_id: {self.episode_id}", flush=True)
             assertions.assert_is_not_none(self.annotation_id, "annotation_id 不能为空")
             assertions.assert_is_not_none(self.episode_id, "episode_id 不能为空")
 
@@ -578,7 +707,7 @@ class TestShakeV3Verify:
                 "end_time": f"{END_TIME_NS // 1_000_000_000}.{END_TIME_NS % 1_000_000_000:09d}",
             }
             playback = {
-                "topic": self._camera_topics()[1],
+                "topic": self.camera_topics[1],
                 "gap_policy": "skip_on_playback",
                 "current_sequence": 1,
                 "baseline_camera_key": "gripper_fisheye_r_color",
@@ -589,6 +718,10 @@ class TestShakeV3Verify:
             }
             TestShakeV3Verify.l1_segment = segment
             TestShakeV3Verify.submit_playback = playback
+            print(f"[步骤3] annotation_id: {self.annotation_id}", flush=True)
+            print(f"[步骤3] tag_vocabulary(scene_tags): {tag_vocabulary}", flush=True)
+            print(f"[步骤3] selected scene tag: {selected_scene_tag}", flush=True)
+            print(f"[步骤3] generated segmentId/id: {segment_id}", flush=True)
             allure.attach(
                 json.dumps({"segments": [segment], "playback": playback}, ensure_ascii=False, indent=2),
                 name="步骤3请求参数",
@@ -633,6 +766,9 @@ class TestShakeV3Verify:
                 "episodeTimeUnit": "episode_sec",
             }
             TestShakeV3Verify.submitted_annotation_json = annotation_json
+            print(f"[步骤4] annotation_id: {self.annotation_id}", flush=True)
+            print(f"[步骤4] episode_id: {self.episode_id}", flush=True)
+            print(f"[步骤4] tag_vocabulary(scene_tags): {tag_vocabulary}", flush=True)
             allure.attach(
                 json.dumps(annotation_json, ensure_ascii=False, indent=2),
                 name="步骤4提交标注JSON",
@@ -653,6 +789,7 @@ class TestShakeV3Verify:
             if self.workflow_mode == "converted":
                 pytest.skip("任务已转换，跳过质检流程")
             assertions.assert_is_not_none(self.task_id, "缺少 task_id")
+            print(f"[步骤5] task_id: {self.task_id}", flush=True)
             response = self.api_all.complete_task_qc(task_id=self.task_id)
             assertions.assert_code(response.status_code, 200)
             assertions.assert_in_text(response.json(), "success")
@@ -663,6 +800,8 @@ class TestShakeV3Verify:
         with allure.step("步骤6：发起数据转换"):
             assertions.assert_is_not_none(self.task_id, "缺少 task_id")
             TestShakeV3Verify.target_format = "lerobot_v3"
+            print(f"[步骤6] task_id: {self.task_id}", flush=True)
+            print(f"[步骤6] target_format: {self.target_format}", flush=True)
             if self.workflow_mode == "converted":
                 return
             response = self.api_all.create_conversion(
@@ -684,12 +823,16 @@ class TestShakeV3Verify:
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
                 assertions.assert_text(response_data.get("msg", ""), "success")
-                entry = find_conversion_entry(response_data.get("data", {}).get("list", []), self.task_id)
+                conversion_list = response_data.get("data", {}).get("list", [])
+                entry = find_conversion_entry(conversion_list, self.task_id)
+                print(f"[步骤7] 第{attempt}次轮询，active列表条数: {len(conversion_list)}", flush=True)
                 if entry is None:
+                    print(f"[步骤7] active列表未找到 task_id={self.task_id}，进入步骤8", flush=True)
                     TestShakeV3Verify.active_conversion_entry = None
                     break
                 TestShakeV3Verify.active_conversion_entry = entry
                 status = str(entry.get("status", "")).strip().lower()
+                print(f"[步骤7] 找到task_id={self.task_id}，status={status}", flush=True)
                 if status not in {"running", "queued"}:
                     pytest.fail(f"active 转换状态异常: {status!r}")
                 if attempt == 60:
@@ -706,9 +849,12 @@ class TestShakeV3Verify:
             assertions.assert_code(response.status_code, 200)
             response_data = response.json()
             assertions.assert_text(response_data.get("msg", ""), "success")
-            entry = find_conversion_entry(response_data.get("data", {}).get("list", []), self.task_id)
+            conversion_list = response_data.get("data", {}).get("list", [])
+            entry = find_conversion_entry(conversion_list, self.task_id)
+            print(f"[步骤8] finished列表条数: {len(conversion_list)}", flush=True)
             assertions.assert_is_not_none(entry, f"finished 列表中未找到 task_id={self.task_id}")
             assert str(entry.get("status", "")).strip().lower() == "completed", f"转换未完成: {entry}"
+            print(f"[步骤8] 找到task_id={self.task_id}，status=completed", flush=True)
             TestShakeV3Verify.finished_conversion_entry = entry
 
     @pytest.mark.order(9)
@@ -723,6 +869,15 @@ class TestShakeV3Verify:
             )
             parquet_sources = self._discover_remote_parquet_sources()
             assert parquet_sources, "S3 chunk-000 中未发现 parquet 文件"
+            print(f"[步骤9] task_no: {self.task_no}", flush=True)
+            print(f"[步骤9] parquet_source: {self.parquet_store.source_label}", flush=True)
+            print(f"[步骤9] parquet_count: {len(parquet_sources)}", flush=True)
+            for index, source in enumerate(parquet_sources, start=1):
+                print(
+                    f"[步骤9][Parquet {index}/{len(parquet_sources)}] "
+                    f"{source.object_name}, size={source.size_bytes} bytes",
+                    flush=True,
+                )
             allure.attach(
                 "\n".join(str(source) for source in parquet_sources),
                 name="步骤9远端parquet文件列表",
@@ -806,6 +961,11 @@ class TestShakeV3Verify:
                 expected_layers=expected_layers,
             )
             TestShakeV3Verify.parquet_annotation_validation_result = result
+            print(
+                f"[步骤15] annotation consistent={result['is_consistent']} "
+                f"failure_count={len(result.get('failures', []))}",
+                flush=True,
+            )
             allure.attach(
                 json.dumps(expected_layers, ensure_ascii=False, indent=2),
                 name="步骤15-代码中的期望标注",

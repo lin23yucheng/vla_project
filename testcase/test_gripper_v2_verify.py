@@ -304,6 +304,25 @@ class TestV2Verify:
         cls.parquet_annotation_validation_result = None
         cls.image_output_dirs_prepared = False
 
+    @staticmethod
+    def _step_label(method) -> str:
+        for marker in getattr(method, "pytestmark", ()):
+            if marker.name == "order" and marker.args:
+                return str(marker.args[0])
+        return method.__name__
+
+    def setup_method(self, method):
+        self._step_started_at = time.perf_counter()
+        self._step_number = self._step_label(method)
+        print(f"[步骤{self._step_number}] 开始执行: {method.__name__}", flush=True)
+
+    def teardown_method(self, method):
+        elapsed_seconds = time.perf_counter() - self._step_started_at
+        print(
+            f"[步骤{self._step_number}] 执行结束: {method.__name__}，耗时 {elapsed_seconds:.3f}s",
+            flush=True,
+        )
+
     def _resolve_step3_start_time_ns(self) -> int:
         """优先取步骤3生成的 startTimeNs；步骤3被跳过时使用默认值。"""
         if isinstance(self.l1_segment, dict):
