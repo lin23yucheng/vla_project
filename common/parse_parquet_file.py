@@ -92,6 +92,7 @@ ANNOTATION_COLUMNS = (
     "annotation.hierarchy_json",
     "done",
 )
+PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.04
 
 
 def _annotation_text(value: Any) -> str:
@@ -103,6 +104,23 @@ def _annotation_int(value: Any) -> int | None:
         return int(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _annotation_float(value: Any) -> float | None:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_duration_seconds(duration_ns: int | None) -> str:
+    """将纳秒时长格式化为不丢失精度的秒数字符串。"""
+    if duration_ns is None:
+        return "无效"
+    seconds, nanoseconds = divmod(duration_ns, 1_000_000_000)
+    if not nanoseconds:
+        return str(seconds)
+    return f"{seconds}.{nanoseconds:09d}".rstrip("0")
 
 
 def _hierarchy_value(item: dict[str, Any], snake_name: str, camel_name: str) -> Any:
@@ -117,6 +135,8 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
         available_columns = set(parquet_file.schema_arrow.names)
         missing_columns = [name for name in ANNOTATION_COLUMNS if name not in available_columns]
         read_columns = [name for name in ANNOTATION_COLUMNS if name in available_columns]
+        if "timestamp" in available_columns:
+            read_columns.append("timestamp")
         rows = parquet_file.read(columns=read_columns, use_threads=False).to_pylist()
 
     validation_errors: list[str] = []
@@ -139,6 +159,7 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
 
     for row_index, row in enumerate(rows):
         timestamp_ns = _annotation_int(row.get("original_timestamp_ns"))
+        playback_timestamp = _annotation_float(row.get("timestamp"))
         if timestamp_ns is None:
             add_error(f"第{row_index}行 original_timestamp_ns 不是有效整数")
         elif previous_timestamp_ns is not None and timestamp_ns <= previous_timestamp_ns:
@@ -247,11 +268,26 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
                     "last_row_index": row_index,
                     "first_timestamp_ns": timestamp_ns,
                     "last_timestamp_ns": timestamp_ns,
+                    "first_playback_timestamp": playback_timestamp,
+                    "last_playback_timestamp": playback_timestamp,
                 },
             )
             summary["row_count"] += 1
             summary["last_row_index"] = row_index
             summary["last_timestamp_ns"] = timestamp_ns
+            if playback_timestamp is not None:
+                first_playback = summary["first_playback_timestamp"]
+                last_playback = summary["last_playback_timestamp"]
+                summary["first_playback_timestamp"] = (
+                    playback_timestamp
+                    if first_playback is None
+                    else min(first_playback, playback_timestamp)
+                )
+                summary["last_playback_timestamp"] = (
+                    playback_timestamp
+                    if last_playback is None
+                    else max(last_playback, playback_timestamp)
+                )
             definitions_by_id[(level, layer_id, segment_id)].add((name, start_ns, end_ns))
 
         if not normalized_hierarchy:
@@ -390,6 +426,28 @@ def extract_parquet_annotation_summary(parquet_path: Any) -> dict[str, Any]:
             ]
             existing["first_timestamp_ns"] = min(first_timestamps) if first_timestamps else None
             existing["last_timestamp_ns"] = max(last_timestamps) if last_timestamps else None
+            first_playback_timestamps = [
+                value
+                for value in (
+                    existing.get("first_playback_timestamp"),
+                    item.get("first_playback_timestamp"),
+                )
+                if value is not None
+            ]
+            last_playback_timestamps = [
+                value
+                for value in (
+                    existing.get("last_playback_timestamp"),
+                    item.get("last_playback_timestamp"),
+                )
+                if value is not None
+            ]
+            existing["first_playback_timestamp"] = (
+                min(first_playback_timestamps) if first_playback_timestamps else None
+            )
+            existing["last_playback_timestamp"] = (
+                max(last_playback_timestamps) if last_playback_timestamps else None
+            )
 
     annotation_list = sorted(
         merged_annotations.values(),
@@ -457,6 +515,7 @@ def _normalize_expected_annotations(expected_layers: list[dict[str, Any]]) -> li
 def compare_parquet_annotations(
     parquet_path: Any,
     expected_layers: list[dict[str, Any]],
+    validate_l1_playback_duration: bool = False,
 ) -> dict[str, Any]:
     """将代码中提交的 layers/segments 与 parquet 标注元数据逐层比较。"""
     summary = extract_parquet_annotation_summary(parquet_path)
@@ -464,6 +523,7 @@ def compare_parquet_annotations(
     actual = summary["annotations"]
     failures = list(summary["validation_errors"])
     segment_comparisons: list[dict[str, Any]] = []
+    l1_playback_duration_comparisons: list[dict[str, Any]] = []
 
     levels = sorted({1, 2, 3, *(item["level"] for item in expected), *(item["level"] for item in actual)})
     level_comparisons = []
@@ -530,6 +590,51 @@ def compare_parquet_annotations(
                         f"L{expected_item['level']}第{expected_index + 1}条{field_labels[field]}不一致: "
                         f"期望 {expected_item[field]!r}，实际 {actual_item[field]!r}"
                     )
+
+            if validate_l1_playback_duration and expected_item["level"] == 1:
+                expected_duration_ns = (
+                    expected_item["end_timestamp_ns"] - expected_item["start_timestamp_ns"]
+                    if expected_item["start_timestamp_ns"] is not None
+                    and expected_item["end_timestamp_ns"] is not None
+                    else None
+                )
+                playback_start_seconds = actual_item.get("first_playback_timestamp")
+                playback_end_seconds = actual_item.get("last_playback_timestamp")
+                actual_duration_seconds = (
+                    playback_end_seconds - playback_start_seconds
+                    if playback_start_seconds is not None and playback_end_seconds is not None
+                    else None
+                )
+                expected_duration_seconds = (
+                    expected_duration_ns / 1_000_000_000
+                    if expected_duration_ns is not None
+                    else None
+                )
+                duration_is_consistent = (
+                    expected_duration_seconds is not None
+                    and actual_duration_seconds is not None
+                    and abs(expected_duration_seconds - actual_duration_seconds)
+                    <= PLAYBACK_DURATION_TOLERANCE_SECONDS
+                )
+                l1_playback_duration_comparisons.append(
+                    {
+                        "expected_duration_ns": expected_duration_ns,
+                        "expected_duration_seconds": expected_duration_seconds,
+                        "parquet_playback_start_seconds": playback_start_seconds,
+                        "parquet_playback_end_seconds": playback_end_seconds,
+                        "parquet_playback_duration_seconds": actual_duration_seconds,
+                        "is_consistent": duration_is_consistent,
+                    }
+                )
+                if not duration_is_consistent:
+                    failures.append(
+                        f"L1第{expected_index + 1}条播放时长不一致: "
+                        f"parquet timestamp {playback_start_seconds!r} -> {playback_end_seconds!r}，"
+                        f"时长 {actual_duration_seconds!r} 秒；"
+                        f"代码标注时长 {_format_duration_seconds(expected_duration_ns)} 秒"
+                        f"（{expected_duration_ns!r} ns），"
+                        f"允许误差 {PLAYBACK_DURATION_TOLERANCE_SECONDS} 秒"
+                    )
         segment_comparisons.append(
             {
                 "expected": expected_item,
@@ -549,6 +654,7 @@ def compare_parquet_annotations(
         "actual_summary": summary,
         "level_comparisons": level_comparisons,
         "segment_comparisons": segment_comparisons,
+        "l1_playback_duration_comparisons": l1_playback_duration_comparisons,
         "unexpected_annotations": unexpected_annotations,
         "failures": failures,
     }

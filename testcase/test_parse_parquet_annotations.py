@@ -39,6 +39,7 @@ def _write_annotation_parquet(path):
         rows.append(
             {
                 "original_timestamp_ns": timestamp_ns,
+                "timestamp": frame_index / 50,
                 "episode_index": 0,
                 "frame_index": frame_index,
                 "index": frame_index,
@@ -122,3 +123,100 @@ def test_compare_parquet_annotations_reports_field_differences(tmp_path):
         for difference in comparison["differences"]
     }
     assert {"name", "end_timestamp_ns"}.issubset(difference_fields)
+
+
+def test_compare_parquet_annotations_reports_l1_playback_duration_difference(tmp_path):
+    parquet_path = tmp_path / "annotations.parquet"
+    _write_annotation_parquet(parquet_path)
+    expected_layers = _expected_layers()
+    expected_layers[0]["segments"][0]["endTimeNs"] = "100000100"
+    result = compare_parquet_annotations(
+        parquet_path,
+        expected_layers,
+        validate_l1_playback_duration=True,
+    )
+
+    assert result["is_consistent"] is False
+    assert result["l1_playback_duration_comparisons"] == [
+        {
+            "expected_duration_ns": 100000000,
+            "expected_duration_seconds": 0.1,
+            "parquet_playback_start_seconds": 0.0,
+            "parquet_playback_end_seconds": 0.04,
+            "parquet_playback_duration_seconds": 0.04,
+            "is_consistent": False,
+        }
+    ]
+    assert any(
+        "L1第1条播放时长不一致: parquet timestamp 0.0 -> 0.04，时长 0.04 秒；"
+        "代码标注时长 0.1 秒（100000000 ns），允许误差 0.04 秒" == failure
+        for failure in result["failures"]
+    )
+
+
+def test_compare_parquet_annotations_validates_each_l1_playback_independently(tmp_path):
+    parquet_path = tmp_path / "two_l1_episodes.parquet"
+    l1_first = _annotation(1, "l1-first", "first-task", 1_000_000_000, 3_000_000_000)
+    l1_second = _annotation(1, "l1-second", "second-task", 10_000_000_000, 13_000_000_000)
+    rows = []
+    for frame_index, (l1, timestamp, original_timestamp_ns) in enumerate(
+        (
+            (l1_first, 0.0, 1_100_000_000),
+            (l1_first, 2.0, 2_900_000_000),
+            (l1_second, 0.0, 10_100_000_000),
+            (l1_second, 3.0, 12_900_000_000),
+        )
+    ):
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "original_timestamp_ns": original_timestamp_ns,
+                "episode_index": frame_index // 2,
+                "frame_index": frame_index,
+                "index": frame_index,
+                "episode_id": f"episode-{frame_index // 2}",
+                "task": l1["name"],
+                "subtask": l1["name"],
+                "subtask_id": l1["id"],
+                "subtask_progress": 1.0,
+                "annotation.level_1_id": l1["id"],
+                "annotation.level_1_name": l1["name"],
+                "annotation.leaf_id": l1["id"],
+                "annotation.leaf_name": l1["name"],
+                "annotation.path": l1["name"],
+                "annotation.hierarchy_json": _hierarchy(l1),
+                "done": frame_index in (1, 3),
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+    expected_layers = [
+        {
+            "layerId": "l1",
+            "segments": [
+                {
+                    "segmentId": l1_first["id"],
+                    "description": l1_first["name"],
+                    "startTimeNs": l1_first["start_timestamp_ns"],
+                    "endTimeNs": l1_first["end_timestamp_ns"],
+                },
+                {
+                    "segmentId": l1_second["id"],
+                    "description": l1_second["name"],
+                    "startTimeNs": l1_second["start_timestamp_ns"],
+                    "endTimeNs": l1_second["end_timestamp_ns"],
+                },
+            ],
+        }
+    ]
+
+    result = compare_parquet_annotations(
+        parquet_path,
+        expected_layers,
+        validate_l1_playback_duration=True,
+    )
+
+    assert result["is_consistent"] is True
+    assert [
+        comparison["parquet_playback_duration_seconds"]
+        for comparison in result["l1_playback_duration_comparisons"]
+    ] == [2.0, 3.0]

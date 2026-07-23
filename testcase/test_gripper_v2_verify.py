@@ -1799,6 +1799,7 @@ class TestV2Verify:
             result = compare_parquet_annotations(
                 parquet_path=self.parquet_sources,
                 expected_layers=expected_layers,
+                validate_l1_playback_duration=True,
             )
             TestV2Verify.parquet_annotation_validation_result = result
             allure.attach(
