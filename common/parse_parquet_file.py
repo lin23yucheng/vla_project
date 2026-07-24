@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import re
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -725,6 +726,148 @@ def _save_preview_image(image_bytes: bytes, output_png_path: Path) -> tuple[Path
     return bin_path, "raw_bin_fallback"
 
 
+def _build_parquet_image_output_path(
+    output_root: Path,
+    column_name: str,
+    target_ns: int,
+    matched_timestamp_ns: int,
+    name_prefix: str | None,
+    extra_name_parts: list[str] | None,
+) -> Path:
+    name_parts = []
+    if name_prefix:
+        name_parts.append(_sanitize_filename_component(name_prefix))
+    name_parts.extend(
+        [
+            "parquet",
+            _infer_side_label(column_name),
+            _sanitize_filename_component(column_name),
+            f"target_{target_ns}",
+            f"matched_{matched_timestamp_ns}",
+        ]
+    )
+    for extra in extra_name_parts or []:
+        if extra:
+            name_parts.append(_sanitize_filename_component(extra))
+    return output_root / f"{'_'.join(name_parts)}.png"
+
+
+def _s3_video_object_name(source: Any, column_name: str) -> str:
+    object_name = str(getattr(source, "object_name", ""))
+    match = re.fullmatch(
+        r"(.+)/data/(chunk-\d+)/(episode_[^/]+)\.parquet",
+        object_name,
+    )
+    if match is None:
+        raise ValueError(f"无法从 parquet 路径推导视频路径: {object_name}")
+    dataset_prefix, chunk_name, episode_name = match.groups()
+    return f"{dataset_prefix}/videos/{column_name}/{chunk_name}/{episode_name}.mp4"
+
+
+def _extract_s3_video_frames_for_source(
+    source_batch: dict[str, Any],
+    selected_image_columns: list[str],
+    output_root: Path,
+    name_prefix: str | None,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """从 LeRobot S3 视频中一次解码多个目标帧，避开巨大的 Parquet bytes 列。"""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError("天机视频抽帧需要安装 requirements.txt 中的 av") from exc
+
+    source = source_batch["source"]
+    client = getattr(source, "client", None)
+    bucket = str(getattr(source, "bucket", ""))
+    if client is None or not bucket:
+        raise TypeError("S3 视频抽帧要求 parquet source 提供 client 和 bucket")
+
+    grouped_requests = [
+        pair
+        for row_group_requests in source_batch["row_groups"].values()
+        for pair in row_group_requests
+    ]
+    results: dict[str, dict[str, Any]] = {}
+    requests_by_frame: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+    for request, match in grouped_requests:
+        frame_index = int(match["row_index"])
+        requests_by_frame[frame_index].append((request, match))
+        results[request["key"]] = {
+            "parquet_file": match["source_name"],
+            "matched_row_group_index": match["row_group_index"],
+            "target_ns": request["target_ns"],
+            "matched_row_index": frame_index,
+            "matched_timestamp_ns": int(match["timestamp_ns"]),
+            "diff_ns": int(match["diff_ns"]),
+            "used_nearest": int(match["diff_ns"]) != 0,
+            "image_columns": selected_image_columns,
+            "output_dir": str(output_root),
+            "batch_row_group_target_count": len(
+                source_batch["row_groups"][int(match["row_group_index"])]
+            ),
+            "image_source_mode": "s3_video",
+            "saved_files": [],
+        }
+
+    target_frames = set(requests_by_frame)
+    video_files_read = 0
+    with tempfile.TemporaryDirectory(prefix="tianji_video_") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        for column_name in selected_image_columns:
+            video_object_name = _s3_video_object_name(source, column_name)
+            local_video = temporary_root / f"{_sanitize_filename_component(column_name)}.mp4"
+            client.fget_object(bucket, video_object_name, str(local_video))
+            video_files_read += 1
+
+            found_frames: set[int] = set()
+            with av.open(str(local_video)) as container:
+                stream = container.streams.video[0]
+                for frame_index, frame in enumerate(container.decode(stream)):
+                    if frame_index not in target_frames:
+                        continue
+                    for request, match in requests_by_frame[frame_index]:
+                        output_png = _build_parquet_image_output_path(
+                            output_root=output_root,
+                            column_name=column_name,
+                            target_ns=request["target_ns"],
+                            matched_timestamp_ns=int(match["timestamp_ns"]),
+                            name_prefix=name_prefix,
+                            extra_name_parts=request["extra_name_parts"],
+                        )
+                        output_png.parent.mkdir(parents=True, exist_ok=True)
+                        frame.to_image().save(output_png, format="PNG")
+                        results[request["key"]]["saved_files"].append(
+                            {
+                                "column": column_name,
+                                "side": _infer_side_label(column_name),
+                                "row_path": f"frame_{frame_index:06d}.png",
+                                "saved_path": str(output_png),
+                                "decode_mode": "s3_video_frame",
+                                "bytes_length": output_png.stat().st_size,
+                                "video_object": f"s3://{bucket}/{video_object_name}",
+                                "video_frame_index": frame_index,
+                            }
+                        )
+                    found_frames.add(frame_index)
+                    if found_frames == target_frames:
+                        break
+
+            missing_frames = sorted(target_frames - found_frames)
+            if missing_frames:
+                raise ValueError(
+                    f"视频 {video_object_name} 缺少目标帧: {missing_frames}"
+                )
+
+    expected_count = len(selected_image_columns)
+    for request_key, result in results.items():
+        if len(result["saved_files"]) != expected_count:
+            raise ValueError(
+                f"{request_key} 视频抽帧数量不完整: "
+                f"{len(result['saved_files'])} != {expected_count}"
+            )
+    return results, video_files_read
+
+
 def _build_parquet_image_result(
     match: dict[str, Any],
     nearest_row: dict[str, Any],
@@ -755,22 +898,14 @@ def _build_parquet_image_result(
             continue
 
         side_label = _infer_side_label(column_name)
-        name_parts = []
-        if name_prefix:
-            name_parts.append(_sanitize_filename_component(name_prefix))
-        name_parts.extend(
-            [
-                "parquet",
-                side_label,
-                _sanitize_filename_component(column_name),
-                f"target_{target_ns}",
-                f"matched_{nearest_timestamp_ns}",
-            ]
+        output_png = _build_parquet_image_output_path(
+            output_root=output_root,
+            column_name=column_name,
+            target_ns=target_ns,
+            matched_timestamp_ns=nearest_timestamp_ns,
+            name_prefix=name_prefix,
+            extra_name_parts=extra_name_parts,
         )
-        for extra in extra_name_parts or []:
-            if extra:
-                name_parts.append(_sanitize_filename_component(extra))
-        output_png = output_root / f"{'_'.join(name_parts)}.png"
         saved_path, decode_mode = _save_preview_image(bytes(image_bytes), output_png)
         saved_files.append(
             {
@@ -807,8 +942,9 @@ def extract_nearest_parquet_images_batch(
     output_dir: str | Path,
     image_columns: list[str] | None = None,
     name_prefix: str | None = None,
+    prefer_s3_videos: bool = False,
 ) -> dict[str, Any]:
-    """批量匹配多个时间点，并让每个图片 row group 只读取一次。"""
+    """批量匹配多个时间点，并以小批次流式扫描图片 row group。"""
     requests = []
     request_keys = set()
     for request in target_requests:
@@ -845,6 +981,7 @@ def extract_nearest_parquet_images_batch(
 
     results: dict[str, dict[str, Any]] = {}
     row_groups_read = 0
+    video_files_read = 0
     for source_batch in source_batches.values():
         with open_parquet_file(source_batch["source"]) as parquet_file:
             schema = parquet_file.schema_arrow
@@ -858,20 +995,52 @@ def extract_nearest_parquet_images_batch(
             if not selected_image_columns:
                 raise ValueError("parquet 中未找到可用图片列（期望 struct<bytes, path>）")
 
+            if prefer_s3_videos:
+                source_results, source_video_files_read = _extract_s3_video_frames_for_source(
+                    source_batch=source_batch,
+                    selected_image_columns=selected_image_columns,
+                    output_root=output_root,
+                    name_prefix=name_prefix,
+                )
+                results.update(source_results)
+                video_files_read += source_video_files_read
+                continue
+
             for row_group_index, grouped_requests in source_batch["row_groups"].items():
-                table = parquet_file.read_row_group(
-                    row_group_index,
+                requests_by_row: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+                for request, match in grouped_requests:
+                    requests_by_row[int(match["row_in_group"])].append((request, match))
+
+                target_rows = set(requests_by_row)
+                matched_rows: dict[int, dict[str, Any]] = {}
+                row_offset = 0
+                for batch in parquet_file.iter_batches(
+                    batch_size=8,
+                    row_groups=[row_group_index],
                     columns=selected_image_columns,
                     use_threads=False,
-                )
+                ):
+                    batch_end = row_offset + batch.num_rows
+                    rows_in_batch = sorted(
+                        row_index
+                        for row_index in target_rows
+                        if row_offset <= row_index < batch_end
+                    )
+                    for row_index in rows_in_batch:
+                        matched_rows[row_index] = batch.slice(row_index - row_offset, 1).to_pylist()[0]
+                    row_offset = batch_end
+                    if len(matched_rows) == len(target_rows):
+                        break
                 row_groups_read += 1
+
                 for request, match in grouped_requests:
                     row_in_group = int(match["row_in_group"])
-                    if row_in_group >= table.num_rows:
+                    nearest_row = matched_rows.get(row_in_group)
+                    if nearest_row is None:
                         raise IndexError(
-                            f"parquet row group 行号越界: {row_in_group} >= {table.num_rows}"
+                            f"parquet row group 未读取到目标行: row_group={row_group_index}, "
+                            f"row={row_in_group}, scanned_rows={row_offset}"
                         )
-                    nearest_row = table.slice(row_in_group, 1).to_pylist()[0]
                     results[request["key"]] = _build_parquet_image_result(
                         match=match,
                         nearest_row=nearest_row,
@@ -887,6 +1056,8 @@ def extract_nearest_parquet_images_batch(
         "target_count": len(requests),
         "source_count": len(source_batches),
         "row_groups_read": row_groups_read,
+        "video_files_read": video_files_read,
+        "image_source_mode": "s3_video" if prefer_s3_videos else "parquet_bytes",
         "output_dir": str(output_root),
         "results": {request["key"]: results[request["key"]] for request in requests},
     }
@@ -899,6 +1070,7 @@ def extract_nearest_parquet_images(
     image_columns: list[str] | None = None,
     name_prefix: str | None = None,
     extra_name_parts: list[str] | None = None,
+    prefer_s3_videos: bool = False,
 ) -> dict[str, Any]:
     """跨本地或远端 parquet 源寻找最近帧并导出图片。"""
     batch_result = extract_nearest_parquet_images_batch(
@@ -913,6 +1085,7 @@ def extract_nearest_parquet_images(
         output_dir=output_dir,
         image_columns=image_columns,
         name_prefix=name_prefix,
+        prefer_s3_videos=prefer_s3_videos,
     )
     return batch_result["results"]["single"]
 

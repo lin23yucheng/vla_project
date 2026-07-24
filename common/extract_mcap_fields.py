@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -78,17 +79,26 @@ def load_configured_topic_fields(
 
 
 def get_nested_field_value(message: Any, field_path: str) -> Any:
-    """从动态 ROS2 消息对象中按点分路径读取字段。"""
+    """从动态 ROS2 消息对象中按点分路径读取字段，支持数组下标如 ``data[0]``。"""
     current = message
     for part in field_path.split("."):
+        match = re.fullmatch(r"([^\[\]]+)(?:\[(\d+)\])?", part)
+        if match is None:
+            raise ValueError(f"字段路径格式无效: {field_path}")
+        field_name, index_text = match.groups()
         if isinstance(current, dict):
-            if part not in current:
-                raise KeyError(f"字段路径 {field_path} 缺少节点 {part}")
-            current = current[part]
+            if field_name not in current:
+                raise KeyError(f"字段路径 {field_path} 缺少节点 {field_name}")
+            current = current[field_name]
         else:
-            if not hasattr(current, part):
-                raise AttributeError(f"字段路径 {field_path} 缺少属性 {part}")
-            current = getattr(current, part)
+            if not hasattr(current, field_name):
+                raise AttributeError(f"字段路径 {field_path} 缺少属性 {field_name}")
+            current = getattr(current, field_name)
+        if index_text is not None:
+            try:
+                current = current[int(index_text)]
+            except (IndexError, KeyError, TypeError) as exc:
+                raise IndexError(f"字段路径 {field_path} 的下标 {index_text} 无效") from exc
     return current
 
 
@@ -547,17 +557,26 @@ def _load_gripper_entries(config_path: str | Path) -> dict[tuple[str, str], dict
     entries: dict[tuple[str, str], dict[str, Any]] = {}
     for section in CONFIG_SECTIONS:
         for item in config_data.get(section, []):
-            if not isinstance(item, dict) or item.get("fields") != ["angle"]:
+            if not isinstance(item, dict):
                 continue
             group = item.get("group")
             topic = item.get("topic")
-            if group in {"left", "right"} and isinstance(topic, str):
+            fields = item.get("fields")
+            is_gripper = item.get("parser") == "gripper" or fields == ["angle"]
+            if (
+                is_gripper
+                and group in {"left", "right"}
+                and isinstance(topic, str)
+                and isinstance(fields, list)
+                and len(fields) == 1
+                and isinstance(fields[0], str)
+            ):
                 entries[(section, group)] = {
                     "section": section,
                     "name": item.get("name"),
                     "group": group,
                     "topic": topic,
-                    "fields": ["angle"],
+                    "fields": fields,
                 }
     expected_keys = [
         (section, group)
@@ -566,7 +585,7 @@ def _load_gripper_entries(config_path: str | Path) -> dict[tuple[str, str], dict
     ]
     missing_keys = [key for key in expected_keys if key not in entries]
     if missing_keys:
-        raise ValueError(f"机器人配置缺少夹爪 angle 配置: {missing_keys}")
+        raise ValueError(f"机器人配置缺少有效夹爪配置: {missing_keys}")
     return entries
 
 
@@ -838,13 +857,14 @@ def extract_robot_vectors_at_time(
         gripper_strategy, gripper_ratio, gripper_first, gripper_second = _resolve_interpolation(
             gripper_neighbors, main_frame_ns, max_tolerance_ns
         )
-        angle = float(get_nested_field_value(gripper_first["ros_message"], "angle"))
+        gripper_field = gripper_entry["fields"][0]
+        angle = float(get_nested_field_value(gripper_first["ros_message"], gripper_field))
         if (
             gripper_strategy == "interpolated"
             and gripper_second is not None
             and gripper_ratio is not None
         ):
-            second_angle = float(get_nested_field_value(gripper_second["ros_message"], "angle"))
+            second_angle = float(get_nested_field_value(gripper_second["ros_message"], gripper_field))
             angle = _linear_interpolate(angle, second_angle, gripper_ratio)
         values_by_label = {
             "x": pose_values["pose.position.x"],

@@ -3,6 +3,7 @@
 支持保存图像元数据及解码后的图片文件
 """
 
+import io
 import json
 import os
 import re
@@ -170,6 +171,105 @@ def parse_ros2_image(data: bytes) -> Optional[ParsedImageInfo]:
         return result
     except Exception:
         return None
+
+
+def parse_ros2_compressed_image(data: bytes) -> Optional[ParsedImageInfo]:
+    """解析 ROS2 sensor_msgs/CompressedImage，并统一转换为原始像素信息。"""
+    try:
+        from PIL import Image
+
+        offset = 4  # CDR encapsulation header
+
+        def align(boundary: int):
+            nonlocal offset
+            remainder = offset % boundary
+            if remainder:
+                offset += boundary - remainder
+
+        def ensure_size(size: int):
+            if offset + size > len(data):
+                raise ValueError("消息长度不足，无法继续解析")
+
+        def read_cdr_string() -> str:
+            nonlocal offset
+            align(4)
+            ensure_size(4)
+            value_length = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+            ensure_size(value_length)
+            value = (
+                data[offset:offset + value_length - 1].decode("utf-8", errors="ignore")
+                if value_length > 0
+                else ""
+            )
+            offset += value_length
+            return value
+
+        if len(data) < 4:
+            return None
+
+        align(4)
+        ensure_size(8)
+        sec = struct.unpack_from("<i", data, offset)[0]
+        offset += 4
+        nanosec = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        frame_id = read_cdr_string()
+        _compressed_format = read_cdr_string()
+
+        align(4)
+        ensure_size(4)
+        compressed_length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        ensure_size(compressed_length)
+        compressed_data = data[offset:offset + compressed_length]
+
+        with Image.open(io.BytesIO(compressed_data)) as image:
+            image.load()
+            if image.mode in {"1", "L", "I", "I;16", "F"}:
+                normalized = image.convert("L")
+                encoding = "mono8"
+                channels = 1
+            elif "A" in image.getbands():
+                normalized = image.convert("RGBA")
+                encoding = "rgba8"
+                channels = 4
+            else:
+                normalized = image.convert("RGB")
+                encoding = "rgb8"
+                channels = 3
+            width, height = normalized.size
+            image_data = normalized.tobytes()
+
+        return {
+            "header_stamp_sec": sec,
+            "header_stamp_nanosec": nanosec,
+            "frame_id": frame_id,
+            "height": height,
+            "width": width,
+            "encoding": encoding,
+            "is_bigendian": 0,
+            "step": width * channels,
+            "data": image_data,
+            "data_length": len(image_data),
+        }
+    except Exception:
+        return None
+
+
+def parse_ros2_image_message(
+    data: bytes,
+    schema_name: str | None = None,
+) -> Optional[ParsedImageInfo]:
+    """根据 MCAP schema 解析原始或压缩 ROS2 图片消息。"""
+    normalized_schema = (schema_name or "").strip().lower()
+    if normalized_schema.endswith("/compressedimage"):
+        return parse_ros2_compressed_image(data)
+    if normalized_schema.endswith("/image"):
+        return parse_ros2_image(data)
+
+    # 兼容没有 schema 元信息的旧 MCAP。
+    return parse_ros2_image(data) or parse_ros2_compressed_image(data)
 
 
 def decode_image_for_preview(image_info: ParsedImageInfo):
@@ -499,6 +599,7 @@ def extract_global_nearest_image_from_mcap_sources(
             )
             window_cache_hits += int(cache_hit)
             for window_record in window_records:
+                schema = window_record["schema"]
                 channel = window_record["channel"]
                 message = window_record["message"]
                 topic_name = channel.topic
@@ -514,6 +615,7 @@ def extract_global_nearest_image_from_mcap_sources(
                         "matched_ns": int(message.publish_time),
                         "diff_ns": diff_ns,
                         "data": bytes(message.data),
+                        "schema_name": getattr(schema, "name", None),
                     }
             return
 
@@ -532,7 +634,7 @@ def extract_global_nearest_image_from_mcap_sources(
                             f"远端 MCAP 缺少 chunk index，拒绝顺序读取完整对象: "
                             f"{mcap_source_name(mcap_file)}"
                         )
-                for _, channel, message in reader.iter_messages(
+                for schema, channel, message in reader.iter_messages(
                     topics=scan_topics,
                     start_time=start_time,
                     end_time=end_time,
@@ -548,6 +650,7 @@ def extract_global_nearest_image_from_mcap_sources(
                             "matched_ns": int(message.publish_time),
                             "diff_ns": diff_ns,
                             "data": bytes(message.data),
+                            "schema_name": getattr(schema, "name", None),
                         }
 
     search_attempt_windows_ns: list[int | None] = []
@@ -594,9 +697,19 @@ def extract_global_nearest_image_from_mcap_sources(
             )
             continue
 
-        img_info = parse_ros2_image(best["data"])
+        schema_name = best.get("schema_name")
+        img_info = parse_ros2_image_message(best["data"], schema_name)
         if not img_info:
-            errors.append({"topic_name": topic_name, "error": f"topic={topic_name} 的最近消息无法解析为 ROS2 Image"})
+            errors.append(
+                {
+                    "topic_name": topic_name,
+                    "schema_name": schema_name,
+                    "error": (
+                        f"topic={topic_name} 的最近消息无法按 schema={schema_name!r} "
+                        "解析为 ROS2 图片"
+                    ),
+                }
+            )
             continue
 
         side_label = _infer_side_label(topic_name)
@@ -636,6 +749,7 @@ def extract_global_nearest_image_from_mcap_sources(
                 "saved_paths": save_result["saved_paths"],
                 "preview_path": save_result["preview_path"],
                 "preview_error": save_result["preview_error"],
+                "schema_name": schema_name,
                 "encoding": img_info.get("encoding"),
                 "width": img_info.get("width"),
                 "height": img_info.get("height"),
@@ -643,7 +757,11 @@ def extract_global_nearest_image_from_mcap_sources(
         )
 
     if not results:
-        raise ValueError(f"在 {mcap_source_label} 中未提取到任何 topic={topics} 的图片")
+        error_details = "; ".join(error["error"] for error in errors)
+        raise ValueError(
+            f"在 {mcap_source_label} 中未提取到任何 topic={topics} 的图片"
+            f"；详情: {error_details}"
+        )
 
     return {
         "mcap_dir": mcap_source_label,

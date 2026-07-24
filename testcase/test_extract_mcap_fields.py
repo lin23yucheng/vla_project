@@ -17,6 +17,7 @@ from common.extract_mcap_fields import (
     DEFAULT_MAX_TOLERANCE_NS,
     _build_interpolation_neighbors,
     _incomplete_interpolation_topics,
+    _load_gripper_entries,
     extract_robot_vectors_at_time,
     get_nested_field_value,
     interpolate_pose7d,
@@ -124,6 +125,23 @@ def test_load_configured_topic_fields_discovers_pose7d_topics(tmp_path: Path):
 def test_get_nested_field_value():
     """验证可通过点号路径从嵌套对象中正确读取属性值。"""
     assert get_nested_field_value(Message(), "pose.position.x") == 1.25
+
+
+def test_get_nested_field_value_supports_array_index():
+    """天机夹爪反馈的数值位于 ROS 数组字段 data[0]。"""
+    assert get_nested_field_value({"data": [1.25]}, "data[0]") == 1.25
+
+
+def test_load_tianji_gripper_entries_uses_data_index():
+    config_path = Path(__file__).parent.parent / "Robot_Configuration" / "天机构型.json"
+
+    entries = _load_gripper_entries(config_path)
+
+    assert len(entries) == 4
+    assert {entry["topic"] for entry in entries.values()} == {
+        "/info/gripper_feedback_L", "/info/gripper_feedback_R",
+    }
+    assert all(entry["fields"] == ["data[0]"] for entry in entries.values())
 
 
 def test_get_nested_field_value_rejects_missing_path():
@@ -268,3 +286,61 @@ def test_robot_vector_extraction_uses_one_combined_window_scan(monkeypatch):
     assert result["used_sensor_window_extension"] is False
     assert result["window_cache_hits"] == 0
     assert len(result["vectors"]) == 4
+
+
+def test_robot_vector_extraction_reads_tianji_gripper_data_index(monkeypatch):
+    """夹爪输出标签固定为 angle，但数值须遵循构型中的 data[0] 字段。"""
+    target_ns = 1_000_000_000
+    pose_fields = [
+        "pose.position.x", "pose.position.y", "pose.position.z",
+        "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w",
+    ]
+    pose_entries = [
+        {"section": section, "group": group, "topic": f"/pose_{group}", "fields": pose_fields}
+        for section in ("action", "observation_state")
+        for group in ("left", "right")
+    ]
+    gripper_entries = {
+        (section, group): {"topic": f"/gripper_{group}", "fields": ["data[0]"]}
+        for section in ("action", "observation_state")
+        for group in ("left", "right")
+    }
+    pose_message = {
+        "pose": {
+            "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+    }
+    monkeypatch.setattr("common.extract_mcap_fields.load_configured_topic_fields", lambda *args, **kwargs: pose_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_gripper_entries", lambda *args, **kwargs: gripper_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_main_time_topic", lambda *args, **kwargs: "/main")
+
+    def fake_scan(mcap_files, main_time_topic, sensor_topics, scan_target_ns, start_time, end_time, **kwargs):
+        records = {
+            topic: [{
+                "mcap_file": "fake.mcap", "topic": topic, "schema_name": "fake",
+                "matched_publish_ns": target_ns, "matched_log_ns": target_ns,
+                "ros_message": pose_message if topic.startswith("/pose") else {"data": [2.5]},
+            }]
+            for topic in sensor_topics
+        }
+        return (
+            {
+                "mcap_file": "fake.mcap", "topic": "/main", "schema_name": "image",
+                "matched_publish_ns": target_ns, "matched_log_ns": target_ns, "diff_ns": 0,
+            },
+            records,
+            len(records),
+            False,
+        )
+
+    monkeypatch.setattr("common.extract_mcap_fields._scan_main_frame_and_sensor_messages", fake_scan)
+
+    result = extract_robot_vectors_at_time(
+        config_path="unused.json", mcap_dir=None, target_ns=target_ns,
+        mcap_sources=[object()], mcap_source_label="test", require_chunk_indexes=True,
+        allow_full_scan_fallback=False,
+    )
+
+    assert [item["values_by_label"]["angle"] for item in result["vectors"]] == [2.5] * 4
+    assert all(item["gripper_fields"] == ["data[0]"] for item in result["vectors"])

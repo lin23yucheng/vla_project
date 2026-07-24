@@ -25,6 +25,17 @@ def _infer_display_group(field_name: str) -> str | None:
     return None
 
 
+def _infer_vector_label(field_name: str) -> str | None:
+    """将转换后的展示字段归一化为标准七维标签。"""
+    normalized = field_name.lower().replace("-", "_")
+    label = normalized.rsplit(".", 1)[-1]
+    if label in VECTOR_LABELS:
+        return label
+    if label == "data[0]" and "gripper" in normalized.replace(".", "_").split("_"):
+        return "angle"
+    return None
+
+
 def _build_group_layout(
     source_vector: list[Any],
     display_values: dict[str, Any],
@@ -42,8 +53,8 @@ def _build_group_layout(
     grouped_fields: dict[str, dict[str, tuple[int, str]]] = {"left": {}, "right": {}}
     for index, field_name in enumerate(display_fields):
         group = _infer_display_group(field_name)
-        label = field_name.rsplit(".", 1)[-1].lower()
-        if group is None or label not in VECTOR_LABELS:
+        label = _infer_vector_label(field_name)
+        if group is None or label is None:
             raise ValueError(f"无法识别 parquet {display_column} 字段: {field_name}")
         if label in grouped_fields[group]:
             raise ValueError(f"parquet {display_column} 中 {group}/{label} 字段重复")

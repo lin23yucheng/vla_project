@@ -37,6 +37,9 @@ EXPECTED_SEGMENT_COUNTS = {"l1": 2, "l2": 4, "l3": 3}
 EXPECTED_CAMERA_COUNT = 4
 CONVERSION_POLL_INTERVAL_SECONDS = 10
 CONVERSION_POLL_TIMEOUT_SECONDS = 15 * 60
+TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS = 1.0
+TIANJI_IMAGE_MIN_MATCH_RATIO = 0.85
+TIANJI_IMAGE_MAX_MEAN_ABSOLUTE_ERROR = 4.5
 
 # start/end 为 MCAP 绝对纳秒；存在跳帧时需同时填写接口返回的 episode 起止纳秒。
 TASK_ANNOTATION_CONFIG = {
@@ -448,6 +451,57 @@ def find_conversion_entry(conversion_list, task_id):
     return None
 
 
+def format_image_comparison_summary(comparison: dict[str, Any]) -> str:
+    """把图片比较指标转换成可直接定位问题的控制台说明。"""
+    if not comparison.get("dimension_match"):
+        mcap_size = comparison.get("reference_size")
+        parquet_size = comparison.get("candidate_size")
+
+        def format_size(size: Any) -> str:
+            if isinstance(size, (list, tuple)) and len(size) == 2:
+                return f"{size[0]}x{size[1]}"
+            return "未知"
+
+        return (
+            f"尺寸不一致：MCAP={format_size(mcap_size)}，"
+            f"Parquet={format_size(parquet_size)}；尺寸不同，未执行像素比较"
+        )
+
+    similarity = comparison.get("similarity_percent")
+    mean_error = comparison.get("mean_absolute_error")
+    max_error = comparison.get("max_absolute_error")
+    min_match_ratio = float(comparison.get("min_match_ratio", 0)) * 100
+    max_mean_error = comparison.get("max_mean_absolute_error")
+    if similarity is None or mean_error is None:
+        return str(comparison.get("failure_reason") or "图片比较未产生有效指标")
+    resize_summary = ""
+    if comparison.get("reference_resized"):
+        reference_size = comparison.get("reference_size")
+        comparison_size = comparison.get("comparison_size")
+
+        def format_size(size: Any) -> str:
+            if isinstance(size, (list, tuple)) and len(size) == 2:
+                return f"{size[0]}x{size[1]}"
+            return "未知"
+
+        resize_summary = (
+            f"MCAP已从{format_size(reference_size)}缩放为"
+            f"{format_size(comparison_size)}"
+            f"（{comparison.get('reference_resize_resampling')}）；"
+        )
+    blur_summary = ""
+    if comparison.get("gaussian_blur_applied"):
+        blur_summary = (
+            "两侧已进行高斯平滑"
+            f"（半径={comparison.get('gaussian_blur_radius')}）；"
+        )
+    return resize_summary + blur_summary + (
+        f"像素匹配率={float(similarity):.3f}%（要求>={min_match_ratio:.3f}%），"
+        f"平均像素误差={float(mean_error):.6f}（要求<={max_mean_error}），"
+        f"最大像素误差={max_error}"
+    )
+
+
 global_client = create_lazy_yixiu_client()
 
 
@@ -642,11 +696,11 @@ class TestTianjiV2Verify:
         cls.output_dirs_prepared = True
 
     @staticmethod
-    def _parquet_image_path(extract_result: dict[str, Any], camera_key: str) -> Path:
+    def _parquet_image_path(extract_result: dict[str, Any], camera_name: str) -> Path:
         for item in extract_result.get("saved_files", []):
-            if item.get("column") == camera_key and item.get("saved_path"):
+            if item.get("column") == camera_name and item.get("saved_path"):
                 return Path(item["saved_path"])
-        raise AssertionError(f"parquet 提取结果中未找到相机列 {camera_key}")
+        raise AssertionError(f"parquet 提取结果中未找到相机列 {camera_name}")
 
     @staticmethod
     def _mcap_image_path(extract_result: dict[str, Any], topic: str) -> Path:
@@ -664,7 +718,7 @@ class TestTianjiV2Verify:
         time_key: str,
         target_ns: int,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """一次 Range 扫描同时提取目标时间的四路远端 MCAP 图片。"""
+        """一次 Range 扫描提取与 Parquet 实际命中帧对齐的四路 MCAP 图片。"""
         assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
         project_root = Path(__file__).resolve().parent.parent
         common_name_parts = [segment_key, time_key]
@@ -675,11 +729,16 @@ class TestTianjiV2Verify:
             f"{segment_key}/{time_key} parquet 批量图片目标时间不一致: "
             f"{parquet_result['target_ns']} != {target_ns}"
         )
+        parquet_matched_ns = parquet_result.get("matched_timestamp_ns")
+        assert parquet_matched_ns is not None, (
+            f"{segment_key}/{time_key} parquet 图片提取结果缺少 matched_timestamp_ns"
+        )
+        mcap_target_ns = int(parquet_matched_ns)
         mcap_result = extract_global_nearest_image_from_mcap_sources(
             mcap_sources=self.mcap_sources,
             mcap_source_label=self.mcap_source_label,
             topics=[camera["topic"] for camera in self.cameras],
-            target_ns=target_ns,
+            target_ns=mcap_target_ns,
             output_dir=project_root / "mcap_image",
             name_prefix=self.task_no,
             extra_name_parts=common_name_parts,
@@ -687,6 +746,8 @@ class TestTianjiV2Verify:
             require_chunk_indexes=True,
             additional_cache_topics=self.mcap_prefetch_topics,
         )
+        mcap_result["annotation_target_ns"] = target_ns
+        mcap_result["parquet_matched_timestamp_ns"] = mcap_target_ns
         allure.attach(
             json.dumps(
                 {
@@ -722,14 +783,17 @@ class TestTianjiV2Verify:
             parquet_path=self.parquet_sources,
             target_requests=target_requests,
             output_dir=Path(__file__).resolve().parent.parent / "parquet_image",
-            image_columns=[camera["key"] for camera in self.cameras],
+            # 天机 V2 Parquet 的图片列名对应构型中的 name，而不是 observation.images.* key。
+            image_columns=[camera["name"] for camera in self.cameras],
             name_prefix=self.task_no,
+            prefer_s3_videos=True,
         )
         TestTianjiV2Verify.parquet_image_batch_extract_results = batch_result["results"]
         print(
             f"[步骤10] parquet图片批量提取完成: 时间点={batch_result['target_count']}，"
             f"源文件={batch_result['source_count']}，"
-            f"实际读取row group={batch_result['row_groups_read']}",
+            f"实际读取row group={batch_result['row_groups_read']}，"
+            f"读取视频文件={batch_result['video_files_read']}",
             flush=True,
         )
         allure.attach(
@@ -738,6 +802,8 @@ class TestTianjiV2Verify:
                     "target_count": batch_result["target_count"],
                     "source_count": batch_result["source_count"],
                     "row_groups_read": batch_result["row_groups_read"],
+                    "video_files_read": batch_result["video_files_read"],
+                    "image_source_mode": batch_result["image_source_mode"],
                     "output_dir": batch_result["output_dir"],
                 },
                 ensure_ascii=False,
@@ -758,7 +824,7 @@ class TestTianjiV2Verify:
         mcap_result: dict[str, Any],
     ) -> dict[str, Any]:
         project_root = Path(__file__).resolve().parent.parent
-        parquet_image = self._parquet_image_path(parquet_result, camera["key"])
+        parquet_image = self._parquet_image_path(parquet_result, camera["name"])
         mcap_image = self._mcap_image_path(mcap_result, camera["topic"])
         assert parquet_image.suffix.lower() == ".png", f"parquet 图片未解码为 PNG: {parquet_image}"
         assert mcap_image.suffix.lower() == ".png", f"MCAP 图片未解码为 PNG: {mcap_image}"
@@ -774,6 +840,13 @@ class TestTianjiV2Verify:
             reference_path=mcap_image,
             candidate_path=parquet_image,
             diff_output_path=diff_path,
+            min_match_ratio=TIANJI_IMAGE_MIN_MATCH_RATIO,
+            max_mean_absolute_error=TIANJI_IMAGE_MAX_MEAN_ABSOLUTE_ERROR,
+            # 天机原始相机帧固定为 960x744，V2 视频帧固定为 640x480。
+            # 两侧轻微平滑用于消除缩放和视频编码产生的高频像素误差。
+            # 仅此用例启用预处理；其他构型仍沿用原始严格规则。
+            resize_reference_to_candidate=True,
+            gaussian_blur_radius=TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS,
         )
         comparison.update(
             {
@@ -785,17 +858,19 @@ class TestTianjiV2Verify:
         )
 
         attachment_prefix = f"{segment_key}-{time_key}-{camera['name']}"
-        allure.attach.file(
-            str(mcap_image),
-            name=f"{attachment_prefix}-MCAP",
-            attachment_type=allure.attachment_type.PNG,
-        )
-        allure.attach.file(
-            str(parquet_image),
-            name=f"{attachment_prefix}-Parquet",
-            attachment_type=allure.attachment_type.PNG,
-        )
-        if comparison.get("diff_path"):
+        comparison["artifacts_retained"] = not comparison["is_consistent"]
+        if not comparison["is_consistent"]:
+            allure.attach.file(
+                str(mcap_image),
+                name=f"{attachment_prefix}-MCAP",
+                attachment_type=allure.attachment_type.PNG,
+            )
+            allure.attach.file(
+                str(parquet_image),
+                name=f"{attachment_prefix}-Parquet",
+                attachment_type=allure.attachment_type.PNG,
+            )
+        if not comparison["is_consistent"] and comparison.get("diff_path"):
             allure.attach.file(
                 comparison["diff_path"],
                 name=f"{attachment_prefix}-像素差异图",
@@ -806,11 +881,11 @@ class TestTianjiV2Verify:
             name=f"{attachment_prefix}-图片一致性指标",
             attachment_type=allure.attachment_type.JSON,
         )
-        assert comparison["is_consistent"], (
-            f"{segment_key}/{time_key}/{camera['name']} 图片不一致: "
-            f"similarity={comparison.get('similarity_percent')}%, "
-            f"mean_absolute_error={comparison.get('mean_absolute_error')}"
-        )
+        if comparison["is_consistent"]:
+            mcap_image.unlink(missing_ok=True)
+            parquet_image.unlink(missing_ok=True)
+        if not comparison["is_consistent"]:
+            raise AssertionError(format_image_comparison_summary(comparison))
         return comparison
 
     def _verify_one_robot_vector_time(
@@ -820,19 +895,26 @@ class TestTianjiV2Verify:
         target_ns: int,
     ) -> dict[str, Any]:
         assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
+        parquet_result = extract_parquet_robot_vectors_at_time(
+            parquet_path=self.parquet_sources,
+            target_ns=target_ns,
+        )
+        parquet_matched_ns = parquet_result.get("matched_timestamp_ns")
+        assert parquet_matched_ns is not None, (
+            f"{segment_key}/{time_key} parquet 向量结果缺少 matched_timestamp_ns"
+        )
+        mcap_target_ns = int(parquet_matched_ns)
         mcap_result = extract_robot_vectors_at_time(
             config_path=self.robot_config_path,
             mcap_dir=None,
-            target_ns=target_ns,
+            target_ns=mcap_target_ns,
             mcap_sources=self.mcap_sources,
             mcap_source_label=self.mcap_source_label,
             require_chunk_indexes=True,
             allow_full_scan_fallback=False,
         )
-        parquet_result = extract_parquet_robot_vectors_at_time(
-            parquet_path=self.parquet_sources,
-            target_ns=target_ns,
-        )
+        mcap_result["annotation_target_ns"] = target_ns
+        mcap_result["parquet_matched_timestamp_ns"] = mcap_target_ns
         assert len(mcap_result.get("vectors", [])) == 4, (
             f"{segment_key}/{time_key} MCAP 预期4组七维向量，"
             f"实际为 {len(mcap_result.get('vectors', []))}"
@@ -860,6 +942,7 @@ class TestTianjiV2Verify:
         )
         if not comparison["is_consistent"]:
             differences = []
+            tolerance = comparison["absolute_tolerance"]
             for item in comparison["comparisons"]:
                 for dimension in item["dimensions"]:
                     if not dimension["is_consistent"]:
@@ -867,10 +950,15 @@ class TestTianjiV2Verify:
                             f"{item['section']}/{item['group']}/{dimension['label']}: "
                             f"MCAP={dimension['mcap_value']}, "
                             f"Parquet={dimension['parquet_value']}, "
-                            f"差值={dimension['absolute_difference']}"
+                            f"差值={dimension['absolute_difference']:.12g} "
+                            f"（允许<={tolerance:.12g}）"
                         )
             raise AssertionError(
-                f"{segment_key}/{time_key} 七维向量不一致:\n" + "\n".join(differences)
+                "向量值超出允许误差：\n"
+                f"标注时间={target_ns}\n"
+                f"Parquet实际帧={parquet_matched_ns}\n"
+                f"MCAP主相机帧={mcap_result.get('main_frame_ns')}\n"
+                + "\n".join(differences)
             )
         return result
 
@@ -1275,6 +1363,7 @@ class TestTianjiV2Verify:
             total_image_cases = total_time_points * len(self.cameras)
             time_point_index = 0
             image_case_index = 0
+            failed_image_cases = 0
             print(
                 f"[步骤10] 开始校验: {total_time_points}个时间点，"
                 f"{len(self.cameras)}路相机，共{total_image_cases}组图片",
@@ -1292,8 +1381,8 @@ class TestTianjiV2Verify:
                     time_results = {}
                     print(
                         f"[步骤10][时间点 {time_point_index}/{total_time_points}] "
-                        f"{segment_key}/{time_key} target_ns={target_ns}，"
-                        "开始提取parquet与S3 MCAP四路图片",
+                        f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
+                        "开始提取 Parquet 与 MCAP 四路图片",
                         flush=True,
                     )
                     try:
@@ -1308,6 +1397,7 @@ class TestTianjiV2Verify:
                         )
                         failures.append(error_message)
                         image_case_index += len(self.cameras)
+                        failed_image_cases += len(self.cameras)
                         print(
                             f"[步骤10][图片 {image_case_index - len(self.cameras) + 1}-"
                             f"{image_case_index}/{total_image_cases}] {error_message}",
@@ -1340,10 +1430,8 @@ class TestTianjiV2Verify:
                                 time_results[camera["name"]] = comparison
                                 print(
                                     f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
-                                    f"{case_key} consistent={comparison['is_consistent']}，"
-                                    f"similarity={comparison.get('similarity_percent')}%，"
-                                    f"mean_absolute_error="
-                                    f"{comparison.get('mean_absolute_error')}",
+                                    f"{case_key} 校验通过；"
+                                    f"{format_image_comparison_summary(comparison)}",
                                     flush=True,
                                 )
                             except (
@@ -1357,6 +1445,7 @@ class TestTianjiV2Verify:
                                 error_message = f"{case_key} 图片校验失败: {exc}"
                                 time_results[camera["name"]] = {"error": str(exc)}
                                 failures.append(error_message)
+                                failed_image_cases += 1
                                 print(
                                     f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
                                     f"{error_message}",
@@ -1376,8 +1465,9 @@ class TestTianjiV2Verify:
                 attachment_type=allure.attachment_type.JSON,
             )
             print(
-                f"[步骤10] 图片校验完成: 总数={total_image_cases}，"
-                f"失败={len(failures)}",
+                f"[步骤10] 图片校验完成：总数={total_image_cases}，"
+                f"通过={total_image_cases - failed_image_cases}，"
+                f"失败={failed_image_cases}",
                 flush=True,
             )
             assert not failures, "全部标注图片校验存在失败:\n" + "\n".join(failures)
@@ -1390,8 +1480,8 @@ class TestTianjiV2Verify:
             results: dict[str, Any] = {}
             total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
             print(
-                f"[步骤11] 开始校验: {total_time_points}个时间点，"
-                "每个时间点对比4组MCAP与parquet七维向量",
+                f"[步骤11] 开始校验：{total_time_points}个时间点；"
+                "每个时间点比较4组向量，每组7个值，共28项",
                 flush=True,
             )
             time_point_index = 0
@@ -1406,7 +1496,8 @@ class TestTianjiV2Verify:
                     target_ns = self._resolve_segment_time_ns(segment_key, field_name)
                     print(
                         f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
-                        f"{segment_key}/{time_key} target_ns={target_ns}，开始校验七维向量",
+                        f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
+                        "开始查找 Parquet 实际帧并校验向量",
                         flush=True,
                     )
                     with allure.step(f"{segment_key}{time_label}七维向量对比"):
@@ -1420,10 +1511,12 @@ class TestTianjiV2Verify:
                             comparison = result["comparison"]
                             print(
                                 f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
-                                f"{segment_key}/{time_key} consistent="
-                                f"{comparison['is_consistent']}，"
-                                f"MCAP缓存命中="
-                                f"{result['mcap_result'].get('window_cache_hits', 0)}",
+                                f"{segment_key}/{time_label}（{time_key}）校验通过；"
+                                f"Parquet实际帧="
+                                f"{result['parquet_result']['matched_timestamp_ns']}，"
+                                f"MCAP主相机帧={result['mcap_result']['main_frame_ns']}，"
+                                f"28项差值均<="
+                                f"{comparison['absolute_tolerance']:.12g}",
                                 flush=True,
                             )
                         except (
@@ -1455,8 +1548,8 @@ class TestTianjiV2Verify:
                 attachment_type=allure.attachment_type.JSON,
             )
             print(
-                f"[步骤11] 七维向量校验完成: 时间点={total_time_points}，"
-                f"失败={len(failures)}",
+                f"[步骤11] 七维向量校验完成：时间点={total_time_points}，"
+                f"通过={total_time_points - len(failures)}，失败={len(failures)}",
                 flush=True,
             )
             assert not failures, "全部标注七维向量校验存在失败:\n" + "\n".join(failures)

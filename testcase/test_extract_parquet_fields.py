@@ -21,12 +21,12 @@ from common.extract_parquet_fields import (
 POSE_LABELS = VECTOR_LABELS[:-1]
 
 
-def _write_robot_parquet(path, include_angle: bool) -> None:
+def _write_robot_parquet(path, include_angle: bool, gripper_field: str = "angle") -> None:
     display_fields = []
     for group in ("left", "right"):
         display_fields.extend(f"{group}_joint_states.{label}" for label in POSE_LABELS)
         if include_angle:
-            display_fields.append(f"{group}_gripper.angle")
+            display_fields.append(f"{group}_gripper.{gripper_field}")
     values = [float(index) for index in range(1, len(display_fields) + 1)]
     display_type = pa.struct([pa.field(name, pa.float32()) for name in display_fields])
     display_value = dict(zip(display_fields, values))
@@ -66,6 +66,19 @@ def test_extract_parquet_robot_vectors_supports_complete_layout(tmp_path):
         assert item["vector_labels"] == VECTOR_LABELS
         assert item["missing_vector_labels"] == []
         assert len(item["vector"]) == len(VECTOR_LABELS)
+
+
+def test_extract_parquet_robot_vectors_maps_tianji_data_index_to_angle(tmp_path):
+    parquet_path = tmp_path / "tianji_robot.parquet"
+    _write_robot_parquet(parquet_path, include_angle=True, gripper_field="data[0]")
+
+    result = extract_parquet_robot_vectors_at_time(parquet_path, target_ns=101)
+
+    assert len(result["vectors"]) == 4
+    for item in result["vectors"]:
+        assert item["vector_labels"] == VECTOR_LABELS
+        assert item["display_fields"][-1].endswith("_gripper.data[0]")
+        assert item["values_by_label"]["angle"] == item["vector"][-1]
 
 
 def test_extract_parquet_robot_vectors_rejects_missing_angle(tmp_path):

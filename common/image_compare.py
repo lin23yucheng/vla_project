@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 DEFAULT_PIXEL_TOLERANCE = 10
@@ -19,8 +19,10 @@ def compare_images(
     pixel_tolerance: int = DEFAULT_PIXEL_TOLERANCE,
     min_match_ratio: float = DEFAULT_MIN_MATCH_RATIO,
     max_mean_absolute_error: float = DEFAULT_MAX_MEAN_ABSOLUTE_ERROR,
+    resize_reference_to_candidate: bool = False,
+    gaussian_blur_radius: float = 0.0,
 ) -> dict[str, Any]:
-    """尺寸完全一致时统一为 RGB，并执行带容差的逐像素比较。"""
+    """按需缩放参考图，然后统一为 RGB 执行带容差的逐像素比较。"""
     reference_file = Path(reference_path)
     candidate_file = Path(candidate_path)
     if not reference_file.is_file():
@@ -33,18 +35,25 @@ def compare_images(
         raise ValueError("min_match_ratio 必须在 0 到 1 之间")
     if max_mean_absolute_error < 0:
         raise ValueError("max_mean_absolute_error 不能小于 0")
+    if gaussian_blur_radius < 0:
+        raise ValueError("gaussian_blur_radius 不能小于 0")
 
     with Image.open(reference_file) as reference_source, Image.open(candidate_file) as candidate_source:
         reference_size = reference_source.size
         candidate_size = candidate_source.size
         reference_mode = reference_source.mode
         candidate_mode = candidate_source.mode
-        dimension_match = reference_size == candidate_size
+        source_dimension_match = reference_size == candidate_size
 
-        if not dimension_match:
+        if not source_dimension_match and not resize_reference_to_candidate:
             return {
                 "is_consistent": False,
                 "dimension_match": False,
+                "source_dimension_match": False,
+                "reference_resized": False,
+                "reference_resize_resampling": None,
+                "gaussian_blur_applied": False,
+                "gaussian_blur_radius": gaussian_blur_radius,
                 "reference_path": str(reference_file),
                 "candidate_path": str(candidate_file),
                 "reference_size": list(reference_size),
@@ -65,6 +74,17 @@ def compare_images(
 
         reference_image = reference_source.convert("RGB")
         candidate_image = candidate_source.convert("RGB")
+        reference_resized = not source_dimension_match
+        if reference_resized:
+            reference_image = reference_image.resize(
+                candidate_size,
+                Image.Resampling.BICUBIC,
+            )
+        gaussian_blur_applied = gaussian_blur_radius > 0
+        if gaussian_blur_applied:
+            blur = ImageFilter.GaussianBlur(radius=gaussian_blur_radius)
+            reference_image = reference_image.filter(blur)
+            candidate_image = candidate_image.filter(blur)
 
         reference_pixels = np.asarray(reference_image, dtype=np.int16)
         candidate_pixels = np.asarray(candidate_image, dtype=np.int16)
@@ -81,7 +101,7 @@ def compare_images(
     )
 
     saved_diff_path = None
-    if diff_output_path is not None:
+    if diff_output_path is not None and not is_consistent:
         diff_file = Path(diff_output_path)
         diff_file.parent.mkdir(parents=True, exist_ok=True)
         # 放大细微差异，便于在 Allure 报告中定位问题区域。
@@ -92,6 +112,11 @@ def compare_images(
     return {
         "is_consistent": is_consistent,
         "dimension_match": True,
+        "source_dimension_match": source_dimension_match,
+        "reference_resized": reference_resized,
+        "reference_resize_resampling": "BICUBIC" if reference_resized else None,
+        "gaussian_blur_applied": gaussian_blur_applied,
+        "gaussian_blur_radius": gaussian_blur_radius,
         "reference_path": str(reference_file),
         "candidate_path": str(candidate_file),
         "reference_size": list(reference_size),
