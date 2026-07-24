@@ -144,12 +144,14 @@ def test_compare_parquet_annotations_reports_l1_playback_duration_difference(tmp
             "parquet_playback_start_seconds": 0.0,
             "parquet_playback_end_seconds": 0.04,
             "parquet_playback_duration_seconds": 0.04,
+            "duration_error_seconds": 0.060000000000000005,
             "is_consistent": False,
         }
     ]
     assert any(
         "L1第1条播放时长不一致: parquet timestamp 0.0 -> 0.04，时长 0.04 秒；"
-        "代码标注时长 0.1 秒（100000000 ns），允许误差 0.04 秒" == failure
+        "代码标注时长 0.1 秒（100000000 ns），实际误差 0.060000000000000005 秒，"
+        "允许误差 0.04 秒" == failure
         for failure in result["failures"]
     )
 

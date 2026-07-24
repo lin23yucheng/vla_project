@@ -616,10 +616,15 @@ def compare_parquet_annotations(
                     if expected_duration_ns is not None
                     else None
                 )
-                duration_is_consistent = (
-                    expected_duration_seconds is not None
+                duration_error_seconds = (
+                    abs(expected_duration_seconds - actual_duration_seconds)
+                    if expected_duration_seconds is not None
                     and actual_duration_seconds is not None
-                    and abs(expected_duration_seconds - actual_duration_seconds)
+                    else None
+                )
+                duration_is_consistent = (
+                    duration_error_seconds is not None
+                    and duration_error_seconds
                     <= PLAYBACK_DURATION_TOLERANCE_SECONDS
                 )
                 l1_playback_duration_comparisons.append(
@@ -629,6 +634,7 @@ def compare_parquet_annotations(
                         "parquet_playback_start_seconds": playback_start_seconds,
                         "parquet_playback_end_seconds": playback_end_seconds,
                         "parquet_playback_duration_seconds": actual_duration_seconds,
+                        "duration_error_seconds": duration_error_seconds,
                         "is_consistent": duration_is_consistent,
                     }
                 )
@@ -639,6 +645,7 @@ def compare_parquet_annotations(
                         f"时长 {actual_duration_seconds!r} 秒；"
                         f"代码标注时长 {_format_duration_seconds(expected_duration_ns)} 秒"
                         f"（{expected_duration_ns!r} ns），"
+                        f"实际误差 {duration_error_seconds!r} 秒，"
                         f"允许误差 {PLAYBACK_DURATION_TOLERANCE_SECONDS} 秒"
                     )
         segment_comparisons.append(
