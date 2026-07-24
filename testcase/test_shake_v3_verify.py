@@ -393,10 +393,11 @@ class TestShakeV3Verify:
                 result["parquet_matched_timestamp_ns"] = mcap_target_ns
                 results[result_key] = result
                 print(
-                    f"[步骤{substep}] MCAP图片 annotation_target_ns={annotation_target_ns} "
-                    f"parquet_matched_timestamp_ns={mcap_target_ns} "
-                    f"scanned_messages={result.get('scanned_messages')} "
-                    f"window_cache_hits={result.get('window_cache_hits')}",
+                    f"[步骤{substep}] L1标注{time_label} MCAP图片提取完成："
+                    f"标注时间={annotation_target_ns}ns，"
+                    f"Parquet匹配时间={mcap_target_ns}ns，"
+                    f"已扫描消息数={result.get('scanned_messages', '未提供')}，"
+                    f"窗口缓存命中数={result.get('window_cache_hits', '未提供')}",
                     flush=True,
                 )
                 allure.attach(
@@ -441,13 +442,21 @@ class TestShakeV3Verify:
                         diff_output_path=diff_path,
                     )
                     comparisons[f"{time_key}_{side}"] = comparison
-                    print(
-                        f"[步骤{substep}] {time_label}时间{side_label}相机 "
-                        f"consistent={comparison['is_consistent']} "
-                        f"diff_pixels={comparison.get('diff_pixels')} "
-                        f"diff_ratio={comparison.get('diff_ratio')}",
-                        flush=True,
-                    )
+                    if not comparison["dimension_match"]:
+                        result_message = (
+                            f"{time_label}时间{side_label}相机图片尺寸不一致："
+                            f"MCAP={comparison['reference_size']}，"
+                            f"Parquet={comparison['candidate_size']}"
+                        )
+                    else:
+                        result_message = (
+                            f"{time_label}时间{side_label}相机图片一致性="
+                            f"{comparison['is_consistent']}，"
+                            f"容差内像素占比={comparison['similarity_percent']:.4f}%，"
+                            f"平均绝对误差={comparison['mean_absolute_error']:.4f}，"
+                            f"尺寸={comparison['reference_size']}"
+                        )
+                    print(f"[步骤{substep}] {result_message}", flush=True)
                     allure.attach.file(str(mcap_image), name=f"步骤{substep}-MCAP", attachment_type=allure.attachment_type.PNG)
                     allure.attach.file(str(parquet_image), name=f"步骤{substep}-Parquet", attachment_type=allure.attachment_type.PNG)
                     if comparison.get("diff_path"):
