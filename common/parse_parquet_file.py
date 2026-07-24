@@ -296,8 +296,13 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
             continue
 
         levels = [item["level"] for item in normalized_hierarchy]
-        if levels != list(range(1, len(normalized_hierarchy) + 1)):
-            add_error(f"第{row_index}行标注层级不连续或顺序错误: {levels}")
+        # L3 标注不要求完全落在某个 L2 标注区间内，因此 hierarchy 可以省略
+        # 当前帧未激活的中间层；只要求已出现的层级按业务顺序递增且不重复。
+        if any(
+            current is None or following is None or current >= following
+            for current, following in zip(levels, levels[1:])
+        ):
+            add_error(f"第{row_index}行标注层级顺序错误或重复: {levels}")
 
         first = normalized_hierarchy[0]
         leaf = normalized_hierarchy[-1]
