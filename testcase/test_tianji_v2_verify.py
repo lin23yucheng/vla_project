@@ -935,8 +935,38 @@ class TestTianjiV2Verify:
             "parquet_result": parquet_result,
             "comparison": comparison,
         }
+        vector_comparisons = []
+        for item in comparison["comparisons"]:
+            dimensions = item["dimensions"]
+            vector_comparisons.append(
+                {
+                    "数据类型": item["section"],
+                    "机械臂": item["group"],
+                    "MCAP提取值": {
+                        dimension["label"]: dimension["mcap_value"]
+                        for dimension in dimensions
+                    },
+                    "Parquet提取值": {
+                        dimension["label"]: dimension["parquet_value"]
+                        for dimension in dimensions
+                    },
+                    "绝对差值": {
+                        dimension["label"]: dimension["absolute_difference"]
+                        for dimension in dimensions
+                    },
+                    "是否通过": item["is_consistent"],
+                }
+            )
+        vector_report = {
+            "标注时间(ns)": target_ns,
+            "Parquet匹配帧时间(ns)": parquet_matched_ns,
+            "MCAP主相机帧时间(ns)": mcap_result.get("main_frame_ns"),
+            "允许绝对误差": comparison["absolute_tolerance"],
+            "是否通过": comparison["is_consistent"],
+            "七维向量对比": vector_comparisons,
+        }
         allure.attach(
-            json.dumps(result, ensure_ascii=False, indent=2),
+            json.dumps(vector_report, ensure_ascii=False, indent=2),
             name=f"{segment_key}-{time_key}-七维向量对比",
             attachment_type=allure.attachment_type.JSON,
         )
