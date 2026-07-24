@@ -4,6 +4,8 @@ import shutil
 import signal
 import sys
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
 import pytest
@@ -24,6 +26,93 @@ TEST_FILES: List[str] = [
     # "testcase/test_shake_v3_verify.py",   # 摇操
     "testcase/test_tianji_v2_verify.py",  # 天机
 ]
+
+
+@dataclass(frozen=True)
+class WorkflowFailurePolicy:
+    """定义一个工作流中前置步骤和验证步骤的失败处理方式。"""
+
+    critical_steps: frozenset[int]
+    validation_groups: tuple[tuple[int, ...], ...]
+
+    def validation_group_for(self, step: int) -> tuple[int, ...] | None:
+        return next(
+            (group for group in self.validation_groups if step in group),
+            None,
+        )
+
+
+WORKFLOW_FAILURE_POLICIES = {
+    "test_gripper_v2_verify.py": WorkflowFailurePolicy(
+        critical_steps=frozenset(range(1, 12)),
+        validation_groups=(
+            (12, 13, 14),
+            (15, 16, 17),
+            (18, 19, 20),
+            (21, 22, 23),
+            (24, 25, 26),
+            (27, 28, 29),
+            (30,),
+        ),
+    ),
+    "test_tianji_v2_verify.py": WorkflowFailurePolicy(
+        critical_steps=frozenset(range(1, 10)),
+        validation_groups=((10,), (11,), (12,)),
+    ),
+    "test_shake_v3_verify.py": WorkflowFailurePolicy(
+        critical_steps=frozenset(range(1, 10)),
+        validation_groups=((10, 11, 12), (13, 14), (15,)),
+    ),
+}
+
+
+class WorkflowFailureController:
+    """在验证失败后跳过同组剩余步骤，在前置失败后停止当前工作流。"""
+
+    def __init__(self, policy: WorkflowFailurePolicy) -> None:
+        self.policy = policy
+        self.failed_groups: dict[tuple[int, ...], int] = {}
+
+    @staticmethod
+    def _step_number(item) -> int | None:
+        marker = item.get_closest_marker("order")
+        if marker is None or not marker.args:
+            return None
+        try:
+            return int(marker.args[0])
+        except (TypeError, ValueError):
+            return None
+
+    def pytest_runtest_setup(self, item) -> None:
+        step = self._step_number(item)
+        if step is None:
+            return
+        group = self.policy.validation_group_for(step)
+        failed_step = self.failed_groups.get(group) if group else None
+        if failed_step is not None:
+            pytest.skip(
+                f"步骤{failed_step}失败，跳过同组验证步骤{step}"
+            )
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item, call):
+        outcome = yield
+        report = outcome.get_result()
+        if report.when not in {"setup", "call"} or not report.failed:
+            return
+
+        step = self._step_number(item)
+        if step is None:
+            return
+        if step in self.policy.critical_steps:
+            item.session.shouldstop = (
+                f"前置步骤{step}失败，停止后续工作流步骤"
+            )
+            return
+
+        group = self.policy.validation_group_for(step)
+        if group is not None:
+            self.failed_groups.setdefault(group, step)
 
 
 def format_time(seconds: float) -> str:
@@ -93,7 +182,9 @@ def execute_test(test_file: str) -> int:
     pytest_args.append(target_path)
     pytest_args.append(f"--alluredir={ALLURE_RESULTS}")
 
-    exit_code = pytest.main(pytest_args)
+    policy = WORKFLOW_FAILURE_POLICIES.get(Path(target_path).name)
+    plugins = [WorkflowFailureController(policy)] if policy else None
+    exit_code = pytest.main(pytest_args, plugins=plugins)
 
     if exit_code == 0:
         MyLog.info(f"测试文件 {test_file} 全部通过")
