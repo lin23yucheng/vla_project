@@ -124,6 +124,25 @@ def _format_duration_seconds(duration_ns: int | None) -> str:
     return f"{seconds}.{nanoseconds:09d}".rstrip("0")
 
 
+def format_l1_playback_duration_comparison(
+    comparison: dict[str, Any],
+    comparison_index: int,
+) -> str:
+    """格式化一条 L1 播放时长校验结果，供测试日志和报告复用。"""
+    status = "通过" if comparison["is_consistent"] else "失败"
+    return (
+        f"L1第{comparison_index}条播放时长校验{status}: "
+        f"parquet timestamp {comparison['parquet_playback_start_seconds']!r} -> "
+        f"{comparison['parquet_playback_end_seconds']!r}，"
+        f"时长 {comparison['parquet_playback_duration_seconds']!r} 秒；"
+        f"代码标注时长 "
+        f"{_format_duration_seconds(comparison['expected_duration_ns'])} 秒"
+        f"（{comparison['expected_duration_ns']!r} ns），"
+        f"实际误差 {comparison['duration_error_seconds']!r} 秒，"
+        f"允许误差 {PLAYBACK_DURATION_TOLERANCE_SECONDS} 秒"
+    )
+
+
 def _hierarchy_value(item: dict[str, Any], snake_name: str, camel_name: str) -> Any:
     value = item.get(snake_name)
     return item.get(camel_name) if value in (None, "") else value

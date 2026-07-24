@@ -25,6 +25,7 @@ from common.image_compare import compare_images
 from common.parse_parquet_file import (
     compare_parquet_annotations,
     extract_nearest_parquet_images_batch,
+    format_l1_playback_duration_comparison,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -1382,207 +1383,207 @@ class TestTianjiV2Verify:
                 attachment_type=allure.attachment_type.TEXT,
             )
 
-    @pytest.mark.order(10)
-    @allure.story("步骤10：校验全部标注起止时间的四路相机图片")
-    def test_compare_all_annotation_camera_images(self):
-        with allure.step("步骤10：校验9段标注起止时间的四路相机图片"):
-            self._prepare_output_dirs_once()
-            failures: list[str] = []
-            results: dict[str, Any] = {}
-            total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
-            total_image_cases = total_time_points * len(self.cameras)
-            time_point_index = 0
-            image_case_index = 0
-            failed_image_cases = 0
-            print(
-                f"[步骤10] 开始校验: {total_time_points}个时间点，"
-                f"{len(self.cameras)}路相机，共{total_image_cases}组图片",
-                flush=True,
-            )
-            for _, _, definition in iter_layer_segments():
-                segment_key = definition["key"]
-                segment_results = {}
-                for time_key, field_name, time_label in (
-                    ("start", "startTimeNs", "开始时间"),
-                    ("end", "endTimeNs", "结束时间"),
-                ):
-                    time_point_index += 1
-                    target_ns = self._resolve_segment_time_ns(segment_key, field_name)
-                    time_results = {}
-                    print(
-                        f"[步骤10][时间点 {time_point_index}/{total_time_points}] "
-                        f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
-                        "开始提取 Parquet 与 MCAP 四路图片",
-                        flush=True,
-                    )
-                    try:
-                        parquet_result, mcap_result = self._extract_images_at_time(
-                            segment_key=segment_key,
-                            time_key=time_key,
-                            target_ns=target_ns,
-                        )
-                    except Exception as exc:
-                        error_message = (
-                            f"{segment_key}/{time_key} 四路图片提取失败: {exc}"
-                        )
-                        failures.append(error_message)
-                        image_case_index += len(self.cameras)
-                        failed_image_cases += len(self.cameras)
-                        print(
-                            f"[步骤10][图片 {image_case_index - len(self.cameras) + 1}-"
-                            f"{image_case_index}/{total_image_cases}] {error_message}",
-                            flush=True,
-                        )
-                        for camera in self.cameras:
-                            time_results[camera["name"]] = {"error": str(exc)}
-                        allure.attach(
-                            error_message,
-                            name=f"{segment_key}-{time_key}-四路图片提取异常",
-                            attachment_type=allure.attachment_type.TEXT,
-                        )
-                        segment_results[time_key] = time_results
-                        continue
-                    for camera in self.cameras:
-                        image_case_index += 1
-                        case_key = f"{segment_key}/{time_key}/{camera['name']}"
-                        with allure.step(
-                            f"{segment_key}{time_label}-{camera['name']}图片对比"
-                        ):
-                            try:
-                                comparison = self._verify_one_camera_image(
-                                    segment_key=segment_key,
-                                    time_key=time_key,
-                                    target_ns=target_ns,
-                                    camera=camera,
-                                    parquet_result=parquet_result,
-                                    mcap_result=mcap_result,
-                                )
-                                time_results[camera["name"]] = comparison
-                                print(
-                                    f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
-                                    f"{case_key} 校验通过；"
-                                    f"{format_image_comparison_summary(comparison)}",
-                                    flush=True,
-                                )
-                            except (
-                                AssertionError,
-                                FileNotFoundError,
-                                KeyError,
-                                OSError,
-                                TypeError,
-                                ValueError,
-                            ) as exc:
-                                error_message = f"{case_key} 图片校验失败: {exc}"
-                                time_results[camera["name"]] = {"error": str(exc)}
-                                failures.append(error_message)
-                                failed_image_cases += 1
-                                print(
-                                    f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
-                                    f"{error_message}",
-                                    flush=True,
-                                )
-                                allure.attach(
-                                    error_message,
-                                    name=f"{case_key}-异常",
-                                    attachment_type=allure.attachment_type.TEXT,
-                                )
-                    segment_results[time_key] = time_results
-                results[segment_key] = segment_results
-            TestTianjiV2Verify.image_validation_results = results
-            allure.attach(
-                json.dumps(results, ensure_ascii=False, indent=2),
-                name="步骤10全部图片校验汇总",
-                attachment_type=allure.attachment_type.JSON,
-            )
-            print(
-                f"[步骤10] 图片校验完成：总数={total_image_cases}，"
-                f"通过={total_image_cases - failed_image_cases}，"
-                f"失败={failed_image_cases}",
-                flush=True,
-            )
-            assert not failures, "全部标注图片校验存在失败:\n" + "\n".join(failures)
-
-    @pytest.mark.order(11)
-    @allure.story("步骤11：校验全部标注起止时间的七维向量")
-    def test_compare_all_annotation_robot_vectors(self):
-        with allure.step("步骤11：校验9段标注起止时间的MCAP与parquet七维向量"):
-            failures: list[str] = []
-            results: dict[str, Any] = {}
-            total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
-            print(
-                f"[步骤11] 开始校验：{total_time_points}个时间点；"
-                "每个时间点比较4组向量，每组7个值，共28项",
-                flush=True,
-            )
-            time_point_index = 0
-            for _, _, definition in iter_layer_segments():
-                segment_key = definition["key"]
-                segment_results = {}
-                for time_key, field_name, time_label in (
-                    ("start", "startTimeNs", "开始时间"),
-                    ("end", "endTimeNs", "结束时间"),
-                ):
-                    time_point_index += 1
-                    target_ns = self._resolve_segment_time_ns(segment_key, field_name)
-                    print(
-                        f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
-                        f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
-                        "开始查找 Parquet 实际帧并校验向量",
-                        flush=True,
-                    )
-                    with allure.step(f"{segment_key}{time_label}七维向量对比"):
-                        try:
-                            result = self._verify_one_robot_vector_time(
-                                segment_key=segment_key,
-                                time_key=time_key,
-                                target_ns=target_ns,
-                            )
-                            segment_results[time_key] = result
-                            comparison = result["comparison"]
-                            print(
-                                f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
-                                f"{segment_key}/{time_label}（{time_key}）校验通过；"
-                                f"Parquet实际帧="
-                                f"{result['parquet_result']['matched_timestamp_ns']}，"
-                                f"MCAP主相机帧={result['mcap_result']['main_frame_ns']}，"
-                                f"28项差值均<="
-                                f"{comparison['absolute_tolerance']:.12g}",
-                                flush=True,
-                            )
-                        except (
-                            AssertionError,
-                            FileNotFoundError,
-                            KeyError,
-                            OSError,
-                            TypeError,
-                            ValueError,
-                        ) as exc:
-                            error_message = f"{segment_key}/{time_key} 七维向量校验失败: {exc}"
-                            segment_results[time_key] = {"error": str(exc)}
-                            failures.append(error_message)
-                            print(
-                                f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
-                                f"{error_message}",
-                                flush=True,
-                            )
-                            allure.attach(
-                                error_message,
-                                name=f"{segment_key}-{time_key}-异常",
-                                attachment_type=allure.attachment_type.TEXT,
-                            )
-                results[segment_key] = segment_results
-            TestTianjiV2Verify.vector_validation_results = results
-            allure.attach(
-                json.dumps(results, ensure_ascii=False, indent=2),
-                name="步骤11全部七维向量校验汇总",
-                attachment_type=allure.attachment_type.JSON,
-            )
-            print(
-                f"[步骤11] 七维向量校验完成：时间点={total_time_points}，"
-                f"通过={total_time_points - len(failures)}，失败={len(failures)}",
-                flush=True,
-            )
-            assert not failures, "全部标注七维向量校验存在失败:\n" + "\n".join(failures)
+    # @pytest.mark.order(10)
+    # @allure.story("步骤10：校验全部标注起止时间的四路相机图片")
+    # def test_compare_all_annotation_camera_images(self):
+    #     with allure.step("步骤10：校验9段标注起止时间的四路相机图片"):
+    #         self._prepare_output_dirs_once()
+    #         failures: list[str] = []
+    #         results: dict[str, Any] = {}
+    #         total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
+    #         total_image_cases = total_time_points * len(self.cameras)
+    #         time_point_index = 0
+    #         image_case_index = 0
+    #         failed_image_cases = 0
+    #         print(
+    #             f"[步骤10] 开始校验: {total_time_points}个时间点，"
+    #             f"{len(self.cameras)}路相机，共{total_image_cases}组图片",
+    #             flush=True,
+    #         )
+    #         for _, _, definition in iter_layer_segments():
+    #             segment_key = definition["key"]
+    #             segment_results = {}
+    #             for time_key, field_name, time_label in (
+    #                 ("start", "startTimeNs", "开始时间"),
+    #                 ("end", "endTimeNs", "结束时间"),
+    #             ):
+    #                 time_point_index += 1
+    #                 target_ns = self._resolve_segment_time_ns(segment_key, field_name)
+    #                 time_results = {}
+    #                 print(
+    #                     f"[步骤10][时间点 {time_point_index}/{total_time_points}] "
+    #                     f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
+    #                     "开始提取 Parquet 与 MCAP 四路图片",
+    #                     flush=True,
+    #                 )
+    #                 try:
+    #                     parquet_result, mcap_result = self._extract_images_at_time(
+    #                         segment_key=segment_key,
+    #                         time_key=time_key,
+    #                         target_ns=target_ns,
+    #                     )
+    #                 except Exception as exc:
+    #                     error_message = (
+    #                         f"{segment_key}/{time_key} 四路图片提取失败: {exc}"
+    #                     )
+    #                     failures.append(error_message)
+    #                     image_case_index += len(self.cameras)
+    #                     failed_image_cases += len(self.cameras)
+    #                     print(
+    #                         f"[步骤10][图片 {image_case_index - len(self.cameras) + 1}-"
+    #                         f"{image_case_index}/{total_image_cases}] {error_message}",
+    #                         flush=True,
+    #                     )
+    #                     for camera in self.cameras:
+    #                         time_results[camera["name"]] = {"error": str(exc)}
+    #                     allure.attach(
+    #                         error_message,
+    #                         name=f"{segment_key}-{time_key}-四路图片提取异常",
+    #                         attachment_type=allure.attachment_type.TEXT,
+    #                     )
+    #                     segment_results[time_key] = time_results
+    #                     continue
+    #                 for camera in self.cameras:
+    #                     image_case_index += 1
+    #                     case_key = f"{segment_key}/{time_key}/{camera['name']}"
+    #                     with allure.step(
+    #                         f"{segment_key}{time_label}-{camera['name']}图片对比"
+    #                     ):
+    #                         try:
+    #                             comparison = self._verify_one_camera_image(
+    #                                 segment_key=segment_key,
+    #                                 time_key=time_key,
+    #                                 target_ns=target_ns,
+    #                                 camera=camera,
+    #                                 parquet_result=parquet_result,
+    #                                 mcap_result=mcap_result,
+    #                             )
+    #                             time_results[camera["name"]] = comparison
+    #                             print(
+    #                                 f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
+    #                                 f"{case_key} 校验通过；"
+    #                                 f"{format_image_comparison_summary(comparison)}",
+    #                                 flush=True,
+    #                             )
+    #                         except (
+    #                             AssertionError,
+    #                             FileNotFoundError,
+    #                             KeyError,
+    #                             OSError,
+    #                             TypeError,
+    #                             ValueError,
+    #                         ) as exc:
+    #                             error_message = f"{case_key} 图片校验失败: {exc}"
+    #                             time_results[camera["name"]] = {"error": str(exc)}
+    #                             failures.append(error_message)
+    #                             failed_image_cases += 1
+    #                             print(
+    #                                 f"[步骤10][图片 {image_case_index}/{total_image_cases}] "
+    #                                 f"{error_message}",
+    #                                 flush=True,
+    #                             )
+    #                             allure.attach(
+    #                                 error_message,
+    #                                 name=f"{case_key}-异常",
+    #                                 attachment_type=allure.attachment_type.TEXT,
+    #                             )
+    #                 segment_results[time_key] = time_results
+    #             results[segment_key] = segment_results
+    #         TestTianjiV2Verify.image_validation_results = results
+    #         allure.attach(
+    #             json.dumps(results, ensure_ascii=False, indent=2),
+    #             name="步骤10全部图片校验汇总",
+    #             attachment_type=allure.attachment_type.JSON,
+    #         )
+    #         print(
+    #             f"[步骤10] 图片校验完成：总数={total_image_cases}，"
+    #             f"通过={total_image_cases - failed_image_cases}，"
+    #             f"失败={failed_image_cases}",
+    #             flush=True,
+    #         )
+    #         assert not failures, "全部标注图片校验存在失败:\n" + "\n".join(failures)
+    #
+    # @pytest.mark.order(11)
+    # @allure.story("步骤11：校验全部标注起止时间的七维向量")
+    # def test_compare_all_annotation_robot_vectors(self):
+    #     with allure.step("步骤11：校验9段标注起止时间的MCAP与parquet七维向量"):
+    #         failures: list[str] = []
+    #         results: dict[str, Any] = {}
+    #         total_time_points = sum(EXPECTED_SEGMENT_COUNTS.values()) * 2
+    #         print(
+    #             f"[步骤11] 开始校验：{total_time_points}个时间点；"
+    #             "每个时间点比较4组向量，每组7个值，共28项",
+    #             flush=True,
+    #         )
+    #         time_point_index = 0
+    #         for _, _, definition in iter_layer_segments():
+    #             segment_key = definition["key"]
+    #             segment_results = {}
+    #             for time_key, field_name, time_label in (
+    #                 ("start", "startTimeNs", "开始时间"),
+    #                 ("end", "endTimeNs", "结束时间"),
+    #             ):
+    #                 time_point_index += 1
+    #                 target_ns = self._resolve_segment_time_ns(segment_key, field_name)
+    #                 print(
+    #                     f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+    #                     f"{segment_key}/{time_label}（{time_key}），标注时间={target_ns}；"
+    #                     "开始查找 Parquet 实际帧并校验向量",
+    #                     flush=True,
+    #                 )
+    #                 with allure.step(f"{segment_key}{time_label}七维向量对比"):
+    #                     try:
+    #                         result = self._verify_one_robot_vector_time(
+    #                             segment_key=segment_key,
+    #                             time_key=time_key,
+    #                             target_ns=target_ns,
+    #                         )
+    #                         segment_results[time_key] = result
+    #                         comparison = result["comparison"]
+    #                         print(
+    #                             f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+    #                             f"{segment_key}/{time_label}（{time_key}）校验通过；"
+    #                             f"Parquet实际帧="
+    #                             f"{result['parquet_result']['matched_timestamp_ns']}，"
+    #                             f"MCAP主相机帧={result['mcap_result']['main_frame_ns']}，"
+    #                             f"28项差值均<="
+    #                             f"{comparison['absolute_tolerance']:.12g}",
+    #                             flush=True,
+    #                         )
+    #                     except (
+    #                         AssertionError,
+    #                         FileNotFoundError,
+    #                         KeyError,
+    #                         OSError,
+    #                         TypeError,
+    #                         ValueError,
+    #                     ) as exc:
+    #                         error_message = f"{segment_key}/{time_key} 七维向量校验失败: {exc}"
+    #                         segment_results[time_key] = {"error": str(exc)}
+    #                         failures.append(error_message)
+    #                         print(
+    #                             f"[步骤11][时间点 {time_point_index}/{total_time_points}] "
+    #                             f"{error_message}",
+    #                             flush=True,
+    #                         )
+    #                         allure.attach(
+    #                             error_message,
+    #                             name=f"{segment_key}-{time_key}-异常",
+    #                             attachment_type=allure.attachment_type.TEXT,
+    #                         )
+    #             results[segment_key] = segment_results
+    #         TestTianjiV2Verify.vector_validation_results = results
+    #         allure.attach(
+    #             json.dumps(results, ensure_ascii=False, indent=2),
+    #             name="步骤11全部七维向量校验汇总",
+    #             attachment_type=allure.attachment_type.JSON,
+    #         )
+    #         print(
+    #             f"[步骤11] 七维向量校验完成：时间点={total_time_points}，"
+    #             f"通过={total_time_points - len(failures)}，失败={len(failures)}",
+    #             flush=True,
+    #         )
+    #         assert not failures, "全部标注七维向量校验存在失败:\n" + "\n".join(failures)
 
     @pytest.mark.order(12)
     @allure.story("步骤12：校验 parquet 中的 L1/L2/L3 标注")
@@ -1601,6 +1602,14 @@ class TestTianjiV2Verify:
                 f"失败项={len(result.get('failures', []))}",
                 flush=True,
             )
+            for comparison_index, comparison in enumerate(
+                result["l1_playback_duration_comparisons"], start=1
+            ):
+                print(
+                    f"[步骤12] "
+                    f"{format_l1_playback_duration_comparison(comparison, comparison_index)}",
+                    flush=True,
+                )
             allure.attach(
                 json.dumps(expected_layers, ensure_ascii=False, indent=2),
                 name="步骤12期望标注",

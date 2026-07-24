@@ -19,6 +19,7 @@ from common.extract_parquet_fields import compare_robot_vectors, extract_parquet
 from common.parse_parquet_file import (
     compare_parquet_annotations,
     extract_nearest_parquet_images_batch,
+    format_l1_playback_duration_comparison,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -1802,6 +1803,14 @@ class TestV2Verify:
                 validate_l1_playback_duration=True,
             )
             TestV2Verify.parquet_annotation_validation_result = result
+            for comparison_index, comparison in enumerate(
+                result["l1_playback_duration_comparisons"], start=1
+            ):
+                print(
+                    f"[步骤30] "
+                    f"{format_l1_playback_duration_comparison(comparison, comparison_index)}",
+                    flush=True,
+                )
             allure.attach(
                 json.dumps(expected_layers, ensure_ascii=False, indent=2),
                 name="步骤30-代码中的期望标注",
