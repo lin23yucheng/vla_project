@@ -591,11 +591,16 @@ class TestV2Verify:
                 (f"{workflow_step}.2", "end_time_extract", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}mcap图片（左/右各一张）"):
+                parquet_reference = extract_parquet_robot_vectors_at_time(
+                    parquet_path=self.parquet_sources,
+                    target_ns=target_ns,
+                )
+                mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 extract_result = extract_global_nearest_image_from_mcap_sources(
                     mcap_sources=self.mcap_sources,
                     mcap_source_label=self.mcap_source_label,
                     topics=topics,
-                    target_ns=target_ns,
+                    target_ns=mcap_target_ns,
                     output_dir=output_dir,
                     name_prefix=self.task_no,
                     extra_name_parts=[annotation_key, time_key],
@@ -603,6 +608,8 @@ class TestV2Verify:
                     require_chunk_indexes=True,
                     additional_cache_topics=self.mcap_prefetch_topics,
                 )
+                extract_result["annotation_target_ns"] = target_ns
+                extract_result["parquet_matched_timestamp_ns"] = mcap_target_ns
                 extract_results[result_key] = extract_result
                 allure.attach(
                     json.dumps(extract_result, ensure_ascii=False, indent=2),
@@ -806,15 +813,25 @@ class TestV2Verify:
                 (f"{workflow_step}.2", "end", "结束时间", end_time_ns),
         ):
             with allure.step(f"步骤{substep}：提取{annotation_label}{time_label}MCAP七维向量"):
+                # 固定 FPS 输出以 Parquet 行的 T0 + n / 30 为准，先确定该行再采样
+                # 原始 state/action，不能把它重新吸附到非均匀的主相机原始帧。
+                parquet_reference = extract_parquet_robot_vectors_at_time(
+                    parquet_path=self.parquet_sources,
+                    target_ns=target_ns,
+                )
+                mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 extract_result = extract_robot_vectors_at_time(
                     config_path=self.robot_config_path,
                     mcap_dir=None,
-                    target_ns=target_ns,
+                    target_ns=mcap_target_ns,
+                    align_to_main_camera=False,
                     mcap_sources=self.mcap_sources,
                     mcap_source_label=self.mcap_source_label,
                     require_chunk_indexes=True,
                     allow_full_scan_fallback=False,
                 )
+                extract_result["annotation_target_ns"] = target_ns
+                extract_result["parquet_matched_timestamp_ns"] = mcap_target_ns
                 results[time_key] = extract_result
                 vectors = extract_result.get("vectors", [])
                 assert len(vectors) == 4, f"步骤{substep}预期提取4组七维向量，实际为 {len(vectors)}"

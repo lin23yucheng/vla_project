@@ -909,6 +909,9 @@ class TestTianjiV2Verify:
             config_path=self.robot_config_path,
             mcap_dir=None,
             target_ns=mcap_target_ns,
+            # V2 输出按 episode 的 T0 + n / 30 固定时间轴采样；不能再吸附回
+            # 不等间隔的主相机原始帧，否则会与该 Parquet 行的 state/action 时刻错位。
+            align_to_main_camera=False,
             mcap_sources=self.mcap_sources,
             mcap_source_label=self.mcap_source_label,
             require_chunk_indexes=True,
@@ -961,7 +964,7 @@ class TestTianjiV2Verify:
         vector_report = {
             "标注时间(ns)": target_ns,
             "Parquet匹配帧时间(ns)": parquet_matched_ns,
-            "MCAP主相机帧时间(ns)": mcap_result.get("main_frame_ns"),
+            "MCAP向量采样时间(ns)": mcap_result.get("sampling_reference_ns"),
             "允许绝对误差": comparison["absolute_tolerance"],
             "是否通过": comparison["is_consistent"],
             "七维向量对比": vector_comparisons,
@@ -988,7 +991,7 @@ class TestTianjiV2Verify:
                 "向量值超出允许误差：\n"
                 f"标注时间={target_ns}\n"
                 f"Parquet实际帧={parquet_matched_ns}\n"
-                f"MCAP主相机帧={mcap_result.get('main_frame_ns')}\n"
+                f"MCAP向量采样时间={mcap_result.get('sampling_reference_ns')}\n"
                 + "\n".join(differences)
             )
         return result
@@ -1545,7 +1548,8 @@ class TestTianjiV2Verify:
                                 f"{segment_key}/{time_label}（{time_key}）校验通过；"
                                 f"Parquet实际帧="
                                 f"{result['parquet_result']['matched_timestamp_ns']}，"
-                                f"MCAP主相机帧={result['mcap_result']['main_frame_ns']}，"
+                                f"MCAP向量采样时间="
+                                f"{result['mcap_result']['sampling_reference_ns']}，"
                                 f"28项差值均<="
                                 f"{comparison['absolute_tolerance']:.12g}",
                                 flush=True,

@@ -673,12 +673,13 @@ def extract_robot_vectors_at_time(
     max_tolerance_ns: int = DEFAULT_MAX_TOLERANCE_NS,
     *,
     initial_search_window_ns: int = DEFAULT_INITIAL_SEARCH_WINDOW_NS,
+    align_to_main_camera: bool = True,
     mcap_sources: Sequence[Any] | None = None,
     mcap_source_label: str | None = None,
     require_chunk_indexes: bool = False,
     allow_full_scan_fallback: bool = True,
 ) -> dict[str, Any]:
-    """按主相机帧同步并插值 MCAP 数据，生成四组机器人七维向量。"""
+    """按主相机帧或指定时间轴同步并插值 MCAP 数据，生成四组机器人七维向量。"""
     if search_window_ns < 0:
         raise ValueError("search_window_ns 不能小于 0")
     if max_tolerance_ns < 0:
@@ -719,31 +720,39 @@ def extract_robot_vectors_at_time(
     neighbors: dict[str, dict[str, dict[str, Any] | None]] | None = None
     incomplete_topics: list[str] = []
 
-    for window_ns in adaptive_search_windows(
-        search_window_ns,
-        initial_search_window_ns,
-    ):
+    for window_ns in adaptive_search_windows(search_window_ns, initial_search_window_ns):
         search_attempt_windows_ns.append(window_ns)
         effective_search_window_ns = window_ns
-        candidate_main, sensor_records, scan_count, cache_hit = _scan_main_frame_and_sensor_messages(
-            mcap_files,
-            main_time_topic,
-            topics,
-            target_ns,
-            target_ns - window_ns,
-            target_ns + window_ns + 1,
-            require_chunk_indexes=require_chunk_indexes,
-        )
-        scanned_messages += scan_count
-        window_cache_hits += int(cache_hit)
-        if candidate_main is None:
-            continue
-
-        candidate_neighbors = _build_interpolation_neighbors(
-            sensor_records,
-            topics,
-            int(candidate_main["matched_publish_ns"]),
-        )
+        if align_to_main_camera:
+            candidate_main, sensor_records, scan_count, cache_hit = _scan_main_frame_and_sensor_messages(
+                mcap_files,
+                main_time_topic,
+                topics,
+                target_ns,
+                target_ns - window_ns,
+                target_ns + window_ns + 1,
+                require_chunk_indexes=require_chunk_indexes,
+            )
+            scanned_messages += scan_count
+            window_cache_hits += int(cache_hit)
+            if candidate_main is None:
+                continue
+            candidate_neighbors = _build_interpolation_neighbors(
+                sensor_records,
+                topics,
+                int(candidate_main["matched_publish_ns"]),
+            )
+        else:
+            candidate_main = None
+            candidate_neighbors, scan_count = _scan_interpolation_neighbors(
+                mcap_files,
+                topics,
+                target_ns,
+                target_ns - window_ns,
+                target_ns + window_ns + 1,
+                require_chunk_indexes=require_chunk_indexes,
+            )
+            scanned_messages += scan_count
         candidate_incomplete_topics = _incomplete_interpolation_topics(
             candidate_neighbors,
             topics,
@@ -755,7 +764,7 @@ def extract_robot_vectors_at_time(
         if not incomplete_topics:
             break
 
-    if main_message is None and allow_full_scan_fallback:
+    if align_to_main_camera and main_message is None and allow_full_scan_fallback:
         fallback_main, fallback_count = _scan_nearest_messages(
             mcap_files,
             [main_time_topic],
@@ -767,17 +776,21 @@ def extract_robot_vectors_at_time(
         scanned_messages += fallback_count
         used_full_scan_fallback = True
         main_message = fallback_main.get(main_time_topic)
-    if main_message is None:
+    if align_to_main_camera and main_message is None:
         raise ValueError(f"多个 mcap 文件中未找到主相机 topic: {main_time_topic}")
 
-    main_frame_ns = int(main_message["matched_publish_ns"])
+    sampling_reference_ns = (
+        int(main_message["matched_publish_ns"])
+        if main_message is not None
+        else target_ns
+    )
     if neighbors is None:
         neighbors, sensor_scan_count = _scan_interpolation_neighbors(
             mcap_files,
             topics,
-            main_frame_ns,
-            main_frame_ns - search_window_ns,
-            main_frame_ns + search_window_ns + 1,
+            sampling_reference_ns,
+            sampling_reference_ns - search_window_ns,
+            sampling_reference_ns + search_window_ns + 1,
             require_chunk_indexes=require_chunk_indexes,
         )
         scanned_messages += sensor_scan_count
@@ -790,9 +803,9 @@ def extract_robot_vectors_at_time(
         extension_neighbors, extension_count = _scan_interpolation_neighbors(
             mcap_files,
             incomplete_topics,
-            main_frame_ns,
-            main_frame_ns - search_window_ns,
-            main_frame_ns + search_window_ns + 1,
+            sampling_reference_ns,
+            sampling_reference_ns - search_window_ns,
+            sampling_reference_ns + search_window_ns + 1,
             require_chunk_indexes=require_chunk_indexes,
         )
         _merge_neighbors(neighbors, extension_neighbors, incomplete_topics)
@@ -808,7 +821,7 @@ def extract_robot_vectors_at_time(
         fallback_neighbors, fallback_count = _scan_interpolation_neighbors(
             mcap_files,
             incomplete_topics,
-            main_frame_ns,
+            sampling_reference_ns,
             None,
             None,
             require_chunk_indexes=require_chunk_indexes,
@@ -831,7 +844,7 @@ def extract_robot_vectors_at_time(
             raise ValueError(f"位姿配置缺少对应夹爪配置: {pose_entry}")
         pose_neighbors = neighbors[pose_entry["topic"]]
         pose_strategy, pose_ratio, pose_first, pose_second = _resolve_interpolation(
-            pose_neighbors, main_frame_ns, max_tolerance_ns
+            pose_neighbors, sampling_reference_ns, max_tolerance_ns
         )
         first_pose = [
             float(get_nested_field_value(pose_first["ros_message"], field))
@@ -855,7 +868,7 @@ def extract_robot_vectors_at_time(
         gripper_entry = gripper_entries[gripper_key]
         gripper_neighbors = neighbors[gripper_entry["topic"]]
         gripper_strategy, gripper_ratio, gripper_first, gripper_second = _resolve_interpolation(
-            gripper_neighbors, main_frame_ns, max_tolerance_ns
+            gripper_neighbors, sampling_reference_ns, max_tolerance_ns
         )
         gripper_field = gripper_entry["fields"][0]
         angle = float(get_nested_field_value(gripper_first["ros_message"], gripper_field))
@@ -894,7 +907,7 @@ def extract_robot_vectors_at_time(
                     pose_ratio,
                     pose_first,
                     pose_second,
-                    main_frame_ns,
+                    sampling_reference_ns,
                 ),
                 "gripper_match": _build_interpolation_metadata(
                     gripper_neighbors,
@@ -902,7 +915,7 @@ def extract_robot_vectors_at_time(
                     gripper_ratio,
                     gripper_first,
                     gripper_second,
-                    main_frame_ns,
+                    sampling_reference_ns,
                 ),
             }
         )
@@ -913,7 +926,13 @@ def extract_robot_vectors_at_time(
         "mcap_source_count": len(mcap_files),
         "target_ns": target_ns,
         "main_time_topic": main_time_topic,
-        "main_frame_ns": main_frame_ns,
+        "align_to_main_camera": align_to_main_camera,
+        "sampling_reference_ns": sampling_reference_ns,
+        "main_frame_ns": (
+            int(main_message["matched_publish_ns"])
+            if main_message is not None
+            else None
+        ),
         "main_frame_match": _public_message_metadata(main_message),
         "search_window_ns": search_window_ns,
         "initial_search_window_ns": initial_search_window_ns,

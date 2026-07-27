@@ -21,8 +21,8 @@ ALLURE_REPORT = os.path.join(BASE_DIR, "report", "allure-report")
 
 # 在这里按顺序填写要执行的测试文件
 TEST_FILES: List[str] = [
-    "testcase/test_gripper_v2_verify.py", # 夹爪
-    # "testcase/test_shake_v3_verify.py",   # 摇操
+    # "testcase/test_gripper_v2_verify.py", # 夹爪
+    "testcase/test_shake_v3_verify.py",   # 摇操
     # "testcase/test_tianji_v2_verify.py",  # 天机
 ]
 

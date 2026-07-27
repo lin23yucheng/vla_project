@@ -512,15 +512,25 @@ class TestShakeV3Verify:
             (f"{workflow_step}.2", "end", "结束时间", self._resolve_l1_end_time_ns()),
         ):
             with allure.step(f"步骤{substep}：提取L1标注{time_label} MCAP 七维向量"):
+                # 以转换输出的 T0 + n / 30 时间轴为准；state/action 在该时刻
+                # 直接取最近值或插值，不再二次映射到主相机原始帧。
+                parquet_reference = extract_parquet_robot_vectors_at_time(
+                    parquet_path=self.parquet_sources,
+                    target_ns=target_ns,
+                )
+                mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 result = extract_robot_vectors_at_time(
                     config_path=config_path,
                     mcap_dir=None,
-                    target_ns=target_ns,
+                    target_ns=mcap_target_ns,
+                    align_to_main_camera=False,
                     mcap_sources=self.mcap_sources,
                     mcap_source_label=self.mcap_source_label,
                     require_chunk_indexes=True,
                     allow_full_scan_fallback=False,
                 )
+                result["annotation_target_ns"] = target_ns
+                result["parquet_matched_timestamp_ns"] = mcap_target_ns
                 results[time_key] = result
                 vectors = result.get("vectors", [])
                 assert len(vectors) == 4, f"预期提取 action/observation_state 左右共4组向量，实际为 {len(vectors)}"
