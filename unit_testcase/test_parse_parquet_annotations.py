@@ -1,8 +1,10 @@
 import json
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from common.parquet_source import open_parquet_file
 from common.parse_parquet_file import (
     compare_parquet_annotations,
     extract_parquet_annotation_summary,
@@ -102,6 +104,19 @@ def test_extract_parquet_annotation_summary(tmp_path):
     assert summary["level_counts"] == {"L1": 1, "L2": 2, "L3": 0}
     assert summary["validation_error_count"] == 0
     assert summary["annotations"][0]["row_count"] == 3
+
+
+def test_extract_parquet_annotation_summary_prebuffers_column_reads(tmp_path):
+    parquet_path = tmp_path / "annotations.parquet"
+    _write_annotation_parquet(parquet_path)
+
+    with patch(
+        "common.parse_parquet_file.open_parquet_file",
+        wraps=open_parquet_file,
+    ) as open_file:
+        extract_parquet_annotation_summary(parquet_path)
+
+    assert open_file.call_args.kwargs["pre_buffer"] is True
 
 
 def test_compare_parquet_annotations_reports_field_differences(tmp_path):

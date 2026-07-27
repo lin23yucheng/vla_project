@@ -46,9 +46,14 @@ def open_parquet_source(source: Any) -> Iterator[Any]:
 
 
 @contextmanager
-def open_parquet_file(source: Any) -> Iterator[pq.ParquetFile]:
+def open_parquet_file(
+    source: Any,
+    *,
+    pre_buffer: bool = False,
+) -> Iterator[pq.ParquetFile]:
+    """Open a Parquet source, optionally coalescing remote column reads."""
     with open_parquet_source(source) as stream:
-        parquet_file = pq.ParquetFile(stream, pre_buffer=False)
+        parquet_file = pq.ParquetFile(stream, pre_buffer=pre_buffer)
         try:
             yield parquet_file
         finally:

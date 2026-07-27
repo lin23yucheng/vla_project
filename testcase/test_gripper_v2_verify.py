@@ -683,7 +683,6 @@ class TestV2Verify:
                 f"尺寸={comparison['reference_size']}"
             )
 
-        print(f"[步骤{substep}] {result_message}")
         allure.attach(
             result_message,
             name=f"{attachment_prefix}-结果",
@@ -709,7 +708,14 @@ class TestV2Verify:
         ]
         comparison_results = {}
         failures = []
-        for substep, extract_key, time_key, time_label, side, side_label, target_ns in comparison_cases:
+        failed_cases = 0
+        print(
+            f"[步骤{workflow_step}] 开始校验: 2个时间点，2路相机，共{len(comparison_cases)}组图片",
+            flush=True,
+        )
+        for case_index, (substep, extract_key, time_key, time_label, side, side_label, target_ns) in enumerate(
+                comparison_cases, start=1
+        ):
             case_name = f"{annotation_label}{time_label}{side_label}"
             with allure.step(f"步骤{substep}：对比{case_name}图片"):
                 try:
@@ -735,12 +741,33 @@ class TestV2Verify:
                         annotation_key=annotation_key,
                     )
                     comparison_results[f"{time_key}_{side}"] = comparison
-                    if not comparison["is_consistent"]:
+                    if comparison["is_consistent"]:
+                        print(
+                            f"[步骤{workflow_step}][图片 {case_index}/{len(comparison_cases)}] "
+                            f"{annotation_label}/{time_label}/{side_label}相机 校验通过；"
+                            f"尺寸={comparison['reference_size']}，"
+                            f"容差内像素占比={comparison['similarity_percent']:.4f}%，"
+                            f"平均绝对误差={comparison['mean_absolute_error']:.4f}",
+                            flush=True,
+                        )
+                    else:
+                        failed_cases += 1
                         failures.append(f"{annotation_label}{result_message}")
+                        print(
+                            f"[步骤{workflow_step}][图片 {case_index}/{len(comparison_cases)}] "
+                            f"{annotation_label}/{time_label}/{side_label}相机 图片校验失败: {result_message}",
+                            flush=True,
+                        )
                 except (AssertionError, FileNotFoundError, OSError, ValueError) as exc:
                     error_message = f"{case_name}图片比较失败：{exc}"
                     comparison_results[f"{time_key}_{side}"] = {"error": str(exc)}
                     failures.append(error_message)
+                    failed_cases += 1
+                    print(
+                        f"[步骤{workflow_step}][图片 {case_index}/{len(comparison_cases)}] "
+                        f"{case_name} 图片校验失败: {exc}",
+                        flush=True,
+                    )
                     allure.attach(
                         error_message,
                         name=f"步骤{substep}-{case_name}-异常",
@@ -751,6 +778,11 @@ class TestV2Verify:
             json.dumps(comparison_results, ensure_ascii=False, indent=2),
             name=f"步骤{workflow_step}-{annotation_label}四组图片汇总",
             attachment_type=allure.attachment_type.JSON,
+        )
+        print(
+            f"[步骤{workflow_step}] 图片校验完成：总数={len(comparison_cases)}，"
+            f"通过={len(comparison_cases) - failed_cases}，失败={failed_cases}",
+            flush=True,
         )
         assert not failures, f"步骤{workflow_step}{annotation_label}图片一致性校验失败：\n" + "\n".join(failures)
         allure.attach(
@@ -786,15 +818,6 @@ class TestV2Verify:
                 results[time_key] = extract_result
                 vectors = extract_result.get("vectors", [])
                 assert len(vectors) == 4, f"步骤{substep}预期提取4组七维向量，实际为 {len(vectors)}"
-                for item in vectors:
-                    print(
-                        f"[步骤{substep}][{annotation_key}][{time_key}]"
-                        f"[{item['section']}][{item['group']}] "
-                        f"pose_topic={item['pose_topic']} "
-                        f"gripper_topic={item['gripper_topic']}"
-                    )
-                    print(f"  labels = {item['vector_labels']}")
-                    print(f"  vector = {item['vector']}")
                 allure.attach(
                     json.dumps(extract_result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-{annotation_label}{time_label}MCAP七维向量",
@@ -824,17 +847,6 @@ class TestV2Verify:
                 results[time_key] = extract_result
                 vectors = extract_result.get("vectors", [])
                 assert len(vectors) == 4, f"步骤{substep}预期提取4组七维向量，实际为 {len(vectors)}"
-                for item in vectors:
-                    print(
-                        f"[步骤{substep}][{annotation_key}][{time_key}]"
-                        f"[{item['section']}][{item['group']}] "
-                        f"target_ns={item['target_ns']} "
-                        f"matched_timestamp_ns={item['matched_timestamp_ns']} "
-                        f"diff_ns={item['diff_ns']} "
-                        f"parquet_column={item['parquet_column']}"
-                    )
-                    print(f"  labels = {item['vector_labels']}")
-                    print(f"  vector = {item['vector']}")
                 allure.attach(
                     json.dumps(extract_result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-{annotation_label}{time_label}parquet七维向量",
@@ -852,6 +864,11 @@ class TestV2Verify:
     ) -> None:
         comparison_results = {}
         failures = []
+        failed_time_points = 0
+        print(
+            f"[步骤{workflow_step}] 开始校验：2个时间点；每个时间点比较4组向量，每组7个值，共28项",
+            flush=True,
+        )
         for substep, time_key, time_label in (
                 (f"{workflow_step}.1", "start", "开始时间"),
                 (f"{workflow_step}.2", "end", "结束时间"),
@@ -865,19 +882,11 @@ class TestV2Verify:
                                                   f"未提取{annotation_label}{time_label}parquet七维向量")
                     comparison = compare_robot_vectors(mcap_result=mcap_result, parquet_result=parquet_result)
                     comparison_results[time_key] = comparison
+                    time_point_has_failure = False
                     for item in comparison["comparisons"]:
-                        print(
-                            f"[步骤{substep}][{annotation_key}][{time_key}]"
-                            f"[{item['section']}][{item['group']}] consistent={item['is_consistent']}"
-                        )
                         for dimension in item["dimensions"]:
-                            print(
-                                f"  {dimension['label']}: mcap={dimension['mcap_value']} "
-                                f"parquet={dimension['parquet_value']} "
-                                f"diff={dimension['absolute_difference']} "
-                                f"consistent={dimension['is_consistent']}"
-                            )
                             if not dimension["is_consistent"]:
+                                time_point_has_failure = True
                                 failures.append(
                                     f"{annotation_label}{time_label}/"
                                     f"{item['section']}/{item['group']}/{dimension['label']}: "
@@ -885,6 +894,21 @@ class TestV2Verify:
                                     f"Parquet={dimension['parquet_value']}, "
                                     f"差值={dimension['absolute_difference']}"
                                 )
+                    time_point_index = 1 if time_key == "start" else 2
+                    if time_point_has_failure:
+                        failed_time_points += 1
+                        print(
+                            f"[步骤{workflow_step}][时间点 {time_point_index}/2] "
+                            f"{annotation_label}/{time_label} 七维向量校验失败",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[步骤{workflow_step}][时间点 {time_point_index}/2] "
+                            f"{annotation_label}/{time_label} 校验通过；28项差值均<="
+                            f"{comparison['absolute_tolerance']:.12g}",
+                            flush=True,
+                        )
                     allure.attach(
                         json.dumps(comparison, ensure_ascii=False, indent=2),
                         name=f"步骤{substep}-{annotation_label}{time_label}七维向量对比",
@@ -894,6 +918,12 @@ class TestV2Verify:
                     error_message = f"{annotation_label}{time_label}七维向量比较失败：{exc}"
                     comparison_results[time_key] = {"error": str(exc)}
                     failures.append(error_message)
+                    failed_time_points += 1
+                    print(
+                        f"[步骤{workflow_step}][时间点 {1 if time_key == 'start' else 2}/2] "
+                        f"{annotation_label}/{time_label} 七维向量校验失败: {exc}",
+                        flush=True,
+                    )
                     allure.attach(
                         error_message,
                         name=f"步骤{substep}-{annotation_label}{time_label}-异常",
@@ -904,6 +934,11 @@ class TestV2Verify:
             json.dumps(comparison_results, ensure_ascii=False, indent=2),
             name=f"步骤{workflow_step}-{annotation_label}开始结束时间七维向量汇总",
             attachment_type=allure.attachment_type.JSON,
+        )
+        print(
+            f"[步骤{workflow_step}] 七维向量校验完成：时间点=2，"
+            f"通过={2 - failed_time_points}，失败={failed_time_points}",
+            flush=True,
         )
         assert not failures, f"步骤{workflow_step}{annotation_label}七维向量不一致：\n" + "\n".join(failures)
 

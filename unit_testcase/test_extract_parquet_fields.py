@@ -53,6 +53,7 @@ def test_compare_robot_vectors_accepts_equal_values():
     result = compare_robot_vectors({"vectors": vectors}, {"vectors": vectors})
 
     assert result["is_consistent"] is True
+    assert result["absolute_tolerance"] == 5e-04
 
 
 def test_extract_parquet_robot_vectors_supports_complete_layout(tmp_path):

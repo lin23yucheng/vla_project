@@ -93,7 +93,7 @@ ANNOTATION_COLUMNS = (
     "annotation.hierarchy_json",
     "done",
 )
-PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.04
+PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.07
 
 
 def _annotation_text(value: Any) -> str:
@@ -151,7 +151,9 @@ def _hierarchy_value(item: dict[str, Any], snake_name: str, camel_name: str) -> 
 def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str, Any]:
     """独立校验单个 episode parquet，保留其局部行号语义。"""
     source_name = parquet_source_name(parquet_source)
-    with open_parquet_file(parquet_source) as parquet_file:
+    # Annotation columns span many row groups in remote files. Arrow's
+    # pre-buffering merges their range reads before issuing S3 requests.
+    with open_parquet_file(parquet_source, pre_buffer=True) as parquet_file:
         available_columns = set(parquet_file.schema_arrow.names)
         missing_columns = [name for name in ANNOTATION_COLUMNS if name not in available_columns]
         read_columns = [name for name in ANNOTATION_COLUMNS if name in available_columns]

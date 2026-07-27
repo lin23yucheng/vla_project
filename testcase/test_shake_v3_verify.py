@@ -425,7 +425,12 @@ class TestShakeV3Verify:
             (f"{workflow_step}.3", "end_time_extract", "end", "结束", "left", "左", self._resolve_l1_end_time_ns()),
             (f"{workflow_step}.4", "end_time_extract", "end", "结束", "right", "右", self._resolve_l1_end_time_ns()),
         )
-        for substep, extract_key, time_key, time_label, side, side_label, target_ns in cases:
+        failed_cases = 0
+        print(
+            f"[步骤{workflow_step}] 开始校验: 2个时间点，2路相机，共{len(cases)}组图片",
+            flush=True,
+        )
+        for case_index, (substep, extract_key, time_key, time_label, side, side_label, target_ns) in enumerate(cases, start=1):
             with allure.step(f"步骤{substep}：对比L1标注{time_label}时间{side_label}相机图片"):
                 try:
                     parquet_result = (self.parquet_image_extract_result or {}).get(extract_key, {})
@@ -443,21 +448,22 @@ class TestShakeV3Verify:
                         diff_output_path=diff_path,
                     )
                     comparisons[f"{time_key}_{side}"] = comparison
-                    if not comparison["dimension_match"]:
-                        result_message = (
-                            f"{time_label}时间{side_label}相机图片尺寸不一致："
-                            f"MCAP={comparison['reference_size']}，"
-                            f"Parquet={comparison['candidate_size']}"
+                    if comparison["is_consistent"]:
+                        print(
+                            f"[步骤{workflow_step}][图片 {case_index}/{len(cases)}] "
+                            f"L1/{time_label}时间/{side_label}相机 校验通过；"
+                            f"尺寸={comparison['reference_size']}，"
+                            f"容差内像素占比={comparison['similarity_percent']:.4f}%，"
+                            f"平均绝对误差={comparison['mean_absolute_error']:.4f}",
+                            flush=True,
                         )
                     else:
-                        result_message = (
-                            f"{time_label}时间{side_label}相机图片一致性="
-                            f"{comparison['is_consistent']}，"
-                            f"容差内像素占比={comparison['similarity_percent']:.4f}%，"
-                            f"平均绝对误差={comparison['mean_absolute_error']:.4f}，"
-                            f"尺寸={comparison['reference_size']}"
+                        failed_cases += 1
+                        print(
+                            f"[步骤{workflow_step}][图片 {case_index}/{len(cases)}] "
+                            f"L1/{time_label}时间/{side_label}相机 图片校验失败: {comparison}",
+                            flush=True,
                         )
-                    print(f"[步骤{substep}] {result_message}", flush=True)
                     allure.attach.file(str(mcap_image), name=f"步骤{substep}-MCAP", attachment_type=allure.attachment_type.PNG)
                     allure.attach.file(str(parquet_image), name=f"步骤{substep}-Parquet", attachment_type=allure.attachment_type.PNG)
                     if comparison.get("diff_path"):
@@ -467,10 +473,21 @@ class TestShakeV3Verify:
                 except (AssertionError, FileNotFoundError, OSError, ValueError) as exc:
                     comparisons[f"{time_key}_{side}"] = {"error": str(exc)}
                     failures.append(f"{time_label}时间{side_label}相机比较失败: {exc}")
+                    failed_cases += 1
+                    print(
+                        f"[步骤{workflow_step}][图片 {case_index}/{len(cases)}] "
+                        f"L1/{time_label}时间/{side_label}相机 图片校验失败: {exc}",
+                        flush=True,
+                    )
         allure.attach(
             json.dumps(comparisons, ensure_ascii=False, indent=2),
             name=f"步骤{workflow_step}-L1图片对比汇总",
             attachment_type=allure.attachment_type.JSON,
+        )
+        print(
+            f"[步骤{workflow_step}] 图片校验完成：总数={len(cases)}，"
+            f"通过={len(cases) - failed_cases}，失败={failed_cases}",
+            flush=True,
         )
         assert not failures, "L1 标注图片一致性校验失败:\n" + "\n".join(failures)
 
@@ -515,13 +532,6 @@ class TestShakeV3Verify:
                     assert item["pose_fields"] == expected_pose_fields
                     assert item["gripper_topic"] == gripper_topic
                     assert item["gripper_fields"] == ["angle"]
-                    print(
-                        f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
-                        f"pose_topic={item['pose_topic']} gripper_topic={item['gripper_topic']}",
-                        flush=True,
-                    )
-                    print(f"  labels = {item['vector_labels']}", flush=True)
-                    print(f"  vector = {item['vector']}", flush=True)
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-MCAP七维向量",
@@ -547,14 +557,6 @@ class TestShakeV3Verify:
                 for item in vectors:
                     assert item["vector_labels"] == ["x", "y", "z", "roll", "pitch", "yaw", "angle"]
                     assert len(item["vector"]) == 7
-                    print(
-                        f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
-                        f"target_ns={item['target_ns']} matched_timestamp_ns={item['matched_timestamp_ns']} "
-                        f"diff_ns={item['diff_ns']} parquet_column={item['parquet_column']}",
-                        flush=True,
-                    )
-                    print(f"  labels = {item['vector_labels']}", flush=True)
-                    print(f"  vector = {item['vector']}", flush=True)
                 allure.attach(
                     json.dumps(result, ensure_ascii=False, indent=2),
                     name=f"步骤{substep}-Parquet机器人向量",
@@ -565,6 +567,11 @@ class TestShakeV3Verify:
     def _compare_vectors(self, workflow_step: str) -> None:
         failures = []
         results = {}
+        failed_time_points = 0
+        print(
+            f"[步骤{workflow_step}] 开始校验：2个时间点；每个时间点比较4组向量，每组7个值，共28项",
+            flush=True,
+        )
         for substep, time_key, time_label in (
             (f"{workflow_step}.1", "start", "开始时间"),
             (f"{workflow_step}.2", "end", "结束时间"),
@@ -577,33 +584,48 @@ class TestShakeV3Verify:
                     assertions.assert_is_not_none(parquet_result, f"未提取{time_label} parquet 向量")
                     comparison = compare_robot_vectors(mcap_result=mcap_result, parquet_result=parquet_result)
                     results[time_key] = comparison
+                    time_point_has_failure = False
                     for item in comparison.get("comparisons", []):
-                        print(
-                            f"[步骤{substep}][{time_key}][{item['section']}][{item['group']}] "
-                            f"consistent={item['is_consistent']}",
-                            flush=True,
-                        )
                         for dimension in item.get("dimensions", []):
-                            print(
-                                f"  {dimension['label']}: mcap={dimension['mcap_value']} "
-                                f"parquet={dimension['parquet_value']} "
-                                f"diff={dimension['absolute_difference']} "
-                                f"consistent={dimension['is_consistent']}",
-                                flush=True,
-                            )
                             if not dimension["is_consistent"]:
+                                time_point_has_failure = True
                                 failures.append(
                                     f"{time_label}/{item['section']}/{item['group']}/{dimension['label']}: "
                                     f"MCAP={dimension['mcap_value']}, Parquet={dimension['parquet_value']}, "
                                     f"差值={dimension['absolute_difference']}"
                                 )
+                    if time_point_has_failure:
+                        failed_time_points += 1
+                        print(
+                            f"[步骤{workflow_step}][时间点 {1 if time_key == 'start' else 2}/2] "
+                            f"L1/{time_label}时间 七维向量校验失败",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[步骤{workflow_step}][时间点 {1 if time_key == 'start' else 2}/2] "
+                            f"L1/{time_label}时间 校验通过；28项差值均<="
+                            f"{comparison['absolute_tolerance']:.12g}",
+                            flush=True,
+                        )
                 except (AssertionError, FileNotFoundError, OSError, ValueError) as exc:
                     results[time_key] = {"error": str(exc)}
                     failures.append(f"{time_label}机器人向量比较失败: {exc}")
+                    failed_time_points += 1
+                    print(
+                        f"[步骤{workflow_step}][时间点 {1 if time_key == 'start' else 2}/2] "
+                        f"L1/{time_label}时间 七维向量校验失败: {exc}",
+                        flush=True,
+                    )
         allure.attach(
             json.dumps(results, ensure_ascii=False, indent=2),
             name=f"步骤{workflow_step}-L1机器人向量对比汇总",
             attachment_type=allure.attachment_type.JSON,
+        )
+        print(
+            f"[步骤{workflow_step}] 七维向量校验完成：时间点=2，"
+            f"通过={2 - failed_time_points}，失败={failed_time_points}",
+            flush=True,
         )
         assert not failures, "L1 标注机器人向量不一致:\n" + "\n".join(failures)
 

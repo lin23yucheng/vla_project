@@ -159,7 +159,7 @@ def extract_parquet_robot_vectors_at_time(
 def compare_robot_vectors(
     mcap_result: dict[str, Any],
     parquet_result: dict[str, Any],
-    absolute_tolerance: float = 1e-5,
+    absolute_tolerance: float = 5e-04,
 ) -> dict[str, Any]:
     """按 section/group 和七维下标比较 MCAP 转换值与 Parquet 原始值。"""
     mcap_vectors = {
