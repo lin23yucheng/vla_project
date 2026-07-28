@@ -18,6 +18,8 @@ from common.extract_mcap_fields import (
     _build_interpolation_neighbors,
     _incomplete_interpolation_topics,
     _load_gripper_entries,
+    _resolve_interpolation,
+    _sync_policy_to_tolerance_ns,
     extract_robot_vectors_at_time,
     get_nested_field_value,
     interpolate_pose7d,
@@ -195,17 +197,42 @@ def test_adaptive_search_windows_expand_to_configured_maximum():
 def test_build_interpolation_neighbors_collects_nearest_and_bracket():
     records = {
         "/pose": [
-            {"matched_publish_ns": 90, "ros_message": object()},
-            {"matched_publish_ns": 110, "ros_message": object()},
+            {"matched_publish_ns": 900, "matched_log_ns": 90, "ros_message": object()},
+            {"matched_publish_ns": 800, "matched_log_ns": 110, "ros_message": object()},
         ]
     }
 
     neighbors = _build_interpolation_neighbors(records, ["/pose"], target_ns=100)
 
-    assert neighbors["/pose"]["nearest"]["matched_publish_ns"] == 90
-    assert neighbors["/pose"]["before"]["matched_publish_ns"] == 90
-    assert neighbors["/pose"]["after"]["matched_publish_ns"] == 110
+    assert neighbors["/pose"]["nearest"]["matched_log_ns"] == 90
+    assert neighbors["/pose"]["before"]["matched_log_ns"] == 90
+    assert neighbors["/pose"]["after"]["matched_log_ns"] == 110
     assert _incomplete_interpolation_topics(neighbors, ["/pose"], max_tolerance_ns=5) == []
+
+
+def test_sync_policy_is_parsed_as_milliseconds():
+    assert _sync_policy_to_tolerance_ns("3") == 3_000_000
+    assert _sync_policy_to_tolerance_ns("exact_frame") == 3_000_000
+    assert _sync_policy_to_tolerance_ns("0.5") == 500_000
+
+
+def test_resolve_interpolation_clamps_to_episode_first_and_last_values():
+    first = {"matched_log_ns": 110, "diff_ns": 10, "ros_message": object()}
+    last = {"matched_log_ns": 90, "diff_ns": 10, "ros_message": object()}
+
+    strategy, ratio, selected, second = _resolve_interpolation(
+        {"nearest": first, "before": None, "after": first},
+        target_ns=100,
+        max_tolerance_ns=5,
+    )
+    assert (strategy, ratio, selected, second) == ("clamp_first", None, first, None)
+
+    strategy, ratio, selected, second = _resolve_interpolation(
+        {"nearest": last, "before": last, "after": None},
+        target_ns=100,
+        max_tolerance_ns=5,
+    )
+    assert (strategy, ratio, selected, second) == ("clamp_last", None, last, None)
 
 
 def test_robot_vector_extraction_uses_one_combined_window_scan(monkeypatch):
@@ -288,6 +315,45 @@ def test_robot_vector_extraction_uses_one_combined_window_scan(monkeypatch):
     assert len(result["vectors"]) == 4
 
 
+def test_main_camera_fallback_stays_inside_episode(monkeypatch):
+    fallback_ranges = []
+    monkeypatch.setattr(
+        "common.extract_mcap_fields.load_configured_topic_fields",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "common.extract_mcap_fields._load_gripper_entries",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "common.extract_mcap_fields._load_main_time_topic",
+        lambda *args, **kwargs: "/main",
+    )
+    monkeypatch.setattr(
+        "common.extract_mcap_fields._scan_main_frame_and_sensor_messages",
+        lambda *args, **kwargs: (None, {}, 0, False),
+    )
+
+    def fake_fallback(mcap_files, topics, target_ns, start_time, end_time, **kwargs):
+        fallback_ranges.append((start_time, end_time))
+        return {}, 0
+
+    monkeypatch.setattr("common.extract_mcap_fields._scan_nearest_messages", fake_fallback)
+
+    with pytest.raises(ValueError, match="未找到主相机 topic"):
+        extract_robot_vectors_at_time(
+            config_path="unused.json",
+            mcap_dir=None,
+            target_ns=150,
+            mcap_sources=[object()],
+            allow_full_scan_fallback=True,
+            episode_start_ns=100,
+            episode_end_ns=200,
+        )
+
+    assert fallback_ranges == [(100, 201)]
+
+
 def test_robot_vector_extraction_reads_tianji_gripper_data_index(monkeypatch):
     """夹爪输出标签固定为 angle，但数值须遵循构型中的 data[0] 字段。"""
     target_ns = 1_000_000_000
@@ -344,3 +410,81 @@ def test_robot_vector_extraction_reads_tianji_gripper_data_index(monkeypatch):
 
     assert [item["values_by_label"]["angle"] for item in result["vectors"]] == [2.5] * 4
     assert all(item["gripper_fields"] == ["data[0]"] for item in result["vectors"])
+
+
+def test_robot_vector_extraction_uses_slerp_in_interpolated_path(monkeypatch):
+    target_ns = 100
+    pose_fields = [
+        "pose.position.x", "pose.position.y", "pose.position.z",
+        "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w",
+    ]
+    pose_entries = [
+        {
+            "section": section,
+            "group": group,
+            "topic": f"/pose_{group}",
+            "fields": pose_fields,
+            "sync_tolerance_ns": 0,
+        }
+        for section in ("action", "observation_state")
+        for group in ("left", "right")
+    ]
+    gripper_entries = {
+        (section, group): {
+            "topic": f"/gripper_{group}",
+            "fields": ["angle"],
+            "sync_tolerance_ns": 0,
+        }
+        for section in ("action", "observation_state")
+        for group in ("left", "right")
+    }
+    start_q = [math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)]
+    end_q = [0.0, math.sqrt(0.5), 0.0, math.sqrt(0.5)]
+
+    def pose_message(quaternion):
+        return {
+            "pose": {
+                "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "orientation": dict(zip(("x", "y", "z", "w"), quaternion)),
+            }
+        }
+
+    monkeypatch.setattr("common.extract_mcap_fields.load_configured_topic_fields", lambda *args, **kwargs: pose_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_gripper_entries", lambda *args, **kwargs: gripper_entries)
+    monkeypatch.setattr("common.extract_mcap_fields._load_main_time_topic", lambda *args, **kwargs: "/main")
+
+    def fake_scan(mcap_files, topics, scan_target_ns, start_time, end_time, **kwargs):
+        result = {}
+        for topic in topics:
+            is_pose = topic.startswith("/pose")
+            before = {
+                "matched_log_ns": 0, "matched_publish_ns": 10,
+                "diff_ns": 100,
+                "ros_message": pose_message(start_q) if is_pose else {"angle": 0.0},
+            }
+            after = {
+                "matched_log_ns": 200, "matched_publish_ns": 210,
+                "diff_ns": 100,
+                "ros_message": pose_message(end_q) if is_pose else {"angle": 2.0},
+            }
+            result[topic] = {"nearest": before, "before": before, "after": after}
+        return result, len(topics) * 2
+
+    monkeypatch.setattr("common.extract_mcap_fields._scan_interpolation_neighbors", fake_scan)
+
+    result = extract_robot_vectors_at_time(
+        config_path="unused.json",
+        mcap_dir=None,
+        target_ns=target_ns,
+        align_to_main_camera=False,
+        mcap_sources=[object()],
+        mcap_source_label="test",
+        episode_start_ns=0,
+        episode_end_ns=200,
+    )
+
+    expected_euler = quaternion_to_euler_zyx(*slerp_quaternion(start_q, end_q, 0.5))
+    assert result["vectors"][0]["values_by_label"] == pytest.approx(
+        {"x": 0.0, "y": 0.0, "z": 0.0, **expected_euler, "angle": 1.0}
+    )
+    assert result["vectors"][0]["pose_match"]["strategy"] == "interpolated"

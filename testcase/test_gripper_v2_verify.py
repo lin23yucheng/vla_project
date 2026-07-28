@@ -14,6 +14,7 @@ from common import Assert
 from common.client_factory import create_lazy_yixiu_client
 from common.extract_mcap_image import extract_global_nearest_image_from_mcap_sources
 from common.extract_mcap_fields import extract_robot_vectors_at_time, load_robot_vector_topics
+from common.fixed_fps_validation import validate_episode_fixed_fps_timeline
 from common.image_compare import compare_images
 from common.extract_parquet_fields import compare_robot_vectors, extract_parquet_robot_vectors_at_time
 from common.parse_parquet_file import (
@@ -607,6 +608,8 @@ class TestV2Verify:
                     allow_full_scan_fallback=False,
                     require_chunk_indexes=True,
                     additional_cache_topics=self.mcap_prefetch_topics,
+                    episode_start_ns=self._resolve_step3_start_time_ns(),
+                    episode_end_ns=self._resolve_step3_end_time_ns(),
                 )
                 extract_result["annotation_target_ns"] = target_ns
                 extract_result["parquet_matched_timestamp_ns"] = mcap_target_ns
@@ -829,6 +832,8 @@ class TestV2Verify:
                     mcap_source_label=self.mcap_source_label,
                     require_chunk_indexes=True,
                     allow_full_scan_fallback=False,
+                    episode_start_ns=self._resolve_step3_start_time_ns(),
+                    episode_end_ns=self._resolve_step3_end_time_ns(),
                 )
                 extract_result["annotation_target_ns"] = target_ns
                 extract_result["parquet_matched_timestamp_ns"] = mcap_target_ns
@@ -1592,6 +1597,20 @@ class TestV2Verify:
             assert self.parquet_sources, "S3 chunk-000 中未发现 parquet 文件"
             allure.attach("步骤11执行成功：已发现全部远端parquet文件", name="步骤11结果",
                           attachment_type=allure.attachment_type.TEXT)
+
+    @pytest.mark.order(11)
+    @allure.story("固定30FPS时间轴校验")
+    def test_validate_l1_fixed_fps_timeline(self):
+        with allure.step("根据主相机首帧独立校验L1 Episode的30FPS输出时间轴"):
+            result = validate_episode_fixed_fps_timeline(
+                mcap_sources=self.mcap_sources,
+                parquet_sources=self.parquet_sources,
+                main_camera_topic=self.main_time_topic,
+                episode_start_ns=self._resolve_step3_start_time_ns(),
+                episode_end_ns=self._resolve_step3_end_time_ns(),
+            )
+            allure.attach(json.dumps(result, ensure_ascii=False, indent=2), name="L1固定30FPS时间轴校验", attachment_type=allure.attachment_type.JSON)
+            assert result["is_consistent"], "L1固定30FPS时间轴校验失败:\n" + "\n".join(result["failures"])
 
     @pytest.mark.order(12)
     @allure.story("步骤12：按步骤3标注开始和结束时间提取parquet图片")

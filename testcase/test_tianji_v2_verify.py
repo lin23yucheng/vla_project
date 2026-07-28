@@ -21,6 +21,7 @@ from common.extract_parquet_fields import (
     compare_robot_vectors,
     extract_parquet_robot_vectors_at_time,
 )
+from common.fixed_fps_validation import validate_episode_fixed_fps_timeline
 from common.image_compare import compare_images
 from common.parse_parquet_file import (
     compare_parquet_annotations,
@@ -37,7 +38,7 @@ BASELINE_CAMERA_KEY = "camera_bottom_right"
 EXPECTED_SEGMENT_COUNTS = {"l1": 2, "l2": 4, "l3": 3}
 EXPECTED_CAMERA_COUNT = 4
 CONVERSION_POLL_INTERVAL_SECONDS = 10
-CONVERSION_POLL_TIMEOUT_SECONDS = 40 * 60
+CONVERSION_POLL_TIMEOUT_SECONDS = 30 * 60
 TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS = 1.0
 TIANJI_IMAGE_MIN_MATCH_RATIO = 0.90
 TIANJI_IMAGE_MAX_MEAN_ABSOLUTE_ERROR = 4.0
@@ -653,6 +654,32 @@ class TestTianjiV2Verify:
             return int(created_segment[field_name])
         return int(build_annotation_time_fields(segment_key)[field_name])
 
+    def _resolve_parent_l1_range_ns(self, segment_key: str) -> tuple[int, int]:
+        layer, segment = get_segment_definition(segment_key)
+        if layer.get("layerId") == "l1":
+            parent = segment
+        else:
+            sequence = segment.get("current_sequence")
+            l1_segments = next(
+                item.get("segments", [])
+                for item in TASK_ANNOTATION_CONFIG["layers"]
+                if item.get("layerId") == "l1"
+            )
+            matches = [
+                item for item in l1_segments
+                if item.get("current_sequence") == sequence
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"{segment_key} 无法按 current_sequence={sequence!r} 唯一确定所属 L1"
+                )
+            parent = matches[0]
+        parent_key = str(parent["key"])
+        return (
+            self._resolve_segment_time_ns(parent_key, "startTimeNs"),
+            self._resolve_segment_time_ns(parent_key, "endTimeNs"),
+        )
+
     def _configured_expected_layers(self) -> list[dict[str, Any]]:
         expected_layers = []
         for layer in TASK_ANNOTATION_CONFIG["layers"]:
@@ -735,6 +762,7 @@ class TestTianjiV2Verify:
             f"{segment_key}/{time_key} parquet 图片提取结果缺少 matched_timestamp_ns"
         )
         mcap_target_ns = int(parquet_matched_ns)
+        episode_start_ns, episode_end_ns = self._resolve_parent_l1_range_ns(segment_key)
         mcap_result = extract_global_nearest_image_from_mcap_sources(
             mcap_sources=self.mcap_sources,
             mcap_source_label=self.mcap_source_label,
@@ -746,6 +774,8 @@ class TestTianjiV2Verify:
             allow_full_scan_fallback=False,
             require_chunk_indexes=True,
             additional_cache_topics=self.mcap_prefetch_topics,
+            episode_start_ns=episode_start_ns,
+            episode_end_ns=episode_end_ns,
         )
         mcap_result["annotation_target_ns"] = target_ns
         mcap_result["parquet_matched_timestamp_ns"] = mcap_target_ns
@@ -905,6 +935,7 @@ class TestTianjiV2Verify:
             f"{segment_key}/{time_key} parquet 向量结果缺少 matched_timestamp_ns"
         )
         mcap_target_ns = int(parquet_matched_ns)
+        episode_start_ns, episode_end_ns = self._resolve_parent_l1_range_ns(segment_key)
         mcap_result = extract_robot_vectors_at_time(
             config_path=self.robot_config_path,
             mcap_dir=None,
@@ -916,6 +947,8 @@ class TestTianjiV2Verify:
             mcap_source_label=self.mcap_source_label,
             require_chunk_indexes=True,
             allow_full_scan_fallback=False,
+            episode_start_ns=episode_start_ns,
+            episode_end_ns=episode_end_ns,
         )
         mcap_result["annotation_target_ns"] = target_ns
         mcap_result["parquet_matched_timestamp_ns"] = mcap_target_ns
@@ -1385,6 +1418,28 @@ class TestTianjiV2Verify:
                 name="步骤9远端parquet文件列表",
                 attachment_type=allure.attachment_type.TEXT,
             )
+
+    @pytest.mark.order(9)
+    @allure.story("固定30FPS时间轴校验")
+    def test_validate_l1_fixed_fps_timelines(self):
+        with allure.step("根据主相机首帧独立校验全部L1 Episode的30FPS输出时间轴"):
+            results = {}
+            failures = []
+            for layer, _, definition in iter_layer_segments():
+                if layer["layerId"] != "l1":
+                    continue
+                segment_key = definition["key"]
+                result = validate_episode_fixed_fps_timeline(
+                    mcap_sources=self.mcap_sources,
+                    parquet_sources=self.parquet_sources,
+                    main_camera_topic=self.main_time_topic,
+                    episode_start_ns=self._resolve_segment_time_ns(segment_key, "startTimeNs"),
+                    episode_end_ns=self._resolve_segment_time_ns(segment_key, "endTimeNs"),
+                )
+                results[segment_key] = result
+                failures.extend(f"{segment_key}: {failure}" for failure in result["failures"])
+            allure.attach(json.dumps(results, ensure_ascii=False, indent=2), name="L1固定30FPS时间轴校验", attachment_type=allure.attachment_type.JSON)
+            assert not failures, "L1固定30FPS时间轴校验失败:\n" + "\n".join(failures)
 
     @pytest.mark.order(10)
     @allure.story("步骤10：校验全部标注起止时间的四路相机图片")

@@ -960,6 +960,7 @@ def _build_parquet_image_result(
         "target_ns": target_ns,
         "matched_row_index": nearest_index,
         "matched_timestamp_ns": nearest_timestamp_ns,
+        "output_timestamp": float(nearest_row["timestamp"]),
         "diff_ns": nearest_diff_ns,
         "used_nearest": nearest_diff_ns != 0,
         "image_columns": selected_image_columns,
@@ -1036,6 +1037,16 @@ def extract_nearest_parquet_images_batch(
                     name_prefix=name_prefix,
                 )
                 results.update(source_results)
+                for row_group_index, grouped_requests in source_batch["row_groups"].items():
+                    timestamp_rows = parquet_file.read_row_group(
+                        row_group_index,
+                        columns=["timestamp"],
+                        use_threads=False,
+                    ).column("timestamp").to_pylist()
+                    for request, match in grouped_requests:
+                        results[request["key"]]["output_timestamp"] = float(
+                            timestamp_rows[int(match["row_in_group"])]
+                        )
                 video_files_read += source_video_files_read
                 continue
 
@@ -1050,7 +1061,7 @@ def extract_nearest_parquet_images_batch(
                 for batch in parquet_file.iter_batches(
                     batch_size=8,
                     row_groups=[row_group_index],
-                    columns=selected_image_columns,
+                    columns=["timestamp", *selected_image_columns],
                     use_threads=False,
                 ):
                     batch_end = row_offset + batch.num_rows

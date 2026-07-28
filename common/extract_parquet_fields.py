@@ -96,11 +96,12 @@ def extract_parquet_robot_vectors_at_time(
     target_ns: int,
 ) -> dict[str, Any]:
     """跨本地或远端 parquet 源选择最近时间行并解析左右臂向量。"""
-    required_columns = ["original_timestamp_ns", "actions", "state", "ac_display", "st_display"]
+    required_columns = ["timestamp", "original_timestamp_ns", "actions", "state", "ac_display", "st_display"]
     target_ns = int(target_ns)
     match = find_nearest_parquet_row(parquet_path, target_ns)
     nearest_row, _ = read_matched_parquet_row(match, required_columns)
     matched_timestamp_ns = nearest_row["original_timestamp_ns"]
+    output_timestamp = float(nearest_row["timestamp"])
 
     vectors = []
     for section, (column, display_column) in PARQUET_SECTION_COLUMNS.items():
@@ -138,6 +139,7 @@ def extract_parquet_robot_vectors_at_time(
                     "display_values": display_values,
                     "target_ns": target_ns,
                     "matched_timestamp_ns": matched_timestamp_ns,
+                    "output_timestamp": output_timestamp,
                     "diff_ns": abs(matched_timestamp_ns - target_ns),
                 }
             )
@@ -149,6 +151,7 @@ def extract_parquet_robot_vectors_at_time(
         "matched_row_index": match["row_index"],
         "target_ns": target_ns,
         "matched_timestamp_ns": matched_timestamp_ns,
+        "output_timestamp": output_timestamp,
         "diff_ns": abs(matched_timestamp_ns - target_ns),
         "vector_labels": list(next(iter(available_label_sets))) if len(available_label_sets) == 1 else None,
         "expected_vector_labels": VECTOR_LABELS,

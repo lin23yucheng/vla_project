@@ -417,7 +417,7 @@ def extract_nearest_image_from_mcap(
             if channel.topic != topic_name:
                 continue
             total_topic_messages += 1
-            diff = abs(message.publish_time - target_ns)
+            diff = abs(message.log_time - target_ns)
             if best_diff is None or diff < best_diff:
                 best_diff = diff
                 best_msg = message
@@ -429,7 +429,7 @@ def extract_nearest_image_from_mcap(
     if not img_info:
         raise ValueError(f"MCAP 文件 {mcap_file_path} 中 topic {topic_name} 的最近消息无法解析为 ROS2 Image")
 
-    matched_ns = int(best_msg.publish_time)
+    matched_ns = int(best_msg.log_time)
     side_label = _infer_side_label(topic_name)
     name_parts = []
     if name_prefix:
@@ -455,6 +455,8 @@ def extract_nearest_image_from_mcap(
         "side": side_label,
         "target_ns": int(target_ns),
         "matched_ns": matched_ns,
+        "matched_log_ns": matched_ns,
+        "matched_publish_ns": int(best_msg.publish_time),
         "diff_ns": best_diff,
         "total_topic_messages": total_topic_messages,
         "saved_paths": save_result["saved_paths"],
@@ -553,6 +555,8 @@ def extract_global_nearest_image_from_mcap_sources(
     require_chunk_indexes: bool = True,
     initial_search_window_ns: int = DEFAULT_INITIAL_SEARCH_WINDOW_NS,
     additional_cache_topics: Sequence[str] | None = None,
+    episode_start_ns: int | None = None,
+    episode_end_ns: int | None = None,
 ) -> dict[str, Any]:
     """从本地或远端 MCAP 源按索引提取目标时间附近的多路图片。"""
     mcap_files = list(mcap_sources)
@@ -569,6 +573,13 @@ def extract_global_nearest_image_from_mcap_sources(
         raise ValueError(
             "远端 indexed MCAP 模式禁止 allow_full_scan_fallback，避免读取完整对象"
         )
+    if (episode_start_ns is None) != (episode_end_ns is None):
+        raise ValueError("episode_start_ns 和 episode_end_ns 必须同时提供")
+    if episode_start_ns is not None and episode_end_ns is not None:
+        episode_start_ns = int(episode_start_ns)
+        episode_end_ns = int(episode_end_ns)
+        if episode_start_ns >= episode_end_ns:
+            raise ValueError("episode_start_ns 必须早于 episode_end_ns")
 
     target_ns = int(target_ns)
     output_root = Path(output_dir)
@@ -607,12 +618,15 @@ def extract_global_nearest_image_from_mcap_sources(
                     continue
                 scanned_messages += 1
                 topic_message_counts[topic_name] += 1
-                diff_ns = abs(int(message.publish_time) - target_ns)
+                log_ns = int(message.log_time)
+                diff_ns = abs(log_ns - target_ns)
                 current = best_by_topic.get(topic_name)
                 if current is None or diff_ns < current["diff_ns"]:
                     best_by_topic[topic_name] = {
                         "mcap_file": window_record["mcap_file"],
-                        "matched_ns": int(message.publish_time),
+                        "matched_ns": log_ns,
+                        "matched_log_ns": log_ns,
+                        "matched_publish_ns": int(message.publish_time),
                         "diff_ns": diff_ns,
                         "data": bytes(message.data),
                         "schema_name": getattr(schema, "name", None),
@@ -642,12 +656,15 @@ def extract_global_nearest_image_from_mcap_sources(
                     scanned_messages += 1
                     topic_name = channel.topic
                     topic_message_counts[topic_name] += 1
-                    diff_ns = abs(int(message.publish_time) - target_ns)
+                    log_ns = int(message.log_time)
+                    diff_ns = abs(log_ns - target_ns)
                     current = best_by_topic.get(topic_name)
                     if current is None or diff_ns < current["diff_ns"]:
                         best_by_topic[topic_name] = {
                             "mcap_file": mcap_source_name(mcap_file),
-                            "matched_ns": int(message.publish_time),
+                            "matched_ns": log_ns,
+                            "matched_log_ns": log_ns,
+                            "matched_publish_ns": int(message.publish_time),
                             "diff_ns": diff_ns,
                             "data": bytes(message.data),
                             "schema_name": getattr(schema, "name", None),
@@ -657,7 +674,11 @@ def extract_global_nearest_image_from_mcap_sources(
     effective_search_window_ns: int | None = None
     if search_window_ns is None:
         search_attempt_windows_ns.append(None)
-        scan(topics, None, None)
+        scan(
+            topics,
+            episode_start_ns,
+            episode_end_ns + 1 if episode_end_ns is not None else None,
+        )
     else:
         missing_topics = list(topics)
         for window_ns in adaptive_search_windows(
@@ -666,17 +687,27 @@ def extract_global_nearest_image_from_mcap_sources(
         ):
             search_attempt_windows_ns.append(window_ns)
             effective_search_window_ns = window_ns
-            scan(
-                missing_topics,
-                target_ns - window_ns,
-                target_ns + window_ns + 1,
-            )
+            scan_start_ns = target_ns - window_ns
+            scan_end_ns = target_ns + window_ns + 1
+            if episode_start_ns is not None and episode_end_ns is not None:
+                scan_start_ns = max(scan_start_ns, episode_start_ns)
+                scan_end_ns = min(scan_end_ns, episode_end_ns + 1)
+            if scan_start_ns < scan_end_ns:
+                scan(missing_topics, scan_start_ns, scan_end_ns)
             missing_topics = [topic for topic in topics if topic not in best_by_topic]
             if not missing_topics:
                 break
     missing_topics = [topic for topic in topics if topic not in best_by_topic]
     used_full_scan_fallback = False
-    if missing_topics and allow_full_scan_fallback and search_window_ns is not None:
+    if missing_topics and episode_start_ns is not None and episode_end_ns is not None:
+        scan(missing_topics, episode_start_ns, episode_end_ns + 1)
+        missing_topics = [topic for topic in topics if topic not in best_by_topic]
+    if (
+        missing_topics
+        and allow_full_scan_fallback
+        and search_window_ns is not None
+        and episode_start_ns is None
+    ):
         scan(missing_topics, None, None)
         used_full_scan_fallback = True
 
@@ -744,6 +775,8 @@ def extract_global_nearest_image_from_mcap_sources(
                 "side": side_label,
                 "target_ns": target_ns,
                 "matched_ns": best["matched_ns"],
+                "matched_log_ns": best["matched_log_ns"],
+                "matched_publish_ns": best["matched_publish_ns"],
                 "diff_ns": best["diff_ns"],
                 "topic_message_count": topic_message_counts[topic_name],
                 "saved_paths": save_result["saved_paths"],
@@ -767,6 +800,9 @@ def extract_global_nearest_image_from_mcap_sources(
         "mcap_dir": mcap_source_label,
         "mcap_source_count": len(mcap_files),
         "target_ns": target_ns,
+        "time_field": "log_time",
+        "episode_start_ns": episode_start_ns,
+        "episode_end_ns": episode_end_ns,
         "topics": topics,
         "output_dir": str(output_root),
         "search_window_ns": search_window_ns,
@@ -782,7 +818,7 @@ def extract_global_nearest_image_from_mcap_sources(
 
 
 def extract_image(mcap_path: str, topic_name: str, target_ns: int):
-    """查找 topic 中 publish_time 最接近 target_ns 的图像消息并输出信息"""
+    """查找 topic 中 log_time 最接近 target_ns 的图像消息并输出信息。"""
     with open(mcap_path, "rb") as f:
         reader = make_reader(f)
 
@@ -793,7 +829,7 @@ def extract_image(mcap_path: str, topic_name: str, target_ns: int):
         for schema, channel, message in reader.iter_messages():
             if channel.topic == topic_name:
                 msg_count += 1
-                diff = abs(message.publish_time - target_ns)
+                diff = abs(message.log_time - target_ns)
                 if best_diff is None or diff < best_diff:
                     best_diff = diff
                     best_msg = message
@@ -803,12 +839,12 @@ def extract_image(mcap_path: str, topic_name: str, target_ns: int):
             return
 
         assert best_diff is not None
-        publish_time = best_msg.publish_time
-        assert publish_time is not None
+        log_time = best_msg.log_time
+        assert log_time is not None
 
         print("=" * 60)
         print(f"目标时间: {ns_to_str(target_ns)} ({target_ns} ns)")
-        print(f"最近消息 publish_time: {ns_to_str(publish_time)} ({publish_time} ns)")
+        print(f"最近消息 log_time: {ns_to_str(log_time)} ({log_time} ns)")
         diff_ms = float(best_diff) / 1e6
         print(f"时间偏差: {diff_ms:.3f} ms")
         print(f"数据大小: {len(best_msg.data)} bytes")

@@ -26,6 +26,20 @@ CONFIG_SECTIONS = ("action", "observation_state")
 DEFAULT_MAX_TOLERANCE_NS = 3_000_000
 
 
+def _sync_policy_to_tolerance_ns(value: Any) -> int:
+    """将 machine_config 的毫秒同步策略转换为纳秒。"""
+    normalized = "3" if str(value).strip().lower() == "exact_frame" else str(value).strip()
+    if not normalized:
+        return DEFAULT_MAX_TOLERANCE_NS
+    try:
+        tolerance_ns = round(float(normalized) * 1_000_000)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"无法识别 sync_policy={value!r}") from exc
+    if tolerance_ns < 0:
+        raise ValueError(f"sync_policy 不能小于 0: {value!r}")
+    return tolerance_ns
+
+
 def load_configured_topic_fields(
     config_path: str | Path,
     sections: tuple[str, ...] = CONFIG_SECTIONS,
@@ -73,6 +87,10 @@ def load_configured_topic_fields(
                     "group": item.get("group"),
                     "topic": topic,
                     "fields": fields,
+                    "sync_policy": item.get("sync_policy"),
+                    "sync_tolerance_ns": _sync_policy_to_tolerance_ns(
+                        item.get("sync_policy", "3")
+                    ),
                 }
             )
     return entries
@@ -132,16 +150,16 @@ def _scan_nearest_messages(
                     raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_source_name(mcap_file)}")
                 scanned_messages += 1
                 topic = channel.topic
-                publish_ns = int(message.publish_time)
-                diff_ns = abs(publish_ns - target_ns)
+                log_ns = int(message.log_time)
+                diff_ns = abs(log_ns - target_ns)
                 current = nearest.get(topic)
                 if current is None or diff_ns < current["diff_ns"]:
                     nearest[topic] = {
                         "mcap_file": mcap_source_name(mcap_file),
                         "topic": topic,
                         "schema_name": schema.name,
-                        "matched_publish_ns": publish_ns,
-                        "matched_log_ns": int(message.log_time),
+                        "matched_publish_ns": int(message.publish_time),
+                        "matched_log_ns": log_ns,
                         "diff_ns": diff_ns,
                         "ros_message": ros_message,
                     }
@@ -156,14 +174,14 @@ def _message_record(
     mcap_file: Any,
     target_ns: int,
 ) -> dict[str, Any]:
-    publish_ns = int(message.publish_time)
+    log_ns = int(message.log_time)
     return {
         "mcap_file": mcap_source_name(mcap_file),
         "topic": channel.topic,
         "schema_name": schema.name,
-        "matched_publish_ns": publish_ns,
-        "matched_log_ns": int(message.log_time),
-        "diff_ns": abs(publish_ns - target_ns),
+        "matched_publish_ns": int(message.publish_time),
+        "matched_log_ns": log_ns,
+        "diff_ns": abs(log_ns - target_ns),
         "ros_message": ros_message,
     }
 
@@ -199,16 +217,16 @@ def _scan_main_frame_and_sensor_messages(
         if schema is None:
             raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_file}")
 
-        publish_ns = int(message.publish_time)
+        log_ns = int(message.log_time)
         topic = channel.topic
         if topic == main_time_topic:
             candidate = {
                 "mcap_file": mcap_file,
                 "topic": topic,
                 "schema_name": schema.name,
-                "matched_publish_ns": publish_ns,
-                "matched_log_ns": int(message.log_time),
-                "diff_ns": abs(publish_ns - target_ns),
+                "matched_publish_ns": int(message.publish_time),
+                "matched_log_ns": log_ns,
+                "diff_ns": abs(log_ns - target_ns),
             }
             if main_nearest is None or candidate["diff_ns"] < main_nearest["diff_ns"]:
                 main_nearest = candidate
@@ -224,8 +242,8 @@ def _scan_main_frame_and_sensor_messages(
                 "mcap_file": mcap_file,
                 "topic": topic,
                 "schema_name": schema.name,
-                "matched_publish_ns": publish_ns,
-                "matched_log_ns": int(message.log_time),
+                "matched_publish_ns": int(message.publish_time),
+                "matched_log_ns": log_ns,
                 "ros_message": decoder(message.data),
             }
         )
@@ -245,8 +263,8 @@ def _build_interpolation_neighbors(
     }
     for topic in topics:
         for raw_record in records_by_topic.get(topic, []):
-            publish_ns = int(raw_record["matched_publish_ns"])
-            record = {**raw_record, "diff_ns": abs(publish_ns - target_ns)}
+            log_ns = int(raw_record["matched_log_ns"])
+            record = {**raw_record, "diff_ns": abs(log_ns - target_ns)}
             topic_neighbors = neighbors[topic]
 
             nearest = topic_neighbors["nearest"]
@@ -254,14 +272,14 @@ def _build_interpolation_neighbors(
                 topic_neighbors["nearest"] = record
 
             before = topic_neighbors["before"]
-            if publish_ns <= target_ns and (
-                before is None or publish_ns > before["matched_publish_ns"]
+            if log_ns <= target_ns and (
+                before is None or log_ns > before["matched_log_ns"]
             ):
                 topic_neighbors["before"] = record
 
             after = topic_neighbors["after"]
-            if publish_ns >= target_ns and (
-                after is None or publish_ns < after["matched_publish_ns"]
+            if log_ns >= target_ns and (
+                after is None or log_ns < after["matched_log_ns"]
             ):
                 topic_neighbors["after"] = record
     return neighbors
@@ -270,13 +288,18 @@ def _build_interpolation_neighbors(
 def _incomplete_interpolation_topics(
     neighbors: dict[str, dict[str, dict[str, Any] | None]],
     topics: list[str],
-    max_tolerance_ns: int,
+    max_tolerance_ns: int | dict[str, int],
 ) -> list[str]:
     incomplete_topics = []
     for topic in topics:
         topic_neighbors = neighbors[topic]
         nearest = topic_neighbors["nearest"]
-        needs_bracket = nearest is not None and nearest["diff_ns"] > max_tolerance_ns
+        tolerance_ns = (
+            max_tolerance_ns.get(topic, DEFAULT_MAX_TOLERANCE_NS)
+            if isinstance(max_tolerance_ns, dict)
+            else max_tolerance_ns
+        )
+        needs_bracket = nearest is not None and nearest["diff_ns"] > tolerance_ns
         if nearest is None or (needs_bracket and (
             topic_neighbors["before"] is None or topic_neighbors["after"] is None
         )):
@@ -318,7 +341,6 @@ def _scan_interpolation_neighbors(
                     raise ValueError(f"MCAP topic={channel.topic} 缺少 ROS2 schema: {mcap_source_name(mcap_file)}")
                 scanned_messages += 1
                 topic = channel.topic
-                publish_ns = int(message.publish_time)
                 record = _message_record(
                     schema,
                     channel,
@@ -334,14 +356,15 @@ def _scan_interpolation_neighbors(
                     topic_neighbors["nearest"] = record
 
                 before = topic_neighbors["before"]
-                if publish_ns <= target_ns and (
-                    before is None or publish_ns > before["matched_publish_ns"]
+                log_ns = int(message.log_time)
+                if log_ns <= target_ns and (
+                    before is None or log_ns > before["matched_log_ns"]
                 ):
                     topic_neighbors["before"] = record
 
                 after = topic_neighbors["after"]
-                if publish_ns >= target_ns and (
-                    after is None or publish_ns < after["matched_publish_ns"]
+                if log_ns >= target_ns and (
+                    after is None or log_ns < after["matched_log_ns"]
                 ):
                     topic_neighbors["after"] = record
     return neighbors, scanned_messages
@@ -396,7 +419,7 @@ def interpolate_pose7d(
     end: list[float] | tuple[float, ...],
     ratio: float,
 ) -> list[float]:
-    """对 [x,y,z,qx,qy,qz,qw] 做位置线性插值和旋转 SLERP。"""
+    """位置线性插值，姿态按 [qx, qy, qz, qw] 做最短路径 SLERP。"""
     if len(start) != 7 or len(end) != 7:
         raise ValueError("pose7d 的起止向量都必须包含 7 个值")
     position = [
@@ -426,11 +449,17 @@ def _resolve_interpolation(
 
     before = topic_neighbors["before"]
     after = topic_neighbors["after"]
-    if before is None or after is None or before["matched_publish_ns"] == after["matched_publish_ns"]:
-        return "nearest_missing_bracket", None, nearest, None
+    if before is None and after is not None:
+        return "clamp_first", None, after, None
+    if after is None and before is not None:
+        return "clamp_last", None, before, None
+    if before is None or after is None:
+        return "single_value", None, nearest, None
+    if before["matched_log_ns"] == after["matched_log_ns"]:
+        return "single_value", None, nearest, None
     ratio = _interpolation_ratio(
-        before["matched_publish_ns"],
-        after["matched_publish_ns"],
+        before["matched_log_ns"],
+        after["matched_log_ns"],
         target_ns,
     )
     return "interpolated", ratio, before, after
@@ -577,6 +606,10 @@ def _load_gripper_entries(config_path: str | Path) -> dict[tuple[str, str], dict
                     "group": group,
                     "topic": topic,
                     "fields": fields,
+                    "sync_policy": item.get("sync_policy"),
+                    "sync_tolerance_ns": _sync_policy_to_tolerance_ns(
+                        item.get("sync_policy", "3")
+                    ),
                 }
     expected_keys = [
         (section, group)
@@ -652,7 +685,7 @@ def _merge_neighbors(
         current_before = current[topic]["before"]
         if candidate_before is not None and (
             current_before is None
-            or candidate_before["matched_publish_ns"] > current_before["matched_publish_ns"]
+            or candidate_before["matched_log_ns"] > current_before["matched_log_ns"]
         ):
             current[topic]["before"] = candidate_before
 
@@ -660,7 +693,7 @@ def _merge_neighbors(
         current_after = current[topic]["after"]
         if candidate_after is not None and (
             current_after is None
-            or candidate_after["matched_publish_ns"] < current_after["matched_publish_ns"]
+            or candidate_after["matched_log_ns"] < current_after["matched_log_ns"]
         ):
             current[topic]["after"] = candidate_after
 
@@ -670,7 +703,7 @@ def extract_robot_vectors_at_time(
     mcap_dir: str | Path | None,
     target_ns: int,
     search_window_ns: int = 1_000_000_000,
-    max_tolerance_ns: int = DEFAULT_MAX_TOLERANCE_NS,
+    max_tolerance_ns: int | None = None,
     *,
     initial_search_window_ns: int = DEFAULT_INITIAL_SEARCH_WINDOW_NS,
     align_to_main_camera: bool = True,
@@ -678,12 +711,21 @@ def extract_robot_vectors_at_time(
     mcap_source_label: str | None = None,
     require_chunk_indexes: bool = False,
     allow_full_scan_fallback: bool = True,
+    episode_start_ns: int | None = None,
+    episode_end_ns: int | None = None,
 ) -> dict[str, Any]:
     """按主相机帧或指定时间轴同步并插值 MCAP 数据，生成四组机器人七维向量。"""
     if search_window_ns < 0:
         raise ValueError("search_window_ns 不能小于 0")
-    if max_tolerance_ns < 0:
+    if max_tolerance_ns is not None and max_tolerance_ns < 0:
         raise ValueError("max_tolerance_ns 不能小于 0")
+    if (episode_start_ns is None) != (episode_end_ns is None):
+        raise ValueError("episode_start_ns 和 episode_end_ns 必须同时提供")
+    if episode_start_ns is not None and episode_end_ns is not None:
+        episode_start_ns = int(episode_start_ns)
+        episode_end_ns = int(episode_end_ns)
+        if episode_start_ns >= episode_end_ns:
+            raise ValueError("episode_start_ns 必须早于 episode_end_ns")
     if require_chunk_indexes and allow_full_scan_fallback:
         raise ValueError(
             "远端 indexed MCAP 模式禁止 allow_full_scan_fallback，避免读取完整对象"
@@ -708,7 +750,28 @@ def extract_robot_vectors_at_time(
         [entry["topic"] for entry in pose_entries]
         + [entry["topic"] for entry in gripper_entries.values()]
     ))
+    configured_tolerances: dict[str, int] = {}
+    for entry in [*pose_entries, *gripper_entries.values()]:
+        topic = entry["topic"]
+        tolerance_ns = int(entry.get("sync_tolerance_ns", DEFAULT_MAX_TOLERANCE_NS))
+        existing = configured_tolerances.get(topic)
+        if existing is not None and existing != tolerance_ns:
+            raise ValueError(f"同一 topic 的 sync_policy 不一致: topic={topic}")
+        configured_tolerances[topic] = tolerance_ns
+    topic_tolerances = (
+        {topic: int(max_tolerance_ns) for topic in topics}
+        if max_tolerance_ns is not None
+        else configured_tolerances
+    )
     target_ns = int(target_ns)
+
+    def bounded_window(window_ns: int) -> tuple[int, int]:
+        start_ns = target_ns - window_ns
+        end_ns = target_ns + window_ns + 1
+        if episode_start_ns is not None and episode_end_ns is not None:
+            start_ns = max(start_ns, episode_start_ns)
+            end_ns = min(end_ns, episode_end_ns + 1)
+        return start_ns, end_ns
 
     scanned_messages = 0
     window_cache_hits = 0
@@ -723,14 +786,17 @@ def extract_robot_vectors_at_time(
     for window_ns in adaptive_search_windows(search_window_ns, initial_search_window_ns):
         search_attempt_windows_ns.append(window_ns)
         effective_search_window_ns = window_ns
+        scan_start_ns, scan_end_ns = bounded_window(window_ns)
+        if scan_start_ns >= scan_end_ns:
+            continue
         if align_to_main_camera:
             candidate_main, sensor_records, scan_count, cache_hit = _scan_main_frame_and_sensor_messages(
                 mcap_files,
                 main_time_topic,
                 topics,
                 target_ns,
-                target_ns - window_ns,
-                target_ns + window_ns + 1,
+                scan_start_ns,
+                scan_end_ns,
                 require_chunk_indexes=require_chunk_indexes,
             )
             scanned_messages += scan_count
@@ -740,7 +806,7 @@ def extract_robot_vectors_at_time(
             candidate_neighbors = _build_interpolation_neighbors(
                 sensor_records,
                 topics,
-                int(candidate_main["matched_publish_ns"]),
+                int(candidate_main["matched_log_ns"]),
             )
         else:
             candidate_main = None
@@ -748,16 +814,36 @@ def extract_robot_vectors_at_time(
                 mcap_files,
                 topics,
                 target_ns,
-                target_ns - window_ns,
-                target_ns + window_ns + 1,
+                scan_start_ns,
+                scan_end_ns,
                 require_chunk_indexes=require_chunk_indexes,
             )
             scanned_messages += scan_count
         candidate_incomplete_topics = _incomplete_interpolation_topics(
             candidate_neighbors,
             topics,
-            max_tolerance_ns,
+            topic_tolerances,
         )
+        if episode_start_ns is not None and episode_end_ns is not None:
+            candidate_incomplete_topics = [
+                topic
+                for topic in candidate_incomplete_topics
+                if not (
+                    candidate_neighbors[topic]["nearest"] is not None
+                    and (
+                        (
+                            candidate_neighbors[topic]["before"] is None
+                            and candidate_neighbors[topic]["after"] is not None
+                            and scan_start_ns == episode_start_ns
+                        )
+                        or (
+                            candidate_neighbors[topic]["after"] is None
+                            and candidate_neighbors[topic]["before"] is not None
+                            and scan_end_ns == episode_end_ns + 1
+                        )
+                    )
+                )
+            ]
         main_message = candidate_main
         neighbors = candidate_neighbors
         incomplete_topics = candidate_incomplete_topics
@@ -769,8 +855,8 @@ def extract_robot_vectors_at_time(
             mcap_files,
             [main_time_topic],
             target_ns,
-            None,
-            None,
+            episode_start_ns,
+            episode_end_ns + 1 if episode_end_ns is not None else None,
             require_chunk_indexes=require_chunk_indexes,
         )
         scanned_messages += fallback_count
@@ -780,32 +866,52 @@ def extract_robot_vectors_at_time(
         raise ValueError(f"多个 mcap 文件中未找到主相机 topic: {main_time_topic}")
 
     sampling_reference_ns = (
-        int(main_message["matched_publish_ns"])
+        int(main_message["matched_log_ns"])
         if main_message is not None
         else target_ns
     )
     if neighbors is None:
+        fallback_start_ns = (
+            episode_start_ns
+            if episode_start_ns is not None
+            else sampling_reference_ns - search_window_ns
+        )
+        fallback_end_ns = (
+            episode_end_ns + 1
+            if episode_end_ns is not None
+            else sampling_reference_ns + search_window_ns + 1
+        )
         neighbors, sensor_scan_count = _scan_interpolation_neighbors(
             mcap_files,
             topics,
             sampling_reference_ns,
-            sampling_reference_ns - search_window_ns,
-            sampling_reference_ns + search_window_ns + 1,
+            fallback_start_ns,
+            fallback_end_ns,
             require_chunk_indexes=require_chunk_indexes,
         )
         scanned_messages += sensor_scan_count
         incomplete_topics = _incomplete_interpolation_topics(
             neighbors,
             topics,
-            max_tolerance_ns,
+            topic_tolerances,
         )
     elif incomplete_topics:
+        extension_start_ns = (
+            episode_start_ns
+            if episode_start_ns is not None
+            else sampling_reference_ns - search_window_ns
+        )
+        extension_end_ns = (
+            episode_end_ns + 1
+            if episode_end_ns is not None
+            else sampling_reference_ns + search_window_ns + 1
+        )
         extension_neighbors, extension_count = _scan_interpolation_neighbors(
             mcap_files,
             incomplete_topics,
             sampling_reference_ns,
-            sampling_reference_ns - search_window_ns,
-            sampling_reference_ns + search_window_ns + 1,
+            extension_start_ns,
+            extension_end_ns,
             require_chunk_indexes=require_chunk_indexes,
         )
         _merge_neighbors(neighbors, extension_neighbors, incomplete_topics)
@@ -814,16 +920,18 @@ def extract_robot_vectors_at_time(
         incomplete_topics = _incomplete_interpolation_topics(
             neighbors,
             topics,
-            max_tolerance_ns,
+            topic_tolerances,
         )
 
     if incomplete_topics and allow_full_scan_fallback:
+        fallback_start_ns = episode_start_ns
+        fallback_end_ns = episode_end_ns + 1 if episode_end_ns is not None else None
         fallback_neighbors, fallback_count = _scan_interpolation_neighbors(
             mcap_files,
             incomplete_topics,
             sampling_reference_ns,
-            None,
-            None,
+            fallback_start_ns,
+            fallback_end_ns,
             require_chunk_indexes=require_chunk_indexes,
         )
         _merge_neighbors(neighbors, fallback_neighbors, incomplete_topics)
@@ -844,31 +952,37 @@ def extract_robot_vectors_at_time(
             raise ValueError(f"位姿配置缺少对应夹爪配置: {pose_entry}")
         pose_neighbors = neighbors[pose_entry["topic"]]
         pose_strategy, pose_ratio, pose_first, pose_second = _resolve_interpolation(
-            pose_neighbors, sampling_reference_ns, max_tolerance_ns
+            pose_neighbors,
+            sampling_reference_ns,
+            topic_tolerances[pose_entry["topic"]],
         )
         first_pose = [
             float(get_nested_field_value(pose_first["ros_message"], field))
             for field in pose_entry["fields"]
         ]
         pose7d = first_pose
+        first_pose_values = dict(zip(pose_entry["fields"], first_pose))
+        euler = quaternion_to_euler_zyx(
+            first_pose_values["pose.orientation.x"],
+            first_pose_values["pose.orientation.y"],
+            first_pose_values["pose.orientation.z"],
+            first_pose_values["pose.orientation.w"],
+        )
         if pose_strategy == "interpolated" and pose_second is not None and pose_ratio is not None:
             second_pose = [
                 float(get_nested_field_value(pose_second["ros_message"], field))
                 for field in pose_entry["fields"]
             ]
             pose7d = interpolate_pose7d(first_pose, second_pose, pose_ratio)
+            euler = quaternion_to_euler_zyx(*pose7d[3:7])
         pose_values = dict(zip(pose_entry["fields"], pose7d))
-        euler = quaternion_to_euler_zyx(
-            pose_values["pose.orientation.x"],
-            pose_values["pose.orientation.y"],
-            pose_values["pose.orientation.z"],
-            pose_values["pose.orientation.w"],
-        )
 
         gripper_entry = gripper_entries[gripper_key]
         gripper_neighbors = neighbors[gripper_entry["topic"]]
         gripper_strategy, gripper_ratio, gripper_first, gripper_second = _resolve_interpolation(
-            gripper_neighbors, sampling_reference_ns, max_tolerance_ns
+            gripper_neighbors,
+            sampling_reference_ns,
+            topic_tolerances[gripper_entry["topic"]],
         )
         gripper_field = gripper_entry["fields"][0]
         angle = float(get_nested_field_value(gripper_first["ros_message"], gripper_field))
@@ -929,7 +1043,7 @@ def extract_robot_vectors_at_time(
         "align_to_main_camera": align_to_main_camera,
         "sampling_reference_ns": sampling_reference_ns,
         "main_frame_ns": (
-            int(main_message["matched_publish_ns"])
+            int(main_message["matched_log_ns"])
             if main_message is not None
             else None
         ),
@@ -939,6 +1053,10 @@ def extract_robot_vectors_at_time(
         "effective_search_window_ns": effective_search_window_ns,
         "search_attempt_windows_ns": search_attempt_windows_ns,
         "max_tolerance_ns": max_tolerance_ns,
+        "topic_tolerances_ns": topic_tolerances,
+        "time_field": "log_time",
+        "episode_start_ns": episode_start_ns,
+        "episode_end_ns": episode_end_ns,
         "used_full_scan_fallback": used_full_scan_fallback,
         "used_sensor_window_extension": used_sensor_window_extension,
         "window_cache_hits": window_cache_hits,
