@@ -3,7 +3,11 @@
 from typing import Any, Sequence
 
 from common.mcap_source import adaptive_search_windows, read_mcap_window_messages
-from common.parquet_source import normalize_parquet_sources, open_parquet_file, parquet_source_name
+from common.parquet_source import (
+    open_parquet_file,
+    parquet_source_name,
+    resolve_unique_parquet_episode_source,
+)
 
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -73,40 +77,44 @@ def find_episode_last_main_frame_ns(
 
 
 def _read_episode_parquet_rows(
-    parquet_sources: Any,
-    start_ns: int,
-    end_ns: int,
+    parquet_source: Any,
     original_timestamp_column: str,
     timestamp_column: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for source in normalize_parquet_sources(parquet_sources):
-        with open_parquet_file(source) as parquet_file:
-            required_columns = [original_timestamp_column, timestamp_column]
-            missing_columns = [
-                column for column in required_columns
-                if column not in parquet_file.schema_arrow.names
-            ]
-            if missing_columns:
-                raise ValueError(
-                    f"Parquet 缺少列 {missing_columns}: {parquet_source_name(source)}"
-                )
-            for row_group_index in range(parquet_file.metadata.num_row_groups):
-                values = parquet_file.read_row_group(
-                    row_group_index,
-                    columns=required_columns,
-                    use_threads=False,
-                ).to_pylist()
-                rows.extend(
+    with open_parquet_file(parquet_source) as parquet_file:
+        required_columns = [
+            original_timestamp_column,
+            timestamp_column,
+            "frame_index",
+        ]
+        missing_columns = [
+            column for column in required_columns
+            if column not in parquet_file.schema_arrow.names
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Parquet 缺少列 {missing_columns}: {parquet_source_name(parquet_source)}"
+            )
+        for row_group_index in range(parquet_file.metadata.num_row_groups):
+            values = parquet_file.read_row_group(
+                row_group_index,
+                columns=required_columns,
+                use_threads=False,
+            ).to_pylist()
+            for row in values:
+                if any(row.get(column) is None for column in required_columns):
+                    raise ValueError(
+                        f"Parquet 固定 FPS 必需字段存在空值: "
+                        f"{parquet_source_name(parquet_source)}"
+                    )
+                rows.append(
                     {
-                        "source": parquet_source_name(source),
+                        "source": parquet_source_name(parquet_source),
                         "original_timestamp_ns": int(row[original_timestamp_column]),
                         "timestamp": float(row[timestamp_column]),
+                        "frame_index": int(row["frame_index"]),
                     }
-                    for row in values
-                    if row.get(original_timestamp_column) is not None
-                    and row.get(timestamp_column) is not None
-                    and start_ns <= int(row[original_timestamp_column]) <= end_ns
                 )
     return rows
 
@@ -147,10 +155,13 @@ def validate_episode_fixed_fps_timeline(
         require_chunk_indexes=require_chunk_indexes,
     )
     timeline_end_ns = min(episode_end_ns, last_main_frame_ns)
-    rows = _read_episode_parquet_rows(
+    episode_record = resolve_unique_parquet_episode_source(
         parquet_sources,
-        t0_ns,
-        timeline_end_ns,
+        episode_start_ns,
+        episode_end_ns,
+    )
+    rows = _read_episode_parquet_rows(
+        episode_record["source"],
         original_timestamp_column,
         timestamp_column,
     )
@@ -160,7 +171,6 @@ def validate_episode_fixed_fps_timeline(
             f"[{t0_ns}, {episode_end_ns}]"
         )
 
-    rows.sort(key=lambda row: row["timestamp"])
     failures: list[str] = []
     t0_alignment_difference_ns = abs(rows[0]["original_timestamp_ns"] - t0_ns)
     if t0_alignment_difference_ns > T0_ALIGNMENT_TOLERANCE_NS:
@@ -173,17 +183,20 @@ def validate_episode_fixed_fps_timeline(
     if abs(rows[0]["timestamp"]) > 1e-9:
         failures.append(f"固定时间轴首帧不是 0 秒: timestamp={rows[0]['timestamp']}")
 
-    frame_indices: list[int] = []
-    for row in rows:
+    previous_original_timestamp_ns: int | None = None
+    for expected_frame_index, row in enumerate(rows):
         timestamp_seconds = row["timestamp"]
-        frame_index = round(timestamp_seconds * FPS)
-        expected_seconds = frame_index / FPS
+        frame_index = row["frame_index"]
+        expected_seconds = expected_frame_index / FPS
+        if frame_index != expected_frame_index:
+            failures.append(
+                f"frame_index 不连续: actual={frame_index}, expected={expected_frame_index}"
+            )
         if abs(timestamp_seconds - expected_seconds) > TIMESTAMP_GRID_TOLERANCE_SECONDS:
             failures.append(
                 f"时间戳不在 30 FPS 网格: timestamp={timestamp_seconds}, "
-                f"expected={expected_seconds}, frame_index={frame_index}"
+                f"expected={expected_seconds}, frame_index={expected_frame_index}"
             )
-        frame_indices.append(frame_index)
         expected_target_ns = t0_ns + round(expected_seconds * NANOSECONDS_PER_SECOND)
         target_difference_ns = abs(row["original_timestamp_ns"] - expected_target_ns)
         if target_difference_ns > T0_ALIGNMENT_TOLERANCE_NS:
@@ -192,16 +205,15 @@ def validate_episode_fixed_fps_timeline(
                 f"actual={row['original_timestamp_ns']}, expected={expected_target_ns}, "
                 f"diff_ns={target_difference_ns}"
             )
-
-    duplicate_indices = [
-        frame_indices[index]
-        for index in range(1, len(frame_indices))
-        if frame_indices[index] == frame_indices[index - 1]
-    ]
-    if duplicate_indices:
-        failures.append(f"30 FPS 时间轴存在重复帧索引: {duplicate_indices[:10]}")
-    if any(frame_indices[index] != frame_indices[index - 1] + 1 for index in range(1, len(frame_indices))):
-        failures.append("30 FPS 时间轴存在跳帧或非递增帧索引")
+        if (
+            previous_original_timestamp_ns is not None
+            and row["original_timestamp_ns"] <= previous_original_timestamp_ns
+        ):
+            failures.append(
+                "original_timestamp_ns 未严格递增: "
+                f"{row['original_timestamp_ns']} <= {previous_original_timestamp_ns}"
+            )
+        previous_original_timestamp_ns = row["original_timestamp_ns"]
 
     expected_frame_count = ((timeline_end_ns - t0_ns) * FPS) // NANOSECONDS_PER_SECOND + 1
     if len(rows) != expected_frame_count:
@@ -217,6 +229,10 @@ def validate_episode_fixed_fps_timeline(
         "t0_alignment_tolerance_ns": T0_ALIGNMENT_TOLERANCE_NS,
         "t0_alignment_difference_ns": t0_alignment_difference_ns,
         "main_camera_topic": main_camera_topic,
+        "parquet_source": episode_record["source_name"],
+        "episode_id": episode_record["episode_id"],
+        "episode_index": episode_record["episode_index"],
+        "l1_id": episode_record["l1_id"],
         "time_field": "log_time",
         "episode_start_ns": episode_start_ns,
         "episode_end_ns": episode_end_ns,

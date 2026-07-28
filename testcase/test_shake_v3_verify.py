@@ -325,11 +325,15 @@ class TestShakeV3Verify:
                 "key": "start_time_extract",
                 "target_ns": self._resolve_l1_start_time_ns(),
                 "extra_name_parts": ["l1", "start"],
+                "episode_start_ns": self._resolve_l1_start_time_ns(),
+                "episode_end_ns": self._resolve_l1_end_time_ns(),
             },
             {
                 "key": "end_time_extract",
                 "target_ns": self._resolve_l1_end_time_ns(),
                 "extra_name_parts": ["l1", "end"],
+                "episode_start_ns": self._resolve_l1_start_time_ns(),
+                "episode_end_ns": self._resolve_l1_end_time_ns(),
             },
         ]
         output_dir = Path(__file__).resolve().parent.parent / "parquet_image"
@@ -520,6 +524,8 @@ class TestShakeV3Verify:
                 parquet_reference = extract_parquet_robot_vectors_at_time(
                     parquet_path=self.parquet_sources,
                     target_ns=target_ns,
+                    episode_start_ns=self._resolve_l1_start_time_ns(),
+                    episode_end_ns=self._resolve_l1_end_time_ns(),
                 )
                 mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 result = extract_robot_vectors_at_time(
@@ -565,6 +571,8 @@ class TestShakeV3Verify:
                 result = extract_parquet_robot_vectors_at_time(
                     parquet_path=self.parquet_sources,
                     target_ns=target_ns,
+                    episode_start_ns=self._resolve_l1_start_time_ns(),
+                    episode_end_ns=self._resolve_l1_end_time_ns(),
                 )
                 results[time_key] = result
                 vectors = result.get("vectors", [])

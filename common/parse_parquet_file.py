@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 
 from common.parquet_source import (
     find_nearest_parquet_rows,
+    get_parquet_image_column_metadata,
     normalize_parquet_sources,
     open_parquet_file,
     parquet_source_name,
@@ -148,15 +149,24 @@ def _hierarchy_value(item: dict[str, Any], snake_name: str, camel_name: str) -> 
     return item.get(camel_name) if value in (None, "") else value
 
 
-def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str, Any]:
+def _extract_parquet_annotation_summary_single(
+    parquet_source: Any,
+    required_levels: Sequence[int] = (),
+) -> dict[str, Any]:
     """独立校验单个 episode parquet，保留其局部行号语义。"""
     source_name = parquet_source_name(parquet_source)
+    dynamic_level_columns = [
+        f"annotation.level_{level}_{suffix}"
+        for level in sorted({int(level) for level in required_levels})
+        for suffix in ("id", "name")
+    ]
+    required_columns = list(dict.fromkeys([*ANNOTATION_COLUMNS, *dynamic_level_columns]))
     # Annotation columns span many row groups in remote files. Arrow's
     # pre-buffering merges their range reads before issuing S3 requests.
     with open_parquet_file(parquet_source, pre_buffer=True) as parquet_file:
         available_columns = set(parquet_file.schema_arrow.names)
-        missing_columns = [name for name in ANNOTATION_COLUMNS if name not in available_columns]
-        read_columns = [name for name in ANNOTATION_COLUMNS if name in available_columns]
+        missing_columns = [name for name in required_columns if name not in available_columns]
+        read_columns = [name for name in required_columns if name in available_columns]
         if "timestamp" in available_columns:
             read_columns.append("timestamp")
         rows = parquet_file.read(columns=read_columns, use_threads=False).to_pylist()
@@ -343,6 +353,24 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
                     f"与 hierarchy_json 中的 {expected_value!r} 不一致"
                 )
 
+        hierarchy_by_level = {
+            item["level"]: item
+            for item in normalized_hierarchy
+            if item["level"] is not None
+        }
+        for level in required_levels:
+            if level == 1:
+                continue
+            active_item = hierarchy_by_level.get(level)
+            for suffix in ("id", "name"):
+                expected_value = active_item[suffix] if active_item is not None else ""
+                column = f"annotation.level_{level}_{suffix}"
+                if column in available_columns and _annotation_text(row.get(column)) != expected_value:
+                    add_error(
+                        f"第{row_index}行 {column}={row.get(column)!r}，"
+                        f"与 hierarchy_json 中的 {expected_value!r} 不一致"
+                    )
+
         path_value = _annotation_text(row.get("annotation.path"))
         path_position = 0
         for item in normalized_hierarchy:
@@ -400,10 +428,13 @@ def _extract_parquet_annotation_summary_single(parquet_source: Any) -> dict[str,
     }
 
 
-def extract_parquet_annotation_summary(parquet_path: Any) -> dict[str, Any]:
+def extract_parquet_annotation_summary(
+    parquet_path: Any,
+    required_levels: Sequence[int] = (),
+) -> dict[str, Any]:
     """逐个校验所有 episode parquet，并汇总唯一的 L1/L2/L3 分段。"""
     file_summaries = [
-        _extract_parquet_annotation_summary_single(source)
+        _extract_parquet_annotation_summary_single(source, required_levels)
         for source in normalize_parquet_sources(parquet_path)
     ]
 
@@ -545,8 +576,12 @@ def compare_parquet_annotations(
     validate_l1_playback_duration: bool = False,
 ) -> dict[str, Any]:
     """将代码中提交的 layers/segments 与 parquet 标注元数据逐层比较。"""
-    summary = extract_parquet_annotation_summary(parquet_path)
     expected = _normalize_expected_annotations(expected_layers)
+    required_levels = sorted({item["level"] for item in expected})
+    summary = extract_parquet_annotation_summary(
+        parquet_path,
+        required_levels=required_levels,
+    )
     actual = summary["annotations"]
     failures = list(summary["validation_errors"])
     segment_comparisons: list[dict[str, Any]] = []
@@ -704,6 +739,64 @@ def _discover_image_columns(schema: pa.Schema) -> list[str]:
         if {"bytes", "path"}.issubset(child_names):
             image_columns.append(field.name)
     return image_columns
+
+
+def validate_parquet_image_column_integrity(
+    parquet_path: Any,
+    image_columns: Sequence[str],
+) -> dict[str, Any]:
+    """用 Parquet 列元数据全量检查图片 bytes/path 的数量与空值。"""
+    expected_columns = list(dict.fromkeys(str(column) for column in image_columns))
+    if not expected_columns:
+        raise ValueError("image_columns 不能为空")
+    failures: list[str] = []
+    file_results: list[dict[str, Any]] = []
+    for source in normalize_parquet_sources(parquet_path):
+        source_name = parquet_source_name(source)
+        metadata = get_parquet_image_column_metadata(source)
+        available_results = metadata["columns"]
+        missing_columns = [
+            column for column in expected_columns if column not in available_results
+        ]
+        if missing_columns:
+            failures.append(f"{source_name} 缺少图片列: {missing_columns}")
+        column_results: dict[str, Any] = {}
+        for column in expected_columns:
+            column_result = available_results.get(column)
+            if column_result is None:
+                continue
+            if not column_result["metadata_complete"]:
+                failures.append(
+                    f"{source_name} 无法从元数据确认 {column} 的空值数量"
+                )
+            expected_count = metadata["row_count"]
+            for suffix in ("bytes", "path"):
+                value_count = column_result[f"{suffix}_value_count"]
+                null_count = column_result[f"{suffix}_null_count"]
+                if value_count != expected_count:
+                    failures.append(
+                        f"{source_name} {column}.{suffix} 数量不等于行数: "
+                        f"{value_count} != {expected_count}"
+                    )
+                if null_count:
+                    failures.append(
+                        f"{source_name} {column}.{suffix} 存在空值: {null_count}"
+                    )
+            column_results[column] = column_result
+        file_results.append(
+            {
+                "source": source_name,
+                "row_count": metadata["row_count"],
+                "columns": column_results,
+            }
+        )
+    return {
+        "is_consistent": not failures,
+        "image_columns": expected_columns,
+        "file_count": len(file_results),
+        "files": file_results,
+        "failures": failures,
+    }
 
 
 def _sanitize_filename_component(value: Any) -> str:
@@ -940,6 +1033,12 @@ def _build_parquet_image_result(
             extra_name_parts=extra_name_parts,
         )
         saved_path, decode_mode = _save_preview_image(bytes(image_bytes), output_png)
+        if decode_mode == "raw_bin_fallback":
+            saved_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Parquet 图片 bytes 无法解码: column={column_name}, "
+                f"row={nearest_index}, bytes={len(image_bytes)}"
+            )
         saved_files.append(
             {
                 "column": column_name,
@@ -951,8 +1050,15 @@ def _build_parquet_image_result(
             }
         )
 
-    if not saved_files:
-        raise ValueError("最近时间行未提取到有效图片 bytes")
+    if len(saved_files) != len(selected_image_columns):
+        saved_columns = {item["column"] for item in saved_files}
+        missing_image_columns = [
+            column for column in selected_image_columns if column not in saved_columns
+        ]
+        raise ValueError(
+            f"最近时间行缺少有效图片 bytes: columns={missing_image_columns}, "
+            f"row={nearest_index}"
+        )
 
     return {
         "parquet_file": match["source_name"],
@@ -988,20 +1094,48 @@ def extract_nearest_parquet_images_batch(
         if key in request_keys:
             raise ValueError(f"target_request key 重复: {key}")
         request_keys.add(key)
+        episode_start_ns = request.get("episode_start_ns")
+        episode_end_ns = request.get("episode_end_ns")
+        if (episode_start_ns is None) != (episode_end_ns is None):
+            raise ValueError(
+                f"target_request {key} 的 episode_start_ns 和 episode_end_ns 必须同时提供"
+            )
         requests.append(
             {
                 "key": key,
                 "target_ns": int(request["target_ns"]),
                 "extra_name_parts": list(request.get("extra_name_parts") or []),
+                "episode_start_ns": (
+                    int(episode_start_ns) if episode_start_ns is not None else None
+                ),
+                "episode_end_ns": (
+                    int(episode_end_ns) if episode_end_ns is not None else None
+                ),
             }
         )
     if not requests:
         raise ValueError("target_requests 不能为空")
 
-    matches = find_nearest_parquet_rows(
-        parquet_path,
-        [request["target_ns"] for request in requests],
-    )
+    request_groups: dict[tuple[int | None, int | None], list[dict[str, Any]]] = defaultdict(list)
+    for request in requests:
+        request_groups[
+            (request["episode_start_ns"], request["episode_end_ns"])
+        ].append(request)
+    matches_by_key: dict[str, dict[str, Any]] = {}
+    for (episode_start_ns, episode_end_ns), grouped_requests in request_groups.items():
+        grouped_matches = find_nearest_parquet_rows(
+            parquet_path,
+            [request["target_ns"] for request in grouped_requests],
+            episode_start_ns=episode_start_ns,
+            episode_end_ns=episode_end_ns,
+        )
+        matches_by_key.update(
+            {
+                request["key"]: match
+                for request, match in zip(grouped_requests, grouped_matches)
+            }
+        )
+    matches = [matches_by_key[request["key"]] for request in requests]
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     source_batches: dict[str, dict[str, Any]] = {}

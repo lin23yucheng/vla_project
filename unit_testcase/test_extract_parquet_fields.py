@@ -32,6 +32,7 @@ def _write_robot_parquet(path, include_angle: bool, gripper_field: str = "angle"
     display_value = dict(zip(display_fields, values))
     table = pa.table(
         {
+            "timestamp": pa.array([0.0], type=pa.float64()),
             "original_timestamp_ns": pa.array([100], type=pa.int64()),
             "actions": pa.array([values], type=pa.list_(pa.float32())),
             "state": pa.array([values], type=pa.list_(pa.float32())),

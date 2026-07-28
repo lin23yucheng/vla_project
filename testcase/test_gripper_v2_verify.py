@@ -527,11 +527,15 @@ class TestV2Verify:
                         "key": f"{annotation_key}_start",
                         "target_ns": start_time_ns,
                         "extra_name_parts": [annotation_key, "start"],
+                        "episode_start_ns": self._resolve_step3_start_time_ns(),
+                        "episode_end_ns": self._resolve_step3_end_time_ns(),
                     },
                     {
                         "key": f"{annotation_key}_end",
                         "target_ns": end_time_ns,
                         "extra_name_parts": [annotation_key, "end"],
+                        "episode_start_ns": self._resolve_step3_start_time_ns(),
+                        "episode_end_ns": self._resolve_step3_end_time_ns(),
                     },
                 ]
             )
@@ -595,6 +599,8 @@ class TestV2Verify:
                 parquet_reference = extract_parquet_robot_vectors_at_time(
                     parquet_path=self.parquet_sources,
                     target_ns=target_ns,
+                    episode_start_ns=self._resolve_step3_start_time_ns(),
+                    episode_end_ns=self._resolve_step3_end_time_ns(),
                 )
                 mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 extract_result = extract_global_nearest_image_from_mcap_sources(
@@ -821,6 +827,8 @@ class TestV2Verify:
                 parquet_reference = extract_parquet_robot_vectors_at_time(
                     parquet_path=self.parquet_sources,
                     target_ns=target_ns,
+                    episode_start_ns=self._resolve_step3_start_time_ns(),
+                    episode_end_ns=self._resolve_step3_end_time_ns(),
                 )
                 mcap_target_ns = int(parquet_reference["matched_timestamp_ns"])
                 extract_result = extract_robot_vectors_at_time(
@@ -865,6 +873,8 @@ class TestV2Verify:
                 extract_result = extract_parquet_robot_vectors_at_time(
                     parquet_path=self.parquet_sources,
                     target_ns=target_ns,
+                    episode_start_ns=self._resolve_step3_start_time_ns(),
+                    episode_end_ns=self._resolve_step3_end_time_ns(),
                 )
                 results[time_key] = extract_result
                 vectors = extract_result.get("vectors", [])

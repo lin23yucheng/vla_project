@@ -52,6 +52,8 @@ def _write_annotation_parquet(path):
                 "subtask_progress": progress,
                 "annotation.level_1_id": l1["id"],
                 "annotation.level_1_name": l1["name"],
+                "annotation.level_2_id": leaf["id"],
+                "annotation.level_2_name": leaf["name"],
                 "annotation.leaf_id": leaf["id"],
                 "annotation.leaf_name": leaf["name"],
                 "annotation.path": f"{l1['name']}/{leaf['name']}",
@@ -140,11 +142,47 @@ def test_compare_parquet_annotations_reports_field_differences(tmp_path):
     assert {"name", "end_timestamp_ns"}.issubset(difference_fields)
 
 
+def test_compare_parquet_annotations_requires_declared_level_columns(tmp_path):
+    parquet_path = tmp_path / "missing_level_column.parquet"
+    _write_annotation_parquet(parquet_path)
+    table = pq.read_table(parquet_path).drop(["annotation.level_2_name"])
+    pq.write_table(table, parquet_path)
+
+    result = compare_parquet_annotations(parquet_path, _expected_layers())
+
+    assert result["is_consistent"] is False
+    assert any(
+        "缺少标注校验必需列: annotation.level_2_name" in failure
+        for failure in result["failures"]
+    )
+
+
+def test_compare_parquet_annotations_checks_flattened_dynamic_level_values(tmp_path):
+    parquet_path = tmp_path / "wrong_level_value.parquet"
+    _write_annotation_parquet(parquet_path)
+    table = pq.read_table(parquet_path)
+    column_index = table.schema.get_field_index("annotation.level_2_id")
+    table = table.set_column(
+        column_index,
+        "annotation.level_2_id",
+        pa.array(["wrong"] * table.num_rows),
+    )
+    pq.write_table(table, parquet_path)
+
+    result = compare_parquet_annotations(parquet_path, _expected_layers())
+
+    assert result["is_consistent"] is False
+    assert any(
+        "annotation.level_2_id='wrong'" in failure
+        for failure in result["failures"]
+    )
+
+
 def test_compare_parquet_annotations_reports_l1_playback_duration_difference(tmp_path):
     parquet_path = tmp_path / "annotations.parquet"
     _write_annotation_parquet(parquet_path)
     expected_layers = _expected_layers()
-    expected_layers[0]["segments"][0]["endTimeNs"] = "100000100"
+    expected_layers[0]["segments"][0]["endTimeNs"] = "120000100"
     result = compare_parquet_annotations(
         parquet_path,
         expected_layers,
@@ -154,19 +192,19 @@ def test_compare_parquet_annotations_reports_l1_playback_duration_difference(tmp
     assert result["is_consistent"] is False
     assert result["l1_playback_duration_comparisons"] == [
         {
-            "expected_duration_ns": 100000000,
-            "expected_duration_seconds": 0.1,
+            "expected_duration_ns": 120000000,
+            "expected_duration_seconds": 0.12,
             "parquet_playback_start_seconds": 0.0,
             "parquet_playback_end_seconds": 0.04,
             "parquet_playback_duration_seconds": 0.04,
-            "duration_error_seconds": 0.060000000000000005,
+            "duration_error_seconds": 0.07999999999999999,
             "is_consistent": False,
         }
     ]
     assert any(
         "L1第1条播放时长不一致: parquet timestamp 0.0 -> 0.04，时长 0.04 秒；"
-        "代码标注时长 0.1 秒（100000000 ns），实际误差 0.060000000000000005 秒，"
-        "允许误差 0.04 秒" == failure
+        "代码标注时长 0.12 秒（120000000 ns），实际误差 0.07999999999999999 秒，"
+        "允许误差 0.07 秒" == failure
         for failure in result["failures"]
     )
 

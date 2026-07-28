@@ -27,6 +27,7 @@ from common.parse_parquet_file import (
     compare_parquet_annotations,
     extract_nearest_parquet_images_batch,
     format_l1_playback_duration_comparison,
+    validate_parquet_image_column_integrity,
 )
 from common.s3_mcap import S3McapConfig, S3McapStore
 from common.s3_parquet import S3ParquetStore
@@ -579,6 +580,7 @@ class TestTianjiV2Verify:
         cls.parquet_store = None
         cls.parquet_sources = []
         cls.parquet_image_batch_extract_results = None
+        cls.parquet_image_bytes_batch_extract_results = None
         cls.submitted_annotation_json = None
         cls.image_validation_results = {}
         cls.vector_validation_results = {}
@@ -745,7 +747,7 @@ class TestTianjiV2Verify:
         segment_key: str,
         time_key: str,
         target_ns: int,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         """一次 Range 扫描提取与 Parquet 实际命中帧对齐的四路 MCAP 图片。"""
         assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
         project_root = Path(__file__).resolve().parent.parent
@@ -753,6 +755,9 @@ class TestTianjiV2Verify:
         parquet_result = self._ensure_parquet_image_batch_extract_results()[
             f"{segment_key}_{time_key}"
         ]
+        parquet_bytes_result = self._ensure_parquet_image_bytes_batch_extract_results().get(
+            f"{segment_key}_{time_key}"
+        )
         assert parquet_result["target_ns"] == target_ns, (
             f"{segment_key}/{time_key} parquet 批量图片目标时间不一致: "
             f"{parquet_result['target_ns']} != {target_ns}"
@@ -783,6 +788,7 @@ class TestTianjiV2Verify:
             json.dumps(
                 {
                     "parquet": parquet_result,
+                    "parquet_bytes": parquet_bytes_result,
                     "mcap_s3": mcap_result,
                 },
                 ensure_ascii=False,
@@ -791,7 +797,7 @@ class TestTianjiV2Verify:
             name=f"{segment_key}-{time_key}-四路图片提取结果",
             attachment_type=allure.attachment_type.JSON,
         )
-        return parquet_result, mcap_result
+        return parquet_result, parquet_bytes_result, mcap_result
 
     def _ensure_parquet_image_batch_extract_results(self) -> dict[str, dict[str, Any]]:
         """一次匹配全部标注时间点，避免重复读取相同 parquet row group。"""
@@ -799,14 +805,18 @@ class TestTianjiV2Verify:
             return TestTianjiV2Verify.parquet_image_batch_extract_results
 
         target_requests = []
-        for _, _, definition in iter_layer_segments():
+        for layer, _, definition in iter_layer_segments():
             segment_key = definition["key"]
+            episode_start_ns, episode_end_ns = self._resolve_parent_l1_range_ns(segment_key)
             for time_key, field_name in (("start", "startTimeNs"), ("end", "endTimeNs")):
                 target_requests.append(
                     {
                         "key": f"{segment_key}_{time_key}",
                         "target_ns": self._resolve_segment_time_ns(segment_key, field_name),
-                        "extra_name_parts": [segment_key, time_key],
+                        "extra_name_parts": [segment_key, time_key, "video"],
+                        "episode_start_ns": episode_start_ns,
+                        "episode_end_ns": episode_end_ns,
+                        "validate_parquet_bytes": layer["layerId"] == "l1",
                     }
                 )
 
@@ -819,12 +829,57 @@ class TestTianjiV2Verify:
             name_prefix=self.task_no,
             prefer_s3_videos=True,
         )
+        bytes_target_requests = [
+            {
+                **request,
+                "extra_name_parts": [
+                    *request["extra_name_parts"][:-1],
+                    "bytes",
+                ],
+            }
+            for request in target_requests
+            if request["validate_parquet_bytes"]
+        ]
+        image_columns = [camera["name"] for camera in self.cameras]
+        integrity_result = validate_parquet_image_column_integrity(
+            self.parquet_sources,
+            image_columns,
+        )
+        assert integrity_result["is_consistent"], (
+            "天机 Parquet 图片列完整性校验失败:\n"
+            + "\n".join(integrity_result["failures"])
+        )
+        bytes_batch_result = extract_nearest_parquet_images_batch(
+            parquet_path=self.parquet_sources,
+            target_requests=bytes_target_requests,
+            output_dir=Path(__file__).resolve().parent.parent / "parquet_image",
+            image_columns=image_columns,
+            name_prefix=self.task_no,
+            prefer_s3_videos=False,
+        )
+        for request in bytes_target_requests:
+            key = request["key"]
+            video_result = batch_result["results"][key]
+            bytes_result = bytes_batch_result["results"][key]
+            assert (
+                video_result["parquet_file"],
+                video_result["matched_row_group_index"],
+                video_result["matched_row_index"],
+                video_result["matched_timestamp_ns"],
+            ) == (
+                bytes_result["parquet_file"],
+                bytes_result["matched_row_group_index"],
+                bytes_result["matched_row_index"],
+                bytes_result["matched_timestamp_ns"],
+            ), f"{key} 视频帧与 Parquet bytes 未命中同一行"
         TestTianjiV2Verify.parquet_image_batch_extract_results = batch_result["results"]
+        TestTianjiV2Verify.parquet_image_bytes_batch_extract_results = bytes_batch_result["results"]
         print(
             f"[步骤10] parquet图片批量提取完成: 时间点={batch_result['target_count']}，"
             f"源文件={batch_result['source_count']}，"
             f"实际读取row group={batch_result['row_groups_read']}，"
-            f"读取视频文件={batch_result['video_files_read']}",
+            f"读取视频文件={batch_result['video_files_read']}，"
+            f"bytes row group={bytes_batch_result['row_groups_read']}",
             flush=True,
         )
         allure.attach(
@@ -836,6 +891,9 @@ class TestTianjiV2Verify:
                     "video_files_read": batch_result["video_files_read"],
                     "image_source_mode": batch_result["image_source_mode"],
                     "output_dir": batch_result["output_dir"],
+                    "bytes_row_groups_read": bytes_batch_result["row_groups_read"],
+                    "bytes_image_source_mode": bytes_batch_result["image_source_mode"],
+                    "bytes_integrity": integrity_result,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -845,6 +903,12 @@ class TestTianjiV2Verify:
         )
         return TestTianjiV2Verify.parquet_image_batch_extract_results
 
+    def _ensure_parquet_image_bytes_batch_extract_results(self) -> dict[str, dict[str, Any]]:
+        if TestTianjiV2Verify.parquet_image_bytes_batch_extract_results is None:
+            self._ensure_parquet_image_batch_extract_results()
+        assert TestTianjiV2Verify.parquet_image_bytes_batch_extract_results is not None
+        return TestTianjiV2Verify.parquet_image_bytes_batch_extract_results
+
     def _verify_one_camera_image(
         self,
         segment_key: str,
@@ -852,14 +916,26 @@ class TestTianjiV2Verify:
         target_ns: int,
         camera: dict[str, str],
         parquet_result: dict[str, Any],
+        parquet_bytes_result: dict[str, Any] | None,
         mcap_result: dict[str, Any],
     ) -> dict[str, Any]:
         project_root = Path(__file__).resolve().parent.parent
         parquet_image = self._parquet_image_path(parquet_result, camera["name"])
+        parquet_bytes_image = (
+            self._parquet_image_path(parquet_bytes_result, camera["name"])
+            if parquet_bytes_result is not None
+            else None
+        )
         mcap_image = self._mcap_image_path(mcap_result, camera["topic"])
         assert parquet_image.suffix.lower() == ".png", f"parquet 图片未解码为 PNG: {parquet_image}"
+        if parquet_bytes_image is not None:
+            assert parquet_bytes_image.suffix.lower() == ".png", (
+                f"parquet bytes 未解码为 PNG: {parquet_bytes_image}"
+            )
         assert mcap_image.suffix.lower() == ".png", f"MCAP 图片未解码为 PNG: {mcap_image}"
         assert parquet_image.is_file(), f"parquet 图片不存在: {parquet_image}"
+        if parquet_bytes_image is not None:
+            assert parquet_bytes_image.is_file(), f"parquet bytes 图片不存在: {parquet_bytes_image}"
         assert mcap_image.is_file(), f"MCAP 图片不存在: {mcap_image}"
 
         diff_path = (
@@ -867,7 +943,7 @@ class TestTianjiV2Verify:
             / "image_compare"
             / f"{self.task_no}_{segment_key}_{time_key}_{camera['name']}_diff_{target_ns}.png"
         )
-        comparison = compare_images(
+        mcap_to_video = compare_images(
             reference_path=mcap_image,
             candidate_path=parquet_image,
             diff_output_path=diff_path,
@@ -879,6 +955,45 @@ class TestTianjiV2Verify:
             resize_reference_to_candidate=True,
             gaussian_blur_radius=TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS,
         )
+        mcap_to_bytes = None
+        bytes_to_video = None
+        if parquet_bytes_image is not None:
+            mcap_to_bytes = compare_images(
+                reference_path=mcap_image,
+                candidate_path=parquet_bytes_image,
+                diff_output_path=diff_path.with_name(
+                    f"{diff_path.stem}_mcap_to_bytes{diff_path.suffix}"
+                ),
+                min_match_ratio=TIANJI_IMAGE_MIN_MATCH_RATIO,
+                max_mean_absolute_error=TIANJI_IMAGE_MAX_MEAN_ABSOLUTE_ERROR,
+                resize_reference_to_candidate=True,
+                gaussian_blur_radius=TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS,
+            )
+            bytes_to_video = compare_images(
+                reference_path=parquet_bytes_image,
+                candidate_path=parquet_image,
+                diff_output_path=diff_path.with_name(
+                    f"{diff_path.stem}_bytes_to_video{diff_path.suffix}"
+                ),
+                min_match_ratio=TIANJI_IMAGE_MIN_MATCH_RATIO,
+                max_mean_absolute_error=TIANJI_IMAGE_MAX_MEAN_ABSOLUTE_ERROR,
+                resize_reference_to_candidate=True,
+                gaussian_blur_radius=TIANJI_IMAGE_GAUSSIAN_BLUR_RADIUS,
+            )
+        performed_comparisons = [mcap_to_video]
+        performed_comparisons.extend(
+            item for item in (mcap_to_bytes, bytes_to_video) if item is not None
+        )
+        comparison = {
+            **mcap_to_video,
+            "is_consistent": all(
+                item["is_consistent"]
+                for item in performed_comparisons
+            ),
+            "mcap_to_video": mcap_to_video,
+            "mcap_to_parquet_bytes": mcap_to_bytes,
+            "parquet_bytes_to_video": bytes_to_video,
+        }
         comparison.update(
             {
                 "segment_key": segment_key,
@@ -898,15 +1013,27 @@ class TestTianjiV2Verify:
             )
             allure.attach.file(
                 str(parquet_image),
-                name=f"{attachment_prefix}-Parquet",
+                name=f"{attachment_prefix}-Video",
                 attachment_type=allure.attachment_type.PNG,
             )
-        if not comparison["is_consistent"] and comparison.get("diff_path"):
-            allure.attach.file(
-                comparison["diff_path"],
-                name=f"{attachment_prefix}-像素差异图",
-                attachment_type=allure.attachment_type.PNG,
-            )
+            if parquet_bytes_image is not None:
+                allure.attach.file(
+                    str(parquet_bytes_image),
+                    name=f"{attachment_prefix}-ParquetBytes",
+                    attachment_type=allure.attachment_type.PNG,
+                )
+        if not comparison["is_consistent"]:
+            for comparison_name, comparison_item in (
+                ("MCAP与视频", mcap_to_video),
+                ("MCAP与ParquetBytes", mcap_to_bytes),
+                ("ParquetBytes与视频", bytes_to_video),
+            ):
+                if comparison_item is not None and comparison_item.get("diff_path"):
+                    allure.attach.file(
+                        comparison_item["diff_path"],
+                        name=f"{attachment_prefix}-{comparison_name}差异图",
+                        attachment_type=allure.attachment_type.PNG,
+                    )
         allure.attach(
             json.dumps(comparison, ensure_ascii=False, indent=2),
             name=f"{attachment_prefix}-图片一致性指标",
@@ -915,8 +1042,19 @@ class TestTianjiV2Verify:
         if comparison["is_consistent"]:
             mcap_image.unlink(missing_ok=True)
             parquet_image.unlink(missing_ok=True)
+            if parquet_bytes_image is not None:
+                parquet_bytes_image.unlink(missing_ok=True)
         if not comparison["is_consistent"]:
-            raise AssertionError(format_image_comparison_summary(comparison))
+            failed_summaries = [
+                f"{name}: {format_image_comparison_summary(item)}"
+                for name, item in (
+                    ("MCAP与视频", mcap_to_video),
+                    ("MCAP与ParquetBytes", mcap_to_bytes),
+                    ("ParquetBytes与视频", bytes_to_video),
+                )
+                if item is not None and not item["is_consistent"]
+            ]
+            raise AssertionError("；".join(failed_summaries))
         return comparison
 
     def _verify_one_robot_vector_time(
@@ -926,16 +1064,18 @@ class TestTianjiV2Verify:
         target_ns: int,
     ) -> dict[str, Any]:
         assert self.parquet_sources, "步骤9未发现远端 parquet 文件"
+        episode_start_ns, episode_end_ns = self._resolve_parent_l1_range_ns(segment_key)
         parquet_result = extract_parquet_robot_vectors_at_time(
             parquet_path=self.parquet_sources,
             target_ns=target_ns,
+            episode_start_ns=episode_start_ns,
+            episode_end_ns=episode_end_ns,
         )
         parquet_matched_ns = parquet_result.get("matched_timestamp_ns")
         assert parquet_matched_ns is not None, (
             f"{segment_key}/{time_key} parquet 向量结果缺少 matched_timestamp_ns"
         )
         mcap_target_ns = int(parquet_matched_ns)
-        episode_start_ns, episode_end_ns = self._resolve_parent_l1_range_ns(segment_key)
         mcap_result = extract_robot_vectors_at_time(
             config_path=self.robot_config_path,
             mcap_dir=None,
@@ -1475,7 +1615,7 @@ class TestTianjiV2Verify:
                         flush=True,
                     )
                     try:
-                        parquet_result, mcap_result = self._extract_images_at_time(
+                        parquet_result, parquet_bytes_result, mcap_result = self._extract_images_at_time(
                             segment_key=segment_key,
                             time_key=time_key,
                             target_ns=target_ns,
@@ -1514,6 +1654,7 @@ class TestTianjiV2Verify:
                                     target_ns=target_ns,
                                     camera=camera,
                                     parquet_result=parquet_result,
+                                    parquet_bytes_result=parquet_bytes_result,
                                     mcap_result=mcap_result,
                                 )
                                 time_results[camera["name"]] = comparison

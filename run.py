@@ -21,8 +21,8 @@ ALLURE_REPORT = os.path.join(BASE_DIR, "report", "allure-report")
 
 # 在这里按顺序填写要执行的测试文件
 TEST_FILES: List[str] = [
-    # "testcase/test_gripper_v2_verify.py", # 夹爪
-    # "testcase/test_shake_v3_verify.py",   # 摇操
+    "testcase/test_gripper_v2_verify.py", # 夹爪
+    "testcase/test_shake_v3_verify.py",   # 摇操
     "testcase/test_tianji_v2_verify.py",  # 天机
 ]
 
@@ -273,9 +273,9 @@ def run_order_tests() -> int:
                 MyLog.info(f"{file_name}: {format_time(seconds)}")
 
         generate_allure_report(total_time)
-        MyLog.info(f"一休云接口自动化测试-整体耗时: {total_time}")
+        MyLog.info(f"VLA数据验证-整体耗时: {total_time}")
         MyLog.info("===== 测试任务完成 =====")
-        print(f"\033[32mVLA接口自动化测试校验-整体耗时: {total_time}\033[0m")
+        print(f"\033[32mVLA数据验证-整体耗时: {total_time}\033[0m")
 
     return final_exit_code
 

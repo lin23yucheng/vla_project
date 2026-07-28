@@ -6,9 +6,13 @@ import av
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from PIL import Image
 
-from common.parse_parquet_file import extract_nearest_parquet_images_batch
+from common.parse_parquet_file import (
+    extract_nearest_parquet_images_batch,
+    validate_parquet_image_column_integrity,
+)
 
 
 def _png_bytes(color: tuple[int, int, int]) -> bytes:
@@ -74,6 +78,7 @@ def test_batch_image_extraction_reads_shared_row_group_once(tmp_path: Path):
     ]
     table = pa.table(
         {
+            "timestamp": pa.array([0.0, 0.1, 0.2], type=pa.float64()),
             "original_timestamp_ns": pa.array(timestamps, type=pa.int64()),
             "wrist_image_left": pa.array(left_images, type=image_type),
             "wrist_image_right": pa.array(right_images, type=image_type),
@@ -110,6 +115,7 @@ def test_batch_image_extraction_supports_tianji_camera_names(tmp_path: Path):
     camera_names = ["left_eye", "right_eye", "left_image", "right_image"]
     table = pa.table(
         {
+            "timestamp": pa.array([0.0], type=pa.float64()),
             "original_timestamp_ns": pa.array([100], type=pa.int64()),
             **{
                 name: pa.array(
@@ -148,6 +154,7 @@ def test_batch_image_extraction_prefers_s3_video_frames(tmp_path: Path):
     pq.write_table(
         pa.table(
             {
+                "timestamp": pa.array([0.0, 0.1, 0.2], type=pa.float64()),
                 "original_timestamp_ns": pa.array([100, 200, 300], type=pa.int64()),
                 "left_eye": pa.array(images, type=image_type),
             }
@@ -183,3 +190,59 @@ def test_batch_image_extraction_prefers_s3_video_frames(tmp_path: Path):
         saved_file = extract_result["saved_files"][0]
         assert saved_file["decode_mode"] == "s3_video_frame"
         assert Path(saved_file["saved_path"]).is_file()
+
+
+def test_batch_image_extraction_rejects_undecodable_bytes(tmp_path: Path):
+    image_type = pa.struct([
+        pa.field("bytes", pa.binary()),
+        pa.field("path", pa.string()),
+    ])
+    parquet_path = tmp_path / "broken_image.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": pa.array([0.0]),
+                "original_timestamp_ns": pa.array([100], type=pa.int64()),
+                "camera": pa.array(
+                    [{"bytes": b"not-an-image", "path": "frame_000000.png"}],
+                    type=image_type,
+                ),
+            }
+        ),
+        parquet_path,
+    )
+
+    with pytest.raises(ValueError, match="图片 bytes 无法解码"):
+        extract_nearest_parquet_images_batch(
+            parquet_path=parquet_path,
+            target_requests=[{"key": "frame", "target_ns": 100}],
+            output_dir=tmp_path / "output",
+            image_columns=["camera"],
+        )
+
+
+def test_image_column_integrity_reports_null_bytes(tmp_path: Path):
+    image_type = pa.struct([
+        pa.field("bytes", pa.binary()),
+        pa.field("path", pa.string()),
+    ])
+    parquet_path = tmp_path / "null_image.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "camera": pa.array(
+                    [
+                        {"bytes": _png_bytes((1, 2, 3)), "path": "frame_000000.png"},
+                        {"bytes": None, "path": "frame_000001.png"},
+                    ],
+                    type=image_type,
+                )
+            }
+        ),
+        parquet_path,
+    )
+
+    result = validate_parquet_image_column_integrity(parquet_path, ["camera"])
+
+    assert result["is_consistent"] is False
+    assert any("camera.bytes 存在空值: 1" in failure for failure in result["failures"])

@@ -94,11 +94,19 @@ def _build_group_layout(
 def extract_parquet_robot_vectors_at_time(
     parquet_path: Any,
     target_ns: int,
+    *,
+    episode_start_ns: int | None = None,
+    episode_end_ns: int | None = None,
 ) -> dict[str, Any]:
-    """跨本地或远端 parquet 源选择最近时间行并解析左右臂向量。"""
+    """在所属 Episode 内选择最近时间行并解析左右臂向量。"""
     required_columns = ["timestamp", "original_timestamp_ns", "actions", "state", "ac_display", "st_display"]
     target_ns = int(target_ns)
-    match = find_nearest_parquet_row(parquet_path, target_ns)
+    match = find_nearest_parquet_row(
+        parquet_path,
+        target_ns,
+        episode_start_ns=episode_start_ns,
+        episode_end_ns=episode_end_ns,
+    )
     nearest_row, _ = read_matched_parquet_row(match, required_columns)
     matched_timestamp_ns = nearest_row["original_timestamp_ns"]
     output_timestamp = float(nearest_row["timestamp"])
