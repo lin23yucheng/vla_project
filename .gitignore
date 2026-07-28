@@ -21,6 +21,7 @@ report/
 image_compare/
 mcap_image/
 parquet_image/
+config/cookie.txt
 
 # OS files
 .DS_Store
