@@ -287,7 +287,6 @@ class TestV2Verify:
         cls.l2_segment_second = None
         cls.submit_playback = None
         cls.target_format = None
-        cls.active_conversion_entry = None
         cls.finished_conversion_entry = None
         cls.parquet_store = None
         cls.parquet_sources = []
@@ -1437,9 +1436,9 @@ class TestV2Verify:
             allure.attach("步骤8执行成功：已发起数据转换", name="步骤8结果", attachment_type=allure.attachment_type.TEXT)
 
     @pytest.mark.order(9)
-    @allure.story("步骤9：轮询正在转换列表")
-    def test_poll_active_conversion(self):
-        with allure.step("步骤9：轮询正在转换列表"):
+    @allure.story("步骤9：轮询数据转换列表直至完成")
+    def test_poll_conversion_until_completed(self):
+        with allure.step("步骤9：轮询数据转换列表直至完成"):
             if self.workflow_mode == "converted":
                 allure.attach(
                     "任务已转换：跳过步骤9，直接进入步骤11",
@@ -1462,7 +1461,7 @@ class TestV2Verify:
             )
             while True:
                 attempt += 1
-                response = self.api_all.query_active_conversion_list()
+                response = self.api_all.query_conversion_list()
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
                 assertions.assert_text(response_data.get("msg", ""), "success")
@@ -1470,7 +1469,7 @@ class TestV2Verify:
                 conversion_list = response_data.get("data", {}).get("list", [])
                 target_entry = find_conversion_entry(conversion_list, self.task_id)
 
-                print(f"[步骤9] 第{attempt}次轮询，active列表条数: {len(conversion_list)}")
+                print(f"[步骤9] 第{attempt}次轮询，转换列表条数: {len(conversion_list)}")
                 if target_entry:
                     status = str(target_entry.get("status", "")).strip().lower()
                     last_status = status
@@ -1480,91 +1479,36 @@ class TestV2Verify:
                         name="步骤9转换条目",
                         attachment_type=allure.attachment_type.TEXT,
                     )
-                    TestV2Verify.active_conversion_entry = target_entry
+                    if status == "completed":
+                        TestV2Verify.finished_conversion_entry = target_entry
+                        allure.attach("步骤9执行成功：数据转换已完成", name="步骤9结果", attachment_type=allure.attachment_type.TEXT)
+                        return
+                    if status == "failed":
+                        error_msg = f"错误: task_id={self.task_id} 数据转换失败"
+                        allure.attach(error_msg, name="步骤9转换失败", attachment_type=allure.attachment_type.TEXT)
+                        pytest.fail(error_msg)
+                    if status not in {"running", "queued"}:
+                        error_msg = f"错误: task_id={self.task_id} 转换状态异常: '{status}'"
+                        allure.attach(error_msg, name="步骤9状态异常", attachment_type=allure.attachment_type.TEXT)
+                        pytest.fail(error_msg)
 
-                    if status in {"running", "queued"}:
-                        remaining_seconds = poll_deadline - time.monotonic()
-                        if remaining_seconds <= 0:
-                            elapsed_seconds = time.monotonic() - poll_started_at
-                            error_msg = (
-                                f"错误: 转换轮询超过 "
-                                f"{CONVERSION_POLL_TIMEOUT_SECONDS // 60} 分钟，"
-                                f"task_id={self.task_id}，最后状态={last_status!r}"
-                            )
-                            allure.attach(
-                                f"task_id={self.task_id}\n"
-                                f"attempts={attempt}\n"
-                                f"last_status={last_status}\n"
-                                f"elapsed_seconds={elapsed_seconds:.3f}\n"
-                                f"timeout_seconds={CONVERSION_POLL_TIMEOUT_SECONDS}",
-                                name="步骤9轮询超时",
-                                attachment_type=allure.attachment_type.TEXT,
-                            )
-                            pytest.fail(error_msg)
-                        time.sleep(
-                            min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds)
-                        )
-                        continue
-
-                    error_msg = f"错误: task_id={self.task_id} 在 active 列表中状态不是 running，而是 '{status}'"
-                    allure.attach(error_msg, name="步骤9状态异常", attachment_type=allure.attachment_type.TEXT)
+                if not target_entry:
+                    print(f"[步骤9] 转换列表未找到 task_id={self.task_id}")
+                    allure.attach(
+                        f"task_id={self.task_id}\n转换列表未找到",
+                        name="步骤9未找到条目",
+                        attachment_type=allure.attachment_type.TEXT,
+                    )
+                remaining_seconds = poll_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    elapsed_seconds = time.monotonic() - poll_started_at
+                    error_msg = (
+                        f"错误: 转换轮询超过 {CONVERSION_POLL_TIMEOUT_SECONDS // 60} 分钟，"
+                        f"task_id={self.task_id}，最后状态={last_status!r}"
+                    )
+                    allure.attach(error_msg, name="步骤9轮询超时", attachment_type=allure.attachment_type.TEXT)
                     pytest.fail(error_msg)
-
-                print(f"[步骤9] active列表未找到 task_id={self.task_id}，进入步骤10")
-                allure.attach(
-                    f"task_id={self.task_id}\nactive列表未找到，进入步骤10",
-                    name="步骤9未找到条目",
-                    attachment_type=allure.attachment_type.TEXT,
-                )
-                TestV2Verify.active_conversion_entry = None
-                break
-
-            allure.attach("步骤9执行完成：active轮询结束", name="步骤9结果", attachment_type=allure.attachment_type.TEXT)
-
-    @pytest.mark.order(10)
-    @allure.story("步骤10：查询已转换完成列表")
-    def test_check_finished_conversion(self):
-        with allure.step("步骤10：查询已转换完成列表"):
-            if self.workflow_mode == "converted":
-                allure.attach(
-                    "任务已转换：跳过步骤10，直接进入步骤11",
-                    name="步骤10跳过",
-                    attachment_type=allure.attachment_type.TEXT,
-                )
-                pytest.skip("任务已转换，跳过步骤10")
-
-            assertions.assert_is_not_none(self.task_id, "步骤1未提取到 task_id，无法执行步骤10")
-
-            response = self.api_all.query_finished_conversion_list()
-            assertions.assert_code(response.status_code, 200)
-            response_data = response.json()
-            assertions.assert_text(response_data.get("msg", ""), "success")
-
-            conversion_list = response_data.get("data", {}).get("list", [])
-            target_entry = find_conversion_entry(conversion_list, self.task_id)
-
-            print(f"[步骤10] finished列表条数: {len(conversion_list)}")
-            if not target_entry:
-                error_msg = f"错误: 已完成转换列表中未找到 task_id={self.task_id} 的数据"
-                allure.attach(error_msg, name="步骤10未找到条目", attachment_type=allure.attachment_type.TEXT)
-                pytest.fail(error_msg)
-
-            status = str(target_entry.get("status", "")).strip().lower()
-            print(f"[步骤10] 找到task_id={self.task_id}，status={status}")
-            allure.attach(
-                f"task_id={self.task_id}\nstatus={status}\nentry={target_entry}",
-                name="步骤10转换条目",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-            TestV2Verify.finished_conversion_entry = target_entry
-
-            if status != "completed":
-                error_msg = f"错误: task_id={self.task_id} 在已完成列表中的状态不是 completed，而是 '{status}'"
-                allure.attach(error_msg, name="步骤10状态异常", attachment_type=allure.attachment_type.TEXT)
-                pytest.fail(error_msg)
-
-            allure.attach("步骤10执行成功：数据转换已完成", name="步骤10结果",
-                          attachment_type=allure.attachment_type.TEXT)
+                time.sleep(min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds))
 
     @pytest.mark.order(11)
     @allure.story("步骤11：发现S3中的全部parquet文件")
@@ -1572,10 +1516,10 @@ class TestV2Verify:
         with allure.step("步骤11：枚举chunk-000中的全部远端parquet文件"):
             assertions.assert_is_not_none(self.task_no, "步骤1未提取到 task_no，无法执行步骤11")
             if self.workflow_mode != "converted":
-                assertions.assert_is_not_none(self.finished_conversion_entry, "步骤10未确认转换完成，无法执行步骤11")
+                assertions.assert_is_not_none(self.finished_conversion_entry, "步骤9未确认转换完成，无法执行步骤11")
             else:
                 allure.attach(
-                    "任务已转换：步骤11直接执行，步骤10结果不再作为前置依赖",
+                    "任务已转换：步骤11直接执行，步骤9结果不再作为前置依赖",
                     name="步骤11前置说明",
                     attachment_type=allure.attachment_type.TEXT,
                 )

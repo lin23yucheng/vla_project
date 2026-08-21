@@ -127,8 +127,7 @@ class TestShakeV3Verify:
         "test_submit_l1_annotation": "4",
         "test_complete_task_qc": "5",
         "test_create_conversion": "6",
-        "test_poll_active_conversion": "7",
-        "test_check_finished_conversion": "8",
+        "test_poll_conversion_until_completed": "7",
         "test_discover_remote_parquet_files": "9",
         "test_extract_l1_parquet_images": "10",
         "test_extract_l1_mcap_images": "11",
@@ -158,7 +157,6 @@ class TestShakeV3Verify:
         cls.l1_segment = None
         cls.submit_playback = None
         cls.target_format = None
-        cls.active_conversion_entry = None
         cls.finished_conversion_entry = None
         cls.parquet_store = None
         cls.parquet_sources = []
@@ -870,9 +868,9 @@ class TestShakeV3Verify:
             assertions.assert_in_text(response.json(), "success")
 
     @pytest.mark.order(7)
-    @allure.story("步骤7：轮询正在转换列表")
-    def test_poll_active_conversion(self):
-        with allure.step("步骤7：轮询正在转换列表"):
+    @allure.story("步骤7：轮询数据转换列表直至完成")
+    def test_poll_conversion_until_completed(self):
+        with allure.step("步骤7：轮询数据转换列表直至完成"):
             if self.workflow_mode == "converted":
                 pytest.skip("任务已转换，跳过转换轮询")
             poll_started_at = time.monotonic()
@@ -887,23 +885,26 @@ class TestShakeV3Verify:
             )
             while True:
                 attempt += 1
-                response = self.api_all.query_active_conversion_list()
+                response = self.api_all.query_conversion_list()
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
                 assertions.assert_text(response_data.get("msg", ""), "success")
                 conversion_list = response_data.get("data", {}).get("list", [])
                 entry = find_conversion_entry(conversion_list, self.task_id)
-                print(f"[步骤7] 第{attempt}次轮询，active列表条数: {len(conversion_list)}", flush=True)
+                print(f"[步骤7] 第{attempt}次轮询，转换列表条数: {len(conversion_list)}", flush=True)
                 if entry is None:
-                    print(f"[步骤7] active列表未找到 task_id={self.task_id}，进入步骤8", flush=True)
-                    TestShakeV3Verify.active_conversion_entry = None
-                    break
-                TestShakeV3Verify.active_conversion_entry = entry
-                status = str(entry.get("status", "")).strip().lower()
-                last_status = status
-                print(f"[步骤7] 找到task_id={self.task_id}，status={status}", flush=True)
-                if status not in {"running", "queued"}:
-                    pytest.fail(f"active 转换状态异常: {status!r}")
+                    print(f"[步骤7] 转换列表未找到 task_id={self.task_id}", flush=True)
+                else:
+                    status = str(entry.get("status", "")).strip().lower()
+                    last_status = status
+                    print(f"[步骤7] 找到task_id={self.task_id}，status={status}", flush=True)
+                    if status == "completed":
+                        TestShakeV3Verify.finished_conversion_entry = entry
+                        return
+                    if status == "failed":
+                        pytest.fail(f"task_id={self.task_id} 数据转换失败")
+                    if status not in {"running", "queued"}:
+                        pytest.fail(f"转换状态异常: {status!r}")
                 remaining_seconds = poll_deadline - time.monotonic()
                 if remaining_seconds <= 0:
                     elapsed_seconds = time.monotonic() - poll_started_at
@@ -923,24 +924,6 @@ class TestShakeV3Verify:
                 time.sleep(
                     min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds)
                 )
-
-    @pytest.mark.order(8)
-    @allure.story("步骤8：查询已转换完成列表")
-    def test_check_finished_conversion(self):
-        with allure.step("步骤8：查询已转换完成列表"):
-            if self.workflow_mode == "converted":
-                pytest.skip("任务已转换，跳过完成列表确认")
-            response = self.api_all.query_finished_conversion_list()
-            assertions.assert_code(response.status_code, 200)
-            response_data = response.json()
-            assertions.assert_text(response_data.get("msg", ""), "success")
-            conversion_list = response_data.get("data", {}).get("list", [])
-            entry = find_conversion_entry(conversion_list, self.task_id)
-            print(f"[步骤8] finished列表条数: {len(conversion_list)}", flush=True)
-            assertions.assert_is_not_none(entry, f"finished 列表中未找到 task_id={self.task_id}")
-            assert str(entry.get("status", "")).strip().lower() == "completed", f"转换未完成: {entry}"
-            print(f"[步骤8] 找到task_id={self.task_id}，status=completed", flush=True)
-            TestShakeV3Verify.finished_conversion_entry = entry
 
     @pytest.mark.order(9)
     @allure.story("步骤9：发现S3中的全部V3 parquet文件")

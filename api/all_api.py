@@ -11,30 +11,6 @@ class ApiAll():
     def __init__(self, client: ApiClient):
         self.client = client
 
-    # 查询正在转换的任务列表页
-    def query_active_conversion_list(self):
-        url = f"{env}/api/v1/conversions"
-        params = {
-            "view": "active",
-            "page_index": 1,
-            "page_size": 99,
-        }
-
-        response = self.client.get_with_retry(url, params=params)
-        return response
-
-    # 查询已转换完成的任务列表页
-    def query_finished_conversion_list(self):
-        url = f"{env}/api/v1/conversions"
-        params = {
-            "view": "finished",
-            "page_index": 1,
-            "page_size": 99,
-        }
-
-        response = self.client.get_with_retry(url, params=params)
-        return response
-
     # 数据转换接口
     def create_conversion(self, task_id, target_format, quality_labels):
         url = f"{env}/api/v1/conversions"
@@ -94,13 +70,13 @@ class ApiAll():
         response = self.client.get_with_retry(url, params=params)
         return response
 
-    # 查询数据转换列表页
-    def query_conversion_list(self, view="finished", page_index=1, page_size=100):
+    # 查询全部数据转换任务列表页
+    def query_conversion_list(self):
         url = f"{env}/api/v1/conversions"
         params = {
-            "view": view,
-            "page_index": page_index,
-            "page_size": page_size,
+            "view": "all",
+            "page_index": 1,
+            "page_size": 100,
         }
 
         response = self.client.get_no_raise(url, params=params)

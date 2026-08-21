@@ -1,197 +1,169 @@
 {
-  "action": [
-    {
-      "name": "left_pose",
-      "role": "action_pose",
-      "dtype": "float32",
-      "group": "left",
-      "shape": [
-        7
-      ],
-      "topic": "/pika_pose_l",
-      "fields": [
-        "pose.position.x",
-        "pose.position.y",
-        "pose.position.z",
-        "pose.orientation.x",
-        "pose.orientation.y",
-        "pose.orientation.z",
-        "pose.orientation.w"
-      ],
-      "parser": "pose7d",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
-    },
-    {
-      "name": "left_gripper",
-      "role": "gripper",
-      "dtype": "float32",
-      "group": "left",
-      "shape": [
-        1
-      ],
-      "topic": "/sensor/gripper_l/data",
-      "fields": [
-        "angle"
-      ],
-      "parser": "gripper",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
-    },
-    {
-      "name": "right_pose",
-      "role": "action_pose",
-      "dtype": "float32",
-      "group": "right",
-      "shape": [
-        7
-      ],
-      "topic": "/pika_pose_r",
-      "fields": [
-        "pose.position.x",
-        "pose.position.y",
-        "pose.position.z",
-        "pose.orientation.x",
-        "pose.orientation.y",
-        "pose.orientation.z",
-        "pose.orientation.w"
-      ],
-      "parser": "pose7d",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
-    },
-    {
-      "name": "right_gripper",
-      "role": "gripper",
-      "dtype": "float32",
-      "group": "right",
-      "shape": [
-        1
-      ],
-      "topic": "/sensor/gripper_r/data",
-      "fields": [
-        "angle"
-      ],
-      "parser": "gripper",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
-    }
-  ],
+  "schema_version": "1.0",                 
+  "robot_type": "dual_arm_gripper_v1",       
+  "robot_name": "双臂夹爪机器人",             
+  "description": "双臂、双腕相机、双夹爪、末端位姿控制",
+  "main_time_topic": "/sensor/camera_fisheye_r/color/image_raw",
   "cameras": [
     {
-      "key": "observation.images.left_wrist",
-      "name": "wrist_image_left",
+      "key": "observation.images.left_image",
+      "name": "left_image",
+      "topic": "/sensor/camera_fisheye_l/color/image_raw", 
       "role": "image",
-      "group": "left",
-      "topic": "/sensor/camera_fisheye_l/color/image_raw",
-      "encoding": "rgb",
-      "required": true,
-      "video_dir": "observation.images.left_wrist",
-      "sync_policy": "3",
-      "output_video": true
+      "type": "wrist",
+      "required": true,                     
+      "encoding": "rgb",                   
+      "sync_policy": "3",         
+      "output_video": true,                
+      "video_dir": "observation.images.left_image",
+      "group": "left"
     },
     {
-      "key": "observation.images.right_wrist",
-      "name": "wrist_image_right",
+      "key": "observation.images.right_image",
+      "name": "right_image",
+      "topic": "/sensor/camera_fisheye_r/color/image_raw", 
       "role": "image",
-      "group": "right",
-      "topic": "/sensor/camera_fisheye_r/color/image_raw",
-      "encoding": "rgb",
-      "required": true,
-      "video_dir": "observation.images.right_wrist",
-      "sync_policy": "exact_frame",
-      "output_video": true
+      "type": "wrist",
+      "required": true,                     
+      "encoding": "rgb",                   
+      "sync_policy": "3",         
+      "output_video": true,                
+      "video_dir": "observation.images.right_image",
+      "group": "right"
     }
   ],
-  "robot_name": "双臂夹爪机器人",
-  "robot_type": "dual_arm_gripper_v1",
-  "description": "双臂、双腕相机、双夹爪、末端位姿控制",
-  "schema_version": "1.0",
-  "main_time_topic": "/sensor/camera_fisheye_r/color/image_raw",
+
   "observation_state": [
     {
-      "name": "left_joint_states",
-      "role": "joint_state",
-      "dtype": "float32",
-      "group": "left",
-      "shape": [
-        7
-      ],
+      "name": "left_joint_states",           
       "topic": "/pika_pose_l",
-      "fields": [
-        "pose.position.x",
-        "pose.position.y",
-        "pose.position.z",
-        "pose.orientation.x",
-        "pose.orientation.y",
-        "pose.orientation.z",
-        "pose.orientation.w"
-      ],
-      "parser": "pose7d",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
+      "role": "joint_state",             
+      "parser": "pose7d",                    
+      "dtype": "float32",             
+      "fields": ["pose.position.x", "pose.position.y", "pose.position.z", "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w"],
+      "shape": [7],
+      "trigger_fields": ["pose.position.x", "pose.position.y", "pose.position.z"],
+      "trigger_parser": "location3d",
+      "trigger_shape": [3],               
+      "required": true,                 
+      "sync_policy": "3",           
+      "missing_policy": "fill",
+      "group": "left"
     },
     {
       "name": "left_gripper",
-      "role": "gripper",
-      "dtype": "float32",
-      "group": "left",
-      "shape": [
-        1
-      ],
       "topic": "/sensor/gripper_l/data",
-      "fields": [
-        "angle"
-      ],
+      "role": "end_effector",
       "parser": "gripper",
+      "dtype": "float32",
+      "fields": ["angle"],
+      "shape": [1],
+      "trigger_fields": ["angle"],
+      "trigger_parser": "gripper",
+      "trigger_shape": [1],
       "required": true,
       "sync_policy": "3",
-      "missing_policy": "zero"
+      "missing_policy": "fill",
+      "group": "left"
     },
     {
-      "name": "right_joint_states",
-      "role": "joint_state",
-      "dtype": "float32",
-      "group": "right",
-      "shape": [
-        7
-      ],
-      "topic": "/pika_pose_r",
-      "fields": [
-        "pose.position.x",
-        "pose.position.y",
-        "pose.position.z",
-        "pose.orientation.x",
-        "pose.orientation.y",
-        "pose.orientation.z",
-        "pose.orientation.w"
-      ],
-      "parser": "pose7d",
-      "required": true,
-      "sync_policy": "3",
-      "missing_policy": "zero"
+      "name": "right_joint_states",            
+      "topic": "/pika_pose_r", 
+      "role": "joint_state", 
+      "parser": "pose7d",                  
+      "dtype": "float32",                  
+      "fields": ["pose.position.x", "pose.position.y", "pose.position.z", "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w"],
+      "shape": [7],
+      "trigger_fields": ["pose.position.x", "pose.position.y", "pose.position.z"],
+      "trigger_parser": "location3d",
+      "trigger_shape": [3],
+      "required": true,                   
+      "sync_policy": "3",            
+      "missing_policy": "fill",
+      "group": "right"
     },
     {
       "name": "right_gripper",
-      "role": "gripper",
-      "dtype": "float32",
-      "group": "right",
-      "shape": [
-        1
-      ],
       "topic": "/sensor/gripper_r/data",
-      "fields": [
-        "angle"
-      ],
+      "role": "end_effector",
       "parser": "gripper",
+      "dtype": "float32",
+      "fields": ["angle"],
+      "shape": [1],
+      "trigger_fields": ["angle"],
+      "trigger_parser": "gripper",
+      "trigger_shape": [1],
       "required": true,
       "sync_policy": "3",
-      "missing_policy": "zero"
+      "missing_policy": "fill",
+      "group": "right"
+    }
+  ],
+
+  "action": [
+    {
+      "name": "left_joint_states",           
+      "topic": "/pika_pose_l",
+      "role": "joint_state",             
+      "parser": "pose7d",                    
+      "dtype": "float32",             
+      "fields": ["pose.position.x", "pose.position.y", "pose.position.z", "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w"],
+      "shape": [7],
+      "trigger_fields": ["pose.position.x", "pose.position.y", "pose.position.z"],
+      "trigger_parser": "location3d",
+      "trigger_shape": [3],               
+      "required": true,                 
+      "sync_policy": "3",           
+      "missing_policy": "fill",       
+      "group": "left"
+    },
+    {
+      "name": "left_gripper",
+      "topic": "/sensor/gripper_l/data",
+      "role": "end_effector",
+      "parser": "gripper",
+      "dtype": "float32",
+      "fields": ["angle"],
+      "shape": [1],
+      "trigger_fields": ["angle"],
+      "trigger_parser": "gripper",
+      "trigger_shape": [1],
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "fill",
+      "group": "left"
+    },
+    {
+      "name": "right_joint_states",            
+      "topic": "/pika_pose_r", 
+      "role": "joint_state", 
+      "parser": "pose7d",                  
+      "dtype": "float32",                  
+      "fields": ["pose.position.x", "pose.position.y", "pose.position.z", "pose.orientation.x", "pose.orientation.y", "pose.orientation.z", "pose.orientation.w"],
+      "shape": [7],
+      "trigger_fields": ["pose.position.x", "pose.position.y", "pose.position.z"],
+      "trigger_parser": "location3d",
+      "trigger_shape": [3],
+      "required": true,                   
+      "sync_policy": "3",
+      "missing_policy": "fill",
+      "group": "right"
+    },
+    {
+      "name": "right_gripper",
+      "topic": "/sensor/gripper_r/data",
+      "role": "end_effector",
+      "parser": "gripper",
+      "dtype": "float32",
+      "fields": ["angle"],
+      "shape": [1],
+      "trigger_fields": ["angle"],
+      "trigger_parser": "gripper",
+      "trigger_shape": [1],
+      "required": true,
+      "sync_policy": "3",
+      "missing_policy": "fill",
+      "group": "right"
     }
   ]
 }

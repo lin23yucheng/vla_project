@@ -1433,11 +1433,11 @@ class TestTianjiV2Verify:
             )
 
     @pytest.mark.order(7)
-    @allure.story("步骤7：轮询正在转换列表")
-    def test_poll_active_conversion(self):
-        with allure.step("步骤7：轮询正在转换列表"):
+    @allure.story("步骤7：轮询数据转换列表直至完成")
+    def test_poll_conversion_until_completed(self):
+        with allure.step("步骤7：轮询数据转换列表直至完成"):
             if self.workflow_mode == "converted":
-                pytest.skip("任务已转换，跳过 active 列表轮询")
+                pytest.skip("任务已转换，跳过转换列表轮询")
             assertions.assert_is_not_none(self.task_id, "步骤1未提取到 task_id")
             poll_started_at = time.monotonic()
             poll_deadline = poll_started_at + CONVERSION_POLL_TIMEOUT_SECONDS
@@ -1451,41 +1451,39 @@ class TestTianjiV2Verify:
             )
             while True:
                 attempt += 1
-                response = self.api_all.query_active_conversion_list()
+                response = self.api_all.query_conversion_list()
                 assertions.assert_code(response.status_code, 200)
                 response_data = response.json()
                 assertions.assert_text(response_data.get("msg", ""), "success")
                 conversion_list = response_data.get("data", {}).get("list", [])
                 target_entry = find_conversion_entry(conversion_list, self.task_id)
-                if not target_entry:
+                if target_entry:
+                    status = str(target_entry.get("status", "")).strip().lower()
+                    last_status = status
                     elapsed_seconds = time.monotonic() - poll_started_at
                     print(
-                        f"[步骤7] 第{attempt}次轮询: active列表未找到任务，"
-                        f"已结束转换阶段，耗时={elapsed_seconds:.1f}秒",
+                        f"[步骤7] 第{attempt}次轮询: status={status}，"
+                        f"转换列表条数={len(conversion_list)}，"
+                        f"已等待={elapsed_seconds:.1f}秒",
                         flush=True,
                     )
                     allure.attach(
-                        f"attempt={attempt}\ntask_id={self.task_id} 已离开 active 列表",
-                        name="步骤7轮询结果",
-                        attachment_type=allure.attachment_type.TEXT,
+                        json.dumps(target_entry, ensure_ascii=False, indent=2),
+                        name=f"步骤7第{attempt}次轮询",
+                        attachment_type=allure.attachment_type.JSON,
                     )
-                    return
-                status = str(target_entry.get("status", "")).strip().lower()
-                last_status = status
-                elapsed_seconds = time.monotonic() - poll_started_at
-                print(
-                    f"[步骤7] 第{attempt}次轮询: status={status}，"
-                    f"active列表条数={len(conversion_list)}，"
-                    f"已等待={elapsed_seconds:.1f}秒",
-                    flush=True,
-                )
-                allure.attach(
-                    json.dumps(target_entry, ensure_ascii=False, indent=2),
-                    name=f"步骤7第{attempt}次轮询",
-                    attachment_type=allure.attachment_type.JSON,
-                )
-                if status not in {"running", "queued"}:
-                    pytest.fail(f"active 转换状态异常: {status!r}")
+                    if status == "completed":
+                        TestTianjiV2Verify.finished_conversion_entry = target_entry
+                        return
+                    if status == "failed":
+                        pytest.fail(f"task_id={self.task_id} 数据转换失败")
+                    if status not in {"running", "queued"}:
+                        pytest.fail(f"转换状态异常: {status!r}")
+                else:
+                    print(
+                        f"[步骤7] 第{attempt}次轮询: 转换列表未找到 task_id={self.task_id}",
+                        flush=True,
+                    )
 
                 remaining_seconds = poll_deadline - time.monotonic()
                 if remaining_seconds <= 0:
@@ -1507,40 +1505,6 @@ class TestTianjiV2Verify:
                     min(CONVERSION_POLL_INTERVAL_SECONDS, remaining_seconds)
                 )
 
-    @pytest.mark.order(8)
-    @allure.story("步骤8：查询已转换完成列表")
-    def test_check_finished_conversion(self):
-        with allure.step("步骤8：查询已转换完成列表"):
-            if self.workflow_mode == "converted":
-                pytest.skip("任务已转换，跳过 finished 列表确认")
-            response = self.api_all.query_finished_conversion_list()
-            assertions.assert_code(response.status_code, 200)
-            response_data = response.json()
-            assertions.assert_text(response_data.get("msg", ""), "success")
-            target_entry = find_conversion_entry(
-                response_data.get("data", {}).get("list", []),
-                self.task_id,
-            )
-            if not target_entry:
-                pytest.fail(f"finished 列表中未找到 task_id={self.task_id}")
-            TestTianjiV2Verify.finished_conversion_entry = target_entry
-            status = str(target_entry.get("status", "")).strip().lower()
-            print(
-                f"[步骤8] finished列表条数: "
-                f"{len(response_data.get('data', {}).get('list', []))}",
-                flush=True,
-            )
-            print(
-                f"[步骤8] 找到task_id={self.task_id}，status={status}",
-                flush=True,
-            )
-            assert status == "completed", f"finished 转换状态应为 completed，实际为 {status!r}"
-            allure.attach(
-                json.dumps(target_entry, ensure_ascii=False, indent=2),
-                name="步骤8转换条目",
-                attachment_type=allure.attachment_type.JSON,
-            )
-
     @pytest.mark.order(9)
     @allure.story("步骤9：发现 S3 中全部 V2 parquet 文件")
     def test_discover_remote_parquet_files(self):
@@ -1549,7 +1513,7 @@ class TestTianjiV2Verify:
             if self.workflow_mode != "converted":
                 assertions.assert_is_not_none(
                     self.finished_conversion_entry,
-                    "步骤8未确认转换完成",
+                    "步骤7未确认转换完成",
                 )
             parquet_sources = self._discover_remote_parquet_sources()
             assert parquet_sources, "S3 chunk-000 中未发现 parquet 文件"
