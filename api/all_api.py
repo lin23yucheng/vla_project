@@ -11,26 +11,150 @@ class ApiAll():
     def __init__(self, client: ApiClient):
         self.client = client
 
-    # 数据转换接口
-    def create_conversion(self, task_id, target_format, quality_labels):
-        url = f"{env}/api/v1/conversions"
+    # ==================== 工作台 ====================
+
+
+    # ==================== 任务管理 ====================
+    # 创建任务
+    def create_task(self, name, category, scene_tags, robot_config_id):
+        url = f"{env}/api/v1/tasks/add"
         payload = {
-            "task_ids": [str(task_id)],
-            "target_format": target_format,
-            "quality_labels": quality_labels,
+            "name": name,
+            "description": "自动化描述",
+            "annotation_levels": [],
+            "category": category,
+            "scene_tags": scene_tags,
+            "robot_config_id": robot_config_id,
+            "collect_requirement": "自动化要求",
+            "target_count": 10,
+            "priority": "high",
         }
 
         response = self.client.post_with_retry(url, json=payload)
         return response
 
-    # 完成质检接口
-    def complete_task_qc(self, task_id):
-        url = f"{env}/api/v1/tasks/{task_id}/complete-qc"
+    # 删除任务
+    def delete_task(self, task_id):
+        url = f"{env}/api/v1/tasks/{task_id}"
 
-        response = self.client.post_with_retry(url)
+        response = self.client.request_with_retry("DELETE", url)
         return response
 
-    # 查询标注workspace
+    # 查询任务管理列表页
+    def query_task_list(self, page_index=1, page_size=100):
+        url = f"{env}/api/v1/tasks"
+        params = {"page_index": page_index, "page_size": page_size}
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # 获取数据分类
+    def query_data_categories(self, page_index=1, page_size=100):
+        url = f"{env}/api/v1/data-categories"
+        params = {"page_index": page_index, "page_size": page_size}
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # 获取标签
+    def query_scene_tags(self, enabled=True, page_index=1, page_size=100):
+        url = f"{env}/api/v1/scene-tags"
+        params = {
+            "enabled": enabled,
+            "page_index": page_index,
+            "page_size": page_size,
+        }
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # 获取机器人构型
+    def query_robot_configs(self, page_index=1, page_size=100):
+        url = f"{env}/api/v1/robot-configs"
+        params = {"page_index": page_index, "page_size": page_size}
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # ==================== 数据采集 ====================
+    # 查询数据采集列表页
+    def query_data_collection_list(self, page_index=1, page_size=100):
+        url = f"{env}/api/v1/tasks"
+        params = {
+            "page_index": page_index,
+            "page_size": page_size,
+            "status": 1,
+        }
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # 登记待上传采集文件
+    def register_collect_files(self, task_id, files):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files/register"
+        payload = {"files": files}
+
+        response = self.client.post_with_retry(url, json=payload)
+        return response
+
+    # 查询采集文件上传汇总
+    def query_collect_files_summary(self, task_id):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files/summary"
+
+        response = self.client.get_with_retry(url)
+        return response
+
+    # 按上传状态查询采集文件
+    def query_collect_files(self, task_id, status_group, page_index=1, page_size=100):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files"
+        params = {
+            "status_group": status_group,
+            "page_index": page_index,
+            "page_size": page_size,
+        }
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
+    # 查询采集文件断点续传位置
+    def query_collect_file_resume(self, task_id, task_file_id):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files/resume/{task_file_id}"
+
+        response = self.client.get_with_retry(url)
+        return response
+
+    # 上传采集文件二进制流
+    def upload_collect_file_stream(
+        self,
+        task_id,
+        filename,
+        relative_path,
+        task_file_id,
+        offset,
+        file_stream,
+        timeout=3600,
+    ):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files/stream"
+        params = {
+            "filename": filename,
+            "relative_path": relative_path,
+            "task_file_id": task_file_id,
+            "offset": offset,
+        }
+        headers = {"Content-Type": "application/octet-stream"}
+
+        response = self.client.post_with_retry(
+            url,
+            params=params,
+            data=file_stream,
+            headers=headers,
+            timeout=timeout,
+        )
+        return response
+
+
+    # ==================== 数据标注 ====================
+    # 查询标注工作区
     def query_annotation_workspace(self, task_id):
         url = f"{env}/api/v1/task-annotations/tasks/{task_id}/annotation-workspace"
 
@@ -62,12 +186,25 @@ class ApiAll():
         response = self.client.post_with_retry(url, json=payload)
         return response
 
-    # 查询任务管理列表页
-    def query_task_list(self, page_index=1, page_size=99):
-        url = f"{env}/api/v1/tasks"
-        params = {"page_index": page_index, "page_size": page_size}
+    # ==================== 人工质检 ====================
+    # 完成质检接口
+    def complete_task_qc(self, task_id):
+        url = f"{env}/api/v1/tasks/{task_id}/complete-qc"
 
-        response = self.client.get_with_retry(url, params=params)
+        response = self.client.post_with_retry(url)
+        return response
+
+    # ==================== 数据转换 ====================
+    # 创建数据转换任务
+    def create_conversion(self, task_id, target_format, quality_labels):
+        url = f"{env}/api/v1/conversions"
+        payload = {
+            "task_ids": [str(task_id)],
+            "target_format": target_format,
+            "quality_labels": quality_labels,
+        }
+
+        response = self.client.post_with_retry(url, json=payload)
         return response
 
     # 查询全部数据转换任务列表页
@@ -81,3 +218,11 @@ class ApiAll():
 
         response = self.client.get_no_raise(url, params=params)
         return response
+
+    # ==================== 数据可视化 ====================
+
+
+    # ==================== 用户与权限 ====================
+
+
+    # ==================== 基础配置 ====================

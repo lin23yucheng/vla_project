@@ -35,7 +35,7 @@ env_login_map = {
 }
 
 token_url = env_login_map[env]["token_url"]
-username = "admin"
+username = "linyucheng"
 password = "123456"
 url = env_login_map[env]["url"]
 
