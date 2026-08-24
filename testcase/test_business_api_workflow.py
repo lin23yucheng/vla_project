@@ -1,6 +1,7 @@
 """业务接口自动化全流程。"""
 
 import os
+import json
 import threading
 import time
 from datetime import datetime
@@ -16,9 +17,15 @@ from common.client_factory import create_lazy_yixiu_client
 
 assertions = Assert.Assertions()
 global_client = create_lazy_yixiu_client()
+# 填写已有任务编号时，跳过创建、上传和采集完成步骤，直接从步骤 8 开始。
+# 为空字符串时执行完整流程；也可通过 VLA_TASK_NO 环境变量覆盖。
+TASK_NO = "TASK-2026-012"
+TASK_NO = os.environ.get("VLA_TASK_NO", TASK_NO).strip()
 UPLOAD_POLL_INTERVAL_SECONDS = 10
 UPLOAD_POLL_TIMEOUT_SECONDS = 30 * 60
 LOCAL_UPLOAD_PROGRESS_POLL_SECONDS = 30
+AUTO_LABELING_POLL_INTERVAL_SECONDS = 10
+AUTO_LABELING_POLL_TIMEOUT_SECONDS = 60 * 60
 
 
 def response_list(response, interface_name):
@@ -156,10 +163,14 @@ class TestBusinessApiWorkflow:
         cls.task_id = None
         cls.local_collection_path = None
         cls.upload_files = []
+        cls.auto_labeling_job_id = None
+        cls.auto_labeling_result = None
 
     @pytest.mark.order(1)
     @allure.story("步骤1：创建任务")
     def test_create_task(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过创建任务")
         with allure.step("获取创建任务所需的分类、标签和机器人构型"):
             categories = response_list(
                 self.api_all.query_data_categories(), "获取数据分类接口"
@@ -226,6 +237,38 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(2)
     @allure.story("步骤2：查询任务管理列表")
     def test_query_created_task(self):
+        if TASK_NO:
+            task_list = response_list(
+                self.api_all.query_task_list(), "查询任务管理列表接口"
+            )
+            target_task = next(
+                (task for task in task_list if str(task.get("task_no", "")).strip() == TASK_NO),
+                None,
+            )
+            if target_task is None:
+                pytest.fail(f"任务管理列表未找到任务编号：{TASK_NO}")
+            self.__class__.task_no = target_task.get("task_no")
+            self.__class__.task_id = target_task.get("id")
+            self.__class__.task_name = target_task.get("name")
+            self.__class__.robot_config_id = (
+                target_task.get("robot_config_id")
+                or target_task.get("robotConfigId")
+                or (target_task.get("robot_config") or {}).get("id")
+            )
+            self.__class__.robot_config_name = (
+                target_task.get("robot_config_name")
+                or target_task.get("robotConfigName")
+                or (target_task.get("robot_config") or {}).get("name")
+            )
+            if not self.task_id or not self.task_name:
+                pytest.fail(f"任务 {TASK_NO} 未包含有效 id 或 name")
+            if not self.robot_config_id and self.robot_config_name:
+                configs = response_list(self.api_all.query_robot_configs(), "获取机器人构型接口")
+                matched = next((item for item in configs if item.get("name") == self.robot_config_name), None)
+                self.__class__.robot_config_id = matched.get("id") if matched else None
+            if not self.robot_config_id:
+                pytest.fail(f"任务 {TASK_NO} 未包含有效 robot_config_id")
+            return
         if not self.task_name:
             pytest.fail("步骤1未生成任务名称，无法查询创建结果")
 
@@ -260,6 +303,8 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(3)
     @allure.story("步骤3：查询数据采集列表")
     def test_query_created_task_in_data_collection_list(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过数据采集列表校验")
         if not self.task_id or not self.task_no or not self.task_name:
             pytest.fail("步骤2未获取完整任务信息，无法查询数据采集列表")
 
@@ -296,6 +341,8 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(4)
     @allure.story("步骤4：采集文件上传")
     def test_upload_collection_files(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过文件上传")
         if not self.task_id:
             pytest.fail("步骤2未获取 task_id，无法上传采集文件")
 
@@ -466,6 +513,8 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(5)
     @allure.story("步骤5：轮询采集文件上传结果")
     def test_wait_for_collection_upload_completion(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过上传轮询")
         if not self.task_id or not self.upload_files:
             pytest.fail("步骤4未准备上传文件，无法检查上传结果")
 
@@ -547,6 +596,8 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(6)
     @allure.story("步骤6：提交采集完成")
     def test_complete_collection_files(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过提交采集完成")
         if not self.task_id or not self.upload_files:
             pytest.fail("步骤4未准备上传文件，无法提交采集完成")
 
@@ -576,6 +627,8 @@ class TestBusinessApiWorkflow:
     @pytest.mark.order(7)
     @allure.story("步骤7：验证任务进入标注列表")
     def test_verify_collection_completed_task_in_annotation_list(self):
+        if TASK_NO:
+            pytest.skip(f"已指定任务 {TASK_NO}，跳过采集完成后的列表校验")
         if not self.task_id or not self.task_name:
             pytest.fail("步骤2未获取完整任务信息，无法验证采集完成结果")
 
@@ -615,3 +668,146 @@ class TestBusinessApiWorkflow:
                 pytest.fail(
                     f"采集完成任务未出现在标注列表：id={self.task_id}，name={self.task_name}"
                 )
+
+    @pytest.mark.order(8)
+    @allure.story("步骤8：参数预检")
+    def test_auto_labeling_pre_check(self):
+        if not self.task_id or not self.robot_config_id:
+            pytest.fail("缺少 task_id 或 robot_config_id，无法进行参数预检")
+
+        config_response = self.api_all.query_robot_config_detail(self.robot_config_id)
+        assertions.assert_code(config_response.status_code, 200)
+        config_data = config_response.json().get("data", {})
+        robot_config = config_data.get("config_json")
+        if not isinstance(robot_config, dict):
+            pytest.fail("机器人构型详情缺少有效 config_json")
+
+        uploaded_files = query_all_collect_files(self.api_all, self.task_id, "uploaded")
+        file_paths = [item.get("s3_uri") for item in uploaded_files if item.get("s3_uri")]
+        if not file_paths:
+            pytest.fail("没有可用于自动化标注的 S3 文件路径")
+
+        playlist_response = self.api_all.query_task_video_playlist(self.task_id)
+        assertions.assert_code(playlist_response.status_code, 200)
+        playlist_data = playlist_response.json().get("data")
+        if not isinstance(playlist_data, dict):
+            pytest.fail("视频播放清单响应缺少有效 data")
+
+        pre_check_job_id = os.environ.get("VLA_AUTO_LABELING_JOB_ID", "").strip()
+        if not pre_check_job_id:
+            # 预检接口要求 job_id 字符串，但尚未进入正式任务创建阶段；使用本次请求的数字追踪 ID。
+            pre_check_job_id = str(time.time_ns())[-16:]
+        payload = {
+            "job_id": pre_check_job_id,
+            "basic": {"task_id": str(self.task_id), "user_config_path": None},
+            "input": {
+                "file_path": file_paths,
+                "file_type": "mcap",
+                "video_playlist": json.dumps(playlist_data, ensure_ascii=False, separators=(",", ":")),
+                "robot_config": json.dumps(robot_config, ensure_ascii=False, separators=(",", ":")),
+                "user_prompt": os.environ.get(
+                    "VLA_AUTO_LABELING_PROMPT",
+                    "请描述机器人完成的子任务,可选子任务为：夹取物体，移动物体，放下物体",
+                ),
+                "video_fps": int(os.environ.get("VLA_AUTO_LABELING_FPS", "30")),
+            },
+        }
+        response = self.api_all.auto_labeling_pre_check(payload)
+        if response.status_code != 200:
+            pytest.fail(
+                f"参数预检失败：HTTP {response.status_code}，响应：{response.text}"
+            )
+        assertions.assert_code(response.status_code, 200)
+        assertions.assert_text(response.json().get("msg", ""), "ok")
+
+    @pytest.mark.order(9)
+    @allure.story("步骤9：提交自动化标注任务")
+    def test_submit_auto_labeling(self):
+        if not self.task_id or not self.robot_config_id:
+            pytest.fail("缺少任务或机器人构型信息，无法提交自动化标注")
+
+        job_response = self.api_all.create_auto_labeling_job_id()
+        assertions.assert_code(job_response.status_code, 200)
+        job_id = job_response.json().get("data", {}).get("job_id")
+        if not job_id:
+            pytest.fail("生成 job_id 失败")
+
+        config_response = self.api_all.query_robot_config_detail(self.robot_config_id)
+        assertions.assert_code(config_response.status_code, 200)
+        robot_config = config_response.json().get("data", {}).get("config_json")
+        files = query_all_collect_files(self.api_all, self.task_id, "uploaded")
+        playlist_response = self.api_all.query_task_video_playlist(self.task_id)
+        assertions.assert_code(playlist_response.status_code, 200)
+        playlist = playlist_response.json().get("data")
+        if not isinstance(robot_config, dict) or not isinstance(playlist, dict):
+            pytest.fail("自动化标注提交所需配置不完整")
+
+        payload = {
+            "job_id": str(job_id),
+            "basic": {"task_id": str(self.task_id), "user_config_path": None},
+            "input": {
+                "file_path": [item["s3_uri"] for item in files if item.get("s3_uri")],
+                "file_type": "mcap",
+                "video_playlist": json.dumps(playlist, ensure_ascii=False, separators=(",", ":")),
+                "robot_config": json.dumps(robot_config, ensure_ascii=False, separators=(",", ":")),
+                "user_prompt": os.environ.get(
+                    "VLA_AUTO_LABELING_PROMPT",
+                    "请描述机器人完成的子任务,可选子任务为：夹取物体，移动物体，放下物体",
+                ),
+                "video_fps": int(os.environ.get("VLA_AUTO_LABELING_FPS", "30")),
+            },
+        }
+        response = self.api_all.submit_auto_labeling_task(payload)
+        if response.status_code not in {200, 202}:
+            pytest.fail(f"提交自动化标注失败：HTTP {response.status_code}，响应：{response.text}")
+        submitted = response.json().get("data", {})
+        self.__class__.auto_labeling_job_id = submitted.get("job_id") or job_id
+        if submitted.get("status") not in {"QUEUED", "RUNNING"}:
+            pytest.fail(f"自动化标注提交后状态异常：{submitted}")
+
+    @pytest.mark.order(10)
+    @allure.story("步骤10：轮询自动化标注状态")
+    def test_wait_for_auto_labeling(self):
+        if not self.task_id or not self.auto_labeling_job_id:
+            pytest.fail("缺少自动化标注 job_id")
+        started_at = time.monotonic()
+        while True:
+            response = self.api_all.query_auto_labeling_task(self.task_id, self.auto_labeling_job_id)
+            assertions.assert_code(response.status_code, 200)
+            data = response.json().get("data", {})
+            status = data.get("status")
+            status_code = data.get("status_code")
+            print(
+                f"[步骤10] 自动化标注轮询：status={status}，"
+                f"status_code={status_code}，"
+                f"progress={data.get('progress_percent', 0)}%，"
+                f"phase={data.get('progress_phase')}，"
+                f"message={data.get('progress_message')}",
+                flush=True,
+            )
+            if status == "SUCCEEDED" or status_code == 4:
+                return
+            if status in {"FAILED", "CANCELED", "CANCELLED", "TIMEOUT"} or status_code in {5, 6, 7, 8}:
+                pytest.fail(f"自动化标注执行失败：{data}")
+            if time.monotonic() - started_at >= AUTO_LABELING_POLL_TIMEOUT_SECONDS:
+                pytest.fail(f"自动化标注轮询超时：{AUTO_LABELING_POLL_TIMEOUT_SECONDS} 秒")
+            time.sleep(AUTO_LABELING_POLL_INTERVAL_SECONDS)
+
+    @pytest.mark.order(11)
+    @allure.story("步骤11：校验自动化标注结果")
+    def test_verify_auto_labeling_result(self):
+        if not self.task_id:
+            pytest.fail("缺少 task_id，无法查询自动化标注结果")
+        response = self.api_all.query_latest_auto_labeling_job(self.task_id)
+        assertions.assert_code(response.status_code, 200)
+        data = response.json().get("data", {})
+        if data.get("status") != "SUCCEEDED" or data.get("status_code") != 4:
+            pytest.fail(f"自动化标注最终状态异常：{data}")
+        episodes = data.get("result", {}).get("episodes_annotation", [])
+        if not isinstance(episodes, list) or not episodes:
+            pytest.fail("自动化标注成功，但 episodes_annotation 为空")
+        self.__class__.auto_labeling_result = data
+
+        workspace_response = self.api_all.query_annotation_workspace(self.task_id)
+        assertions.assert_code(workspace_response.status_code, 200)
+        assertions.assert_text(workspace_response.json().get("msg", ""), "success")

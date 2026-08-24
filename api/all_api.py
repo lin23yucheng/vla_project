@@ -131,15 +131,15 @@ class ApiAll():
 
     # 上传采集文件二进制流
     def upload_collect_file_stream(
-        self,
-        task_id,
-        filename,
-        relative_path,
-        task_file_id,
-        offset,
-        file_stream,
-        content_length=None,
-        timeout=3600,
+            self,
+            task_id,
+            filename,
+            relative_path,
+            task_file_id,
+            offset,
+            file_stream,
+            content_length=None,
+            timeout=3600,
     ):
         url = f"{env}/api/v1/tasks/{task_id}/collect-files/stream"
         params = {
@@ -207,6 +207,42 @@ class ApiAll():
 
         response = self.client.post_with_retry(url, json=payload)
         return response
+
+    # 查询任务视频播放清单（提交自动化标注时序列化为 input.video_playlist）
+    def query_task_video_playlist(self, task_id):
+        url = f"{env}/api/v1/task-annotations/tasks/{task_id}/video-playlist"
+        return self.client.get_with_retry(url)
+
+    # 获取单个机器人构型详情（包含 config_json）
+    def query_robot_config_detail(self, robot_config_id):
+        url = f"{env}/api/v1/robot-configs/{robot_config_id}"
+        return self.client.get_with_retry(url)
+
+    # 参数预检
+    def auto_labeling_pre_check(self, payload):
+        url = f"{env}/api/v1/auto-labeling/pre-check"
+        # 422 是参数校验失败，重试不会改变请求内容；保留响应体便于定位具体字段。
+        return self.client.post_no_raise(url, json=payload)
+
+    # 生成自动化标注 job_id
+    def create_auto_labeling_job_id(self):
+        url = f"{env}/api/v1/task-annotations/auto-labeling/job-id"
+        return self.client.post_with_retry(url)
+
+    # 提交自动化标注任务
+    def submit_auto_labeling_task(self, payload):
+        url = f"{env}/api/v1/auto-labeling/tasks"
+        return self.client.post_with_retry(url, json=payload)
+
+    # 查询自动化标注任务状态
+    def query_auto_labeling_task(self, task_id, job_id):
+        url = f"{env}/api/v1/auto-labeling/tasks/{task_id}/{job_id}"
+        return self.client.get_with_retry(url)
+
+    # 查询任务最近一次自动化标注结果
+    def query_latest_auto_labeling_job(self, task_id):
+        url = f"{env}/api/v1/task-annotations/tasks/{task_id}/auto-labeling/jobs/latest"
+        return self.client.get_with_retry(url)
 
     # ==================== 人工质检 ====================
     # 完成质检接口
