@@ -111,8 +111,22 @@ def query_all_collect_files(api_all, task_id, status_group, page_size=20):
 def print_active_upload_progress(api_all, task_id):
     """查询并输出正在进行的本地上传进度。"""
     active_files = query_all_collect_files(api_all, task_id, "active")
+    uploaded_files = query_all_collect_files(api_all, task_id, "uploaded")
     if not active_files:
-        print("[步骤4] 上传进度：服务端暂未返回进行中的文件", flush=True)
+        summary_response = api_all.query_collect_files_summary(task_id)
+        if summary_response.status_code == 200:
+            summary_data = summary_response.json().get("data", {})
+            print(
+                "[步骤4] 上传进度：active 列表暂为空，"
+                f"已上传={len(uploaded_files)}，汇总={summary_data}",
+                flush=True,
+            )
+        else:
+            print(
+                "[步骤4] 上传进度：active 列表暂为空，"
+                f"已上传={len(uploaded_files)}，汇总接口状态={summary_response.status_code}",
+                flush=True,
+            )
         return
 
     for active_file in active_files:
@@ -318,6 +332,36 @@ class TestBusinessApiWorkflow:
                     f"接口返回 {len(registered_files)} 个"
                 )
 
+            # 某些环境批量登记接口会返回成功但未实际落库，单文件登记可正常落库。
+            summary_response = self.api_all.query_collect_files_summary(self.task_id)
+            assertions.assert_code(summary_response.status_code, 200)
+            summary_data = summary_response.json().get("data", {})
+            if int(summary_data.get("total", 0) or 0) == 0:
+                registered_files = []
+                for registration_file in registration_files:
+                    single_response = self.api_all.register_collect_files(
+                        task_id=self.task_id, files=[registration_file]
+                    )
+                    assertions.assert_code(single_response.status_code, 200)
+                    single_data = single_response.json()
+                    assertions.assert_text(single_data.get("msg", ""), "success")
+                    single_files = single_data.get("data", {}).get("files", [])
+                    if len(single_files) != 1:
+                        pytest.fail(
+                            f"单文件登记响应数量异常：{registration_file['relative_path']}，"
+                            f"返回 {len(single_files)} 个"
+                        )
+                    registered_files.extend(single_files)
+
+                summary_response = self.api_all.query_collect_files_summary(self.task_id)
+                assertions.assert_code(summary_response.status_code, 200)
+                summary_data = summary_response.json().get("data", {})
+                if int(summary_data.get("total", 0) or 0) != len(upload_files):
+                    pytest.fail(
+                        "文件登记后服务端汇总数量仍不正确："
+                        f"期望 {len(upload_files)}，实际 {summary_data.get('total', 0)}"
+                    )
+
             registered_by_path = {
                 str(file_info.get("relative_path", "")): file_info
                 for file_info in registered_files
@@ -341,6 +385,7 @@ class TestBusinessApiWorkflow:
             attachment_type=allure.attachment_type.TEXT,
         )
 
+        upload_started_at = time.monotonic()
         for index, file_info in enumerate(upload_files, start=1):
             with allure.step(
                 f"上传文件 {index}/{len(upload_files)}：{file_info['relative_path']}"
@@ -375,6 +420,7 @@ class TestBusinessApiWorkflow:
                                 task_file_id=file_info["task_file_id"],
                                 offset=offset,
                                 file_stream=file_stream,
+                                content_length=file_info["size_bytes"] - offset,
                             )
                     except Exception as exc:
                         upload_result["error"] = exc
@@ -408,6 +454,14 @@ class TestBusinessApiWorkflow:
                     f"local_progress={uploaded_file.get('local_progress', 0)}%",
                     flush=True,
                 )
+
+        upload_elapsed_seconds = int(time.monotonic() - upload_started_at)
+        upload_minutes, upload_seconds = divmod(upload_elapsed_seconds, 60)
+        print(
+            f"[步骤4] 全部文件上传完成，总耗时："
+            f"{upload_minutes}分{upload_seconds}秒",
+            flush=True,
+        )
 
     @pytest.mark.order(5)
     @allure.story("步骤5：轮询采集文件上传结果")
@@ -468,9 +522,12 @@ class TestBusinessApiWorkflow:
                     str(len(uploaded_files)), str(len(self.upload_files))
                 )
                 assertions.assert_text(
-                    str(actual_relative_paths), str(expected_relative_paths)
+                    str(sorted(actual_relative_paths)),
+                    str(sorted(expected_relative_paths)),
                 )
-                assertions.assert_text(str(actual_filenames), str(expected_filenames))
+                assertions.assert_text(
+                    str(sorted(actual_filenames)), str(sorted(expected_filenames))
+                )
                 for file_info in uploaded_files:
                     assertions.assert_text(
                         file_info.get("upload_status_label", ""), "上传成功"

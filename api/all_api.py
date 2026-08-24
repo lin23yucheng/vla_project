@@ -131,14 +131,15 @@ class ApiAll():
 
     # 上传采集文件二进制流
     def upload_collect_file_stream(
-            self,
-            task_id,
-            filename,
-            relative_path,
-            task_file_id,
-            offset,
-            file_stream,
-            timeout=3600,
+        self,
+        task_id,
+        filename,
+        relative_path,
+        task_file_id,
+        offset,
+        file_stream,
+        content_length=None,
+        timeout=3600,
     ):
         url = f"{env}/api/v1/tasks/{task_id}/collect-files/stream"
         params = {
@@ -148,6 +149,8 @@ class ApiAll():
             "offset": offset,
         }
         headers = {"Content-Type": "application/octet-stream"}
+        if content_length is not None:
+            headers["Content-Length"] = str(int(content_length))
 
         response = self.client.post_with_retry(
             url,
