@@ -14,6 +14,7 @@ import pytest
 from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
+from common.s3_mcap import S3McapConfig, S3McapStore
 
 
 assertions = Assert.Assertions()
@@ -863,6 +864,161 @@ class TestWorkbenchData:
             if connection is not None:
                 connection.close()
 
+    def _collected_task_nos(self):
+        """返回已采集、已标注、已质检或已转换任务的 task_no。"""
+        try:
+            import psycopg2
+        except ImportError as exc:
+            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
+
+        section = self.config["fat-vla"]
+        connection = None
+        try:
+            connection = psycopg2.connect(
+                host=section.get("db_host"),
+                port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"),
+                password=section.get("db_password"),
+                dbname=section.get("db_name"),
+                connect_timeout=30,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT task_no FROM tasks WHERE status IN (2, 3, 4, 5) "
+                    "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
+                )
+                return [str(row[0]).strip() for row in cursor.fetchall() if str(row[0]).strip()]
+        except Exception as exc:
+            pytest.fail(f"查询已采集任务 task_no 失败：{exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _task_s3_config(self, task_no):
+        return S3McapConfig(
+            endpoint_url=self.config.get("fat-vla", "s3_endpoint"),
+            access_key=self.config.get("fat-vla", "s3_access_key"),
+            secret_key=self.config.get("fat-vla", "s3_secret_key"),
+            bucket=self.config.get("fat-vla", "s3_bucket", fallback="vla-label-studio"),
+            prefix=f"{task_no}/original-data",
+            region=self.config.get("fat-vla", "s3_region", fallback="").strip() or None,
+            read_ahead_bytes=self.config.getint("fat-vla", "s3_read_ahead_bytes", fallback=1024 * 1024),
+            max_range_request_bytes=self.config.getint(
+                "fat-vla", "s3_max_range_request_bytes", fallback=1024 * 1024 * 1024
+            ),
+        )
+
+    def _annotation_duration_rows(self, task_nos):
+        """查询指定任务的全部标注片段起止纳秒数。"""
+        if not task_nos:
+            return []
+        try:
+            import psycopg2
+        except ImportError as exc:
+            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
+
+        section = self.config["fat-vla"]
+        connection = None
+        try:
+            connection = psycopg2.connect(
+                host=section.get("db_host"),
+                port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"),
+                password=section.get("db_password"),
+                dbname=section.get("db_name"),
+                connect_timeout=30,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT task_no, start_time_ns, end_time_ns "
+                    "FROM annotation_segment_items "
+                    "WHERE task_no = ANY(%s) AND deleted_flag = FALSE "
+                    "ORDER BY task_no, segment_item_id",
+                    (task_nos,),
+                )
+                return cursor.fetchall()
+        except Exception as exc:
+            pytest.fail(f"查询 annotation_segment_items 表失败：{exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _episode_count(self, task_nos):
+        """统计指定任务下 segment_kind=episode 的标注数量。"""
+        if not task_nos:
+            return 0
+        try:
+            import psycopg2
+        except ImportError as exc:
+            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
+        section = self.config["fat-vla"]
+        connection = None
+        try:
+            connection = psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM annotation_segment_items "
+                    "WHERE task_no = ANY(%s) AND segment_kind = %s "
+                    "AND deleted_flag = FALSE",
+                    (task_nos, "episode"),
+                )
+                return int(cursor.fetchone()[0])
+        except Exception as exc:
+            pytest.fail(f"查询 episode 标注数量失败：{exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _episode_duration_sec(self, task_nos):
+        """累加所有 Episode 纳秒时长，最后统一换算秒并四舍五入。"""
+        if not task_nos:
+            return 0
+        try:
+            import psycopg2
+        except ImportError as exc:
+            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
+        section = self.config["fat-vla"]
+        connection = None
+        try:
+            connection = psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT task_no, start_time_ns, end_time_ns "
+                    "FROM annotation_segment_items "
+                    "WHERE task_no = ANY(%s) AND segment_kind = %s "
+                    "AND deleted_flag = FALSE",
+                    (task_nos, "episode"),
+                )
+                total_ns = 0
+                for task_no, start_time_ns, end_time_ns in cursor.fetchall():
+                    try:
+                        start = int(start_time_ns)
+                        end = int(end_time_ns)
+                    except (TypeError, ValueError) as exc:
+                        pytest.fail(f"任务 {task_no} Episode 时间无效：{exc}")
+                    duration_ns = end - start
+                    if duration_ns < 0:
+                        pytest.fail(
+                            f"任务 {task_no} Episode 时间范围无效："
+                            f"start={start}，end={end}"
+                        )
+                    total_ns += duration_ns
+                # 所有 Episode 计算完成后，再统一换算为秒并四舍五入。
+                return int(total_ns / 1_000_000_000 + 0.5)
+        except Exception as exc:
+            pytest.fail(f"查询 Episode 标注时长失败：{exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+
     @pytest.mark.order(12)
     @allure.story("步骤1：验证任务状态数据")
     def test_task_status_statistics(self):
@@ -918,4 +1074,275 @@ class TestWorkbenchData:
             json.dumps({"api": actual, "database": expected}, ensure_ascii=False, indent=2),
             name="工作台任务状态统计对比",
             attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(13)
+    @allure.story("步骤2：验证总采集时长")
+    def test_collection_duration_statistics(self):
+        """按 tasks 状态和 S3 MCAP 时间范围重算总采集时长。"""
+        print("[步骤2] 开始调用采集时长统计接口...", flush=True)
+        response = self.api_all.query_duration_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        trend = response_data.get("data", {}).get("duration_trend")
+        if not isinstance(trend, list) or not trend:
+            pytest.fail("工作台采集时长响应缺少 data.duration_trend[0]")
+        try:
+            api_collect_sec = float(trend[0]["collect_sec"])
+        except (KeyError, TypeError, ValueError) as exc:
+            pytest.fail(f"data.duration_trend[0].collect_sec 不是有效数字：{exc}")
+        print(f"[步骤2] 接口采集总时长：{api_collect_sec} 秒", flush=True)
+
+        print("[步骤2] 正在查询符合条件的任务（状态 2/3/4/5）...", flush=True)
+        task_nos = self._collected_task_nos()
+        print(f"[步骤2] 共找到 {len(task_nos)} 个任务，开始读取 S3 MCAP...", flush=True)
+        total_duration_ns = 0
+        task_details = []
+        for task_index, task_no in enumerate(task_nos, start=1):
+            print(f"[步骤2] ({task_index}/{len(task_nos)}) 开始处理任务 {task_no}...", flush=True)
+            store = S3McapStore(self._task_s3_config(task_no))
+
+            def report_mcap_progress(stage, source, mcap_index):
+                if stage == "start":
+                    print(f"[步骤2]   MCAP {mcap_index}: 开始解析 {source.object_name}", flush=True)
+                else:
+                    duration_sec = (int(source.message_end_time_ns) - int(source.message_start_time_ns)) / 1_000_000_000
+                    print(f"[步骤2]   MCAP {mcap_index}: 完成，时长 {duration_sec:.6f} 秒", flush=True)
+
+            sources = store.list_indexed_mcap_sources(progress_callback=report_mcap_progress)
+            task_duration_ns = 0
+            for source in sources:
+                if source.message_start_time_ns is None or source.message_end_time_ns is None:
+                    pytest.fail(f"MCAP 未解析出时间范围：{source}")
+                duration_ns = int(source.message_end_time_ns) - int(source.message_start_time_ns)
+                if duration_ns < 0:
+                    pytest.fail(f"MCAP 时间范围无效：{source}")
+                task_duration_ns += duration_ns
+            total_duration_ns += task_duration_ns
+            task_details.append({"task_no": task_no, "mcap_count": len(sources), "duration_sec": task_duration_ns / 1_000_000_000})
+            print(f"[步骤2] ({task_index}/{len(task_nos)}) 任务 {task_no} 完成，{len(sources)} 个 MCAP，时长 {task_duration_ns / 1_000_000_000:.6f} 秒", flush=True)
+
+        expected_collect_sec = total_duration_ns / 1_000_000_000
+        total_mcap_count = sum(detail["mcap_count"] for detail in task_details)
+        allowed_error_sec = total_mcap_count * 0.066
+        actual_error_sec = abs(api_collect_sec - expected_collect_sec)
+        print(
+            f"[工作台采集时长] 接口={api_collect_sec} 秒，S3重算={expected_collect_sec} 秒，"
+            f"任务数={len(task_nos)}，MCAP数量={total_mcap_count}，"
+            f"允许误差={allowed_error_sec:.6f} 秒，实际误差={actual_error_sec:.6f} 秒",
+            flush=True,
+        )
+        if actual_error_sec > allowed_error_sec:
+            pytest.fail(
+                f"采集总时长不一致：接口={api_collect_sec}，S3重算={expected_collect_sec}，"
+                f"实际误差={actual_error_sec:.6f} 秒，允许误差={allowed_error_sec:.6f} 秒"
+            )
+        allure.attach(
+            json.dumps(
+                {
+                    "api_collect_sec": api_collect_sec,
+                    "s3_collect_sec": expected_collect_sec,
+                    "mcap_count": total_mcap_count,
+                    "allowed_error_sec": allowed_error_sec,
+                    "actual_error_sec": actual_error_sec,
+                    "tasks": task_details,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="采集总时长统计对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(14)
+    @allure.story("步骤3：验证标注总时长")
+    def test_annotation_duration_statistics(self):
+        """按已标注及后续状态任务的标注片段重算标注总时长。"""
+        print("[步骤3] 开始读取工作台标注时长统计接口...", flush=True)
+        response = self.api_all.query_duration_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        trend = response_data.get("data", {}).get("duration_trend")
+        if not isinstance(trend, list) or not trend:
+            pytest.fail("工作台采集时长响应缺少 data.duration_trend[0]")
+        try:
+            api_annotation_sec = float(trend[0]["annotation_sec"])
+        except (KeyError, TypeError, ValueError) as exc:
+            pytest.fail(f"data.duration_trend[0].annotation_sec 不是有效数字：{exc}")
+        print(f"[步骤3] 接口标注总时长：{api_annotation_sec} 秒", flush=True)
+
+        print("[步骤3] 正在查询已标注/已质检/已转换任务...", flush=True)
+        # 标注时长只统计已标注、已质检、已转换任务。
+        try:
+            import psycopg2
+            section = self.config["fat-vla"]
+            with psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT task_no FROM tasks WHERE status IN (3, 4, 5) "
+                        "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
+                    )
+                    task_nos = [str(row[0]).strip() for row in cursor.fetchall()]
+        except Exception as exc:
+            pytest.fail(f"查询标注状态任务失败：{exc}")
+        print(f"[步骤3] 共找到 {len(task_nos)} 个任务，查询标注片段...", flush=True)
+
+        rows = self._annotation_duration_rows(task_nos)
+        total_annotation_ns = 0
+        task_details = {task_no: {"segment_count": 0, "duration_sec": 0.0} for task_no in task_nos}
+        for task_no, start_time_ns, end_time_ns in rows:
+            try:
+                start = int(start_time_ns)
+                end = int(end_time_ns)
+            except (TypeError, ValueError) as exc:
+                pytest.fail(f"任务 {task_no} 存在无效标注时间：{exc}")
+            duration = end - start
+            if duration < 0:
+                pytest.fail(f"任务 {task_no} 标注时间范围无效：start={start}，end={end}")
+            total_annotation_ns += duration
+            detail = task_details.setdefault(str(task_no), {"segment_count": 0, "duration_sec": 0.0})
+            detail["segment_count"] += 1
+            detail["duration_sec"] += duration / 1_000_000_000
+        # 标注片段全部计算完成后，再统一换算为秒并四舍五入。
+        total_annotation_sec = int(total_annotation_ns / 1_000_000_000 + 0.5)
+        actual_error_sec = abs(api_annotation_sec - total_annotation_sec)
+        print(
+            f"[步骤3] 标注片段数={len(rows)}，数据库={total_annotation_sec:.6f} 秒，"
+            f"接口={api_annotation_sec:.6f} 秒，误差={actual_error_sec:.6f} 秒",
+            flush=True,
+        )
+        if actual_error_sec > 1e-6:
+            pytest.fail(
+                f"标注总时长不一致：接口={api_annotation_sec}，数据库={total_annotation_sec}，"
+                f"误差={actual_error_sec:.6f} 秒"
+            )
+        allure.attach(
+            json.dumps(
+                {"api_annotation_sec": api_annotation_sec, "db_annotation_sec": total_annotation_sec,
+                 "segment_count": len(rows), "tasks": task_details},
+                ensure_ascii=False, indent=2,
+            ),
+            name="标注总时长统计对比", attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(15)
+    @allure.story("步骤4：验证 Episode 总个数")
+    def test_episode_count_statistics(self):
+        """按任务状态和 annotation_segment_items 重算 Episode 数量。"""
+        print("[步骤4] 开始读取工作台 Episode 统计接口...", flush=True)
+        response = self.api_all.query_duration_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        trend = response_data.get("data", {}).get("episode_trend")
+        if not isinstance(trend, list) or not trend:
+            pytest.fail("工作台统计响应缺少 data.episode_trend[0]")
+        try:
+            api_episode_count = int(trend[0]["episode_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            pytest.fail(f"data.episode_trend[0].episode_count 不是有效整数：{exc}")
+        print(f"[步骤4] 接口 Episode 总数：{api_episode_count}", flush=True)
+
+        print("[步骤4] 正在查询已转换任务...", flush=True)
+        task_nos = []
+        try:
+            import psycopg2
+            section = self.config["fat-vla"]
+            with psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT task_no FROM tasks WHERE status = 5 "
+                        "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
+                    )
+                    task_nos = [str(row[0]).strip() for row in cursor.fetchall()]
+        except Exception as exc:
+            pytest.fail(f"查询 Episode 状态任务失败：{exc}")
+
+        db_episode_count = self._episode_count(task_nos)
+        print(
+            f"[步骤4] 任务数={len(task_nos)}，数据库 Episode 数={db_episode_count}，"
+            f"接口 Episode 数={api_episode_count}",
+            flush=True,
+        )
+        if api_episode_count != db_episode_count:
+            pytest.fail(
+                f"Episode 总数不一致：接口={api_episode_count}，数据库={db_episode_count}"
+            )
+        allure.attach(
+            json.dumps(
+                {"api_episode_count": api_episode_count, "db_episode_count": db_episode_count,
+                 "task_count": len(task_nos), "task_nos": task_nos},
+                ensure_ascii=False, indent=2,
+            ),
+            name="Episode 总数统计对比", attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(16)
+    @allure.story("步骤5：验证 Episode 总时长")
+    def test_episode_duration_statistics(self):
+        """按已转换任务的 Episode 标注时间范围重算总时长。"""
+        print("[步骤5] 开始读取工作台转换时长统计接口...", flush=True)
+        response = self.api_all.query_duration_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        trend = response_data.get("data", {}).get("duration_trend")
+        if not isinstance(trend, list) or not trend:
+            pytest.fail("工作台统计响应缺少 data.duration_trend[0]")
+        try:
+            api_conversion_sec = float(trend[0]["conversion_sec"])
+        except (KeyError, TypeError, ValueError) as exc:
+            pytest.fail(f"data.duration_trend[0].conversion_sec 不是有效数字：{exc}")
+        print(f"[步骤5] 接口 Episode 总时长：{api_conversion_sec} 秒", flush=True)
+
+        print("[步骤5] 正在查询已转换任务...", flush=True)
+        task_nos = []
+        try:
+            import psycopg2
+            section = self.config["fat-vla"]
+            with psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT task_no FROM tasks WHERE status = 5 "
+                        "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
+                    )
+                    task_nos = [str(row[0]).strip() for row in cursor.fetchall()]
+        except Exception as exc:
+            pytest.fail(f"查询已转换任务失败：{exc}")
+
+        db_conversion_sec = self._episode_duration_sec(task_nos)
+        actual_error_sec = abs(api_conversion_sec - db_conversion_sec)
+        print(
+            f"[步骤5] 已转换任务数={len(task_nos)}，数据库 Episode 时长={db_conversion_sec:.6f} 秒，"
+            f"接口={api_conversion_sec:.6f} 秒，误差={actual_error_sec:.6f} 秒",
+            flush=True,
+        )
+        if actual_error_sec > 1e-6:
+            pytest.fail(
+                f"Episode 总时长不一致：接口={api_conversion_sec}，"
+                f"数据库={db_conversion_sec}，误差={actual_error_sec:.6f} 秒"
+            )
+        allure.attach(
+            json.dumps(
+                {"api_conversion_sec": api_conversion_sec, "db_episode_sec": db_conversion_sec,
+                 "rounding": "所有 Episode 时长先累加，最后统一四舍五入到秒",
+                 "task_count": len(task_nos),
+                 "task_nos": task_nos},
+                ensure_ascii=False, indent=2,
+            ),
+            name="Episode 总时长统计对比", attachment_type=allure.attachment_type.JSON,
         )

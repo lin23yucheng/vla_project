@@ -300,7 +300,8 @@ class S3McapStore:
         )
         return self._active_prefix
 
-    def list_indexed_mcap_sources(self) -> list[S3McapSource]:
+    def list_indexed_mcap_sources(self, progress_callback=None) -> list[S3McapSource]:
+        """列出并解析 MCAP；可通过回调报告逐文件进度。"""
         sources = []
         for item in self.client.list_objects(
             self.config.bucket,
@@ -322,7 +323,11 @@ class S3McapStore:
                 read_ahead_bytes=self.config.read_ahead_bytes,
                 max_range_request_bytes=self.config.max_range_request_bytes,
             )
+            if progress_callback is not None:
+                progress_callback("start", source, len(sources) + 1)
             source.inspect_index()
+            if progress_callback is not None:
+                progress_callback("done", source, len(sources) + 1)
             sources.append(source)
         sources.sort(key=lambda source: source.object_name)
         if not sources:
