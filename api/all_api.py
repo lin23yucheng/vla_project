@@ -13,7 +13,6 @@ class ApiAll():
 
     # ==================== 工作台 ====================
 
-
     # ==================== 任务管理 ====================
     # 创建任务
     def create_task(self, name, category, scene_tags, robot_config_id):
@@ -89,6 +88,13 @@ class ApiAll():
         response = self.client.get_with_retry(url, params=params)
         return response
 
+    # 提交采集完成
+    def complete_collect_files(self, task_id):
+        url = f"{env}/api/v1/tasks/{task_id}/collect-files/complete"
+
+        response = self.client.post_with_retry(url)
+        return response
+
     # 登记待上传采集文件
     def register_collect_files(self, task_id, files):
         url = f"{env}/api/v1/tasks/{task_id}/collect-files/register"
@@ -125,14 +131,14 @@ class ApiAll():
 
     # 上传采集文件二进制流
     def upload_collect_file_stream(
-        self,
-        task_id,
-        filename,
-        relative_path,
-        task_file_id,
-        offset,
-        file_stream,
-        timeout=3600,
+            self,
+            task_id,
+            filename,
+            relative_path,
+            task_file_id,
+            offset,
+            file_stream,
+            timeout=3600,
     ):
         url = f"{env}/api/v1/tasks/{task_id}/collect-files/stream"
         params = {
@@ -152,8 +158,21 @@ class ApiAll():
         )
         return response
 
-
     # ==================== 数据标注 ====================
+    # 查询数据标注列表页
+    def query_annotation_list(
+            self, page_index=1, page_size=99, annotation_status="all"
+    ):
+        url = f"{env}/api/v1/tasks"
+        params = {
+            "page_index": page_index,
+            "page_size": page_size,
+            "annotation_status": annotation_status,
+        }
+
+        response = self.client.get_with_retry(url, params=params)
+        return response
+
     # 查询标注工作区
     def query_annotation_workspace(self, task_id):
         url = f"{env}/api/v1/task-annotations/tasks/{task_id}/annotation-workspace"
@@ -221,8 +240,6 @@ class ApiAll():
 
     # ==================== 数据可视化 ====================
 
-
     # ==================== 用户与权限 ====================
-
 
     # ==================== 基础配置 ====================

@@ -486,3 +486,75 @@ class TestBusinessApiWorkflow:
                     f"等待服务器转存上传完成超时：{UPLOAD_POLL_TIMEOUT_SECONDS} 秒"
                 )
             time.sleep(UPLOAD_POLL_INTERVAL_SECONDS)
+
+    @pytest.mark.order(6)
+    @allure.story("步骤6：提交采集完成")
+    def test_complete_collection_files(self):
+        if not self.task_id or not self.upload_files:
+            pytest.fail("步骤4未准备上传文件，无法提交采集完成")
+
+        with allure.step("核对本地文件与服务端已上传文件数量"):
+            uploaded_files = query_all_collect_files(
+                self.api_all, self.task_id, "uploaded"
+            )
+            active_files = query_all_collect_files(
+                self.api_all, self.task_id, "active"
+            )
+            expected_count = len(self.upload_files)
+            if active_files:
+                pytest.fail(
+                    f"仍有文件处于上传中，无法提交采集完成：{len(active_files)} 个"
+                )
+            assertions.assert_text(str(len(uploaded_files)), str(expected_count))
+            for uploaded_file in uploaded_files:
+                assertions.assert_text(
+                    uploaded_file.get("upload_status_label", ""), "上传成功"
+                )
+
+        with allure.step("调用采集完成接口"):
+            response = self.api_all.complete_collect_files(self.task_id)
+            assertions.assert_code(response.status_code, 200)
+            assertions.assert_text(response.json().get("msg", ""), "success")
+
+    @pytest.mark.order(7)
+    @allure.story("步骤7：验证任务进入标注列表")
+    def test_verify_collection_completed_task_in_annotation_list(self):
+        if not self.task_id or not self.task_name:
+            pytest.fail("步骤2未获取完整任务信息，无法验证采集完成结果")
+
+        with allure.step("采集列表中不再显示该任务"):
+            collection_tasks = response_list(
+                self.api_all.query_data_collection_list(), "查询数据采集列表接口"
+            )
+            collection_match = next(
+                (
+                    task
+                    for task in collection_tasks
+                    if str(task.get("id", "")).strip()
+                    == str(self.task_id).strip()
+                ),
+                None,
+            )
+            if collection_match is not None:
+                pytest.fail(
+                    f"采集完成任务仍存在于数据采集列表：id={self.task_id}"
+                )
+
+        with allure.step("标注列表中显示该任务"):
+            annotation_tasks = response_list(
+                self.api_all.query_annotation_list(), "查询标注列表接口"
+            )
+            annotation_match = next(
+                (
+                    task
+                    for task in annotation_tasks
+                    if str(task.get("id", "")).strip()
+                    == str(self.task_id).strip()
+                    or str(task.get("name", "")).strip() == self.task_name
+                ),
+                None,
+            )
+            if annotation_match is None:
+                pytest.fail(
+                    f"采集完成任务未出现在标注列表：id={self.task_id}，name={self.task_name}"
+                )
