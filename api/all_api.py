@@ -13,6 +13,11 @@ class ApiAll():
 
     # ==================== 工作台 ====================
 
+    # 查询工作台任务概览
+    def query_task_dashboard(self):
+        url = f"{env}/api/v1/tasks/dashboard"
+        return self.client.get_with_retry(url)
+
     # ==================== 任务管理 ====================
     # 创建任务
     def create_task(self, name, category, scene_tags, robot_config_id):

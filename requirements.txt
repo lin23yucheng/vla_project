@@ -18,6 +18,7 @@ pytest-xdist==3.8.0
 
 # HTTP 请求
 requests==2.34.2
+psycopg2-binary==2.9.10
 urllib3==2.7.0
 charset-normalizer==3.4.9
 idna==3.18
