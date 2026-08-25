@@ -191,6 +191,8 @@ class S3McapSource:
     message_start_time_ns: int | None = None
     message_end_time_ns: int | None = None
     chunk_count: int | None = None
+    image_start_time_ns: int | None = None
+    image_end_time_ns: int | None = None
 
     def __str__(self) -> str:
         return f"s3://{self.bucket}/{self.object_name}"
@@ -224,6 +226,53 @@ class S3McapSource:
             int(chunk.message_end_time) for chunk in summary.chunk_indexes
         )
         self.chunk_count = len(summary.chunk_indexes)
+
+    @staticmethod
+    def _is_image_message(schema: Any, channel: Any) -> bool:
+        schema_name = str(getattr(schema, "name", "") or "").lower()
+        topic = str(getattr(channel, "topic", "") or "").lower()
+        return (
+            "sensor_msgs/msg/image" in schema_name
+            or "sensor_msgs/msg/compressedimage" in schema_name
+            or schema_name.endswith("/image")
+            or schema_name.endswith("/compressedimage")
+            or "/image" in topic
+            or "camera" in topic and ("image" in topic or "rgb" in topic or "color" in topic)
+        )
+
+    def inspect_image_time_range(self) -> None:
+        """利用 MCAP 索引仅读取图片 topic 的首尾消息时间戳。"""
+        image_topics = set()
+        with self.open() as stream:
+            reader = make_reader(stream)
+            summary = reader.get_summary()
+            if summary is None:
+                raise ValueError(f"远端 MCAP 缺少摘要: {self}")
+            for channel in summary.channels.values():
+                schema = summary.schemas.get(channel.schema_id)
+                if self._is_image_message(schema, channel):
+                    image_topics.add(channel.topic)
+        if not image_topics:
+            raise ValueError(f"远端 MCAP 未找到图片消息: {self}")
+
+        with self.open() as stream:
+            reader = make_reader(stream)
+            first = next(reader.iter_messages(topics=image_topics), None)
+        with self.open() as stream:
+            reader = make_reader(stream)
+            last = next(reader.iter_messages(topics=image_topics, reverse=True), None)
+        if first is None or last is None:
+            raise ValueError(f"远端 MCAP 图片 topic 没有可读取消息: {self}")
+        first_message = first[2]
+        last_message = last[2]
+        self.image_start_time_ns = int(
+            getattr(first_message, "publish_time", None)
+            or getattr(first_message, "log_time")
+        )
+        self.image_end_time_ns = int(
+            getattr(last_message, "publish_time", None)
+            or getattr(last_message, "log_time")
+        )
 
 
 class S3McapStore:
@@ -325,7 +374,7 @@ class S3McapStore:
             )
             if progress_callback is not None:
                 progress_callback("start", source, len(sources) + 1)
-            source.inspect_index()
+            source.inspect_image_time_range()
             if progress_callback is not None:
                 progress_callback("done", source, len(sources) + 1)
             sources.append(source)

@@ -6,6 +6,7 @@ import configparser
 import threading
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 import allure
@@ -973,10 +974,8 @@ class TestWorkbenchData:
             if connection is not None:
                 connection.close()
 
-    def _episode_duration_sec(self, task_nos):
-        """累加所有 Episode 纳秒时长，最后统一换算秒并四舍五入。"""
-        if not task_nos:
-            return 0
+    def _episode_duration_statistics(self):
+        """按视频转换产物统计全部 Episode 时长及去重后的 Episode 数量。"""
         try:
             import psycopg2
         except ImportError as exc:
@@ -991,28 +990,23 @@ class TestWorkbenchData:
             )
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT task_no, start_time_ns, end_time_ns "
-                    "FROM annotation_segment_items "
-                    "WHERE task_no = ANY(%s) AND segment_kind = %s "
-                    "AND deleted_flag = FALSE",
-                    (task_nos, "episode"),
+                    "SELECT COALESCE(SUM(duration_sec), 0), COUNT(*) "
+                    "FROM ("
+                    "    SELECT task_id, episode_id, MAX(duration_sec) AS duration_sec "
+                    "    FROM conversion_outputs "
+                    "    WHERE kind = %s "
+                    "    GROUP BY task_id, episode_id"
+                    ") AS episode_durations",
+                    ("video",),
                 )
-                total_ns = 0
-                for task_no, start_time_ns, end_time_ns in cursor.fetchall():
-                    try:
-                        start = int(start_time_ns)
-                        end = int(end_time_ns)
-                    except (TypeError, ValueError) as exc:
-                        pytest.fail(f"任务 {task_no} Episode 时间无效：{exc}")
-                    duration_ns = end - start
-                    if duration_ns < 0:
-                        pytest.fail(
-                            f"任务 {task_no} Episode 时间范围无效："
-                            f"start={start}，end={end}"
-                        )
-                    total_ns += duration_ns
-                # 所有 Episode 计算完成后，再统一换算为秒并四舍五入。
-                return int(total_ns / 1_000_000_000 + 0.5)
+                total_duration_sec, episode_count = cursor.fetchone()
+                # 所有 Episode 时长汇总后，再按页面规则统一保留两位小数。
+                return (
+                    Decimal(str(total_duration_sec)).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    ),
+                    int(episode_count),
+                )
         except Exception as exc:
             pytest.fail(f"查询 Episode 标注时长失败：{exc}")
         finally:
@@ -1020,7 +1014,7 @@ class TestWorkbenchData:
                 connection.close()
 
     @pytest.mark.order(12)
-    @allure.story("步骤1：验证任务状态数据")
+    @allure.story("步骤1：任务统计-验证任务状态数据")
     def test_task_status_statistics(self):
         with allure.step("调用工作台任务概览接口"):
             response = self.api_all.query_task_dashboard()
@@ -1077,7 +1071,7 @@ class TestWorkbenchData:
         )
 
     @pytest.mark.order(13)
-    @allure.story("步骤2：验证总采集时长")
+    @allure.story("步骤2：任务统计-验证总采集时长")
     def test_collection_duration_statistics(self):
         """按 tasks 状态和 S3 MCAP 时间范围重算总采集时长。"""
         print("[步骤2] 开始调用采集时长统计接口...", flush=True)
@@ -1107,25 +1101,27 @@ class TestWorkbenchData:
                 if stage == "start":
                     print(f"[步骤2]   MCAP {mcap_index}: 开始解析 {source.object_name}", flush=True)
                 else:
-                    duration_sec = (int(source.message_end_time_ns) - int(source.message_start_time_ns)) / 1_000_000_000
+                    duration_sec = (int(source.image_end_time_ns) - int(source.image_start_time_ns)) / 1_000_000_000
                     print(f"[步骤2]   MCAP {mcap_index}: 完成，时长 {duration_sec:.6f} 秒", flush=True)
 
             sources = store.list_indexed_mcap_sources(progress_callback=report_mcap_progress)
             task_duration_ns = 0
             for source in sources:
-                if source.message_start_time_ns is None or source.message_end_time_ns is None:
-                    pytest.fail(f"MCAP 未解析出时间范围：{source}")
-                duration_ns = int(source.message_end_time_ns) - int(source.message_start_time_ns)
+                if source.image_start_time_ns is None or source.image_end_time_ns is None:
+                    pytest.fail(f"MCAP 未解析出图片时间范围：{source}")
+                duration_ns = int(source.image_end_time_ns) - int(source.image_start_time_ns)
                 if duration_ns < 0:
                     pytest.fail(f"MCAP 时间范围无效：{source}")
                 task_duration_ns += duration_ns
             total_duration_ns += task_duration_ns
-            task_details.append({"task_no": task_no, "mcap_count": len(sources), "duration_sec": task_duration_ns / 1_000_000_000})
-            print(f"[步骤2] ({task_index}/{len(task_nos)}) 任务 {task_no} 完成，{len(sources)} 个 MCAP，时长 {task_duration_ns / 1_000_000_000:.6f} 秒", flush=True)
+            task_duration_sec = task_duration_ns / 1_000_000_000
+            task_details.append({"task_no": task_no, "mcap_count": len(sources), "duration_sec": task_duration_sec})
+            print(f"[步骤2] ({task_index}/{len(task_nos)}) 任务 {task_no} 完成，{len(sources)} 个 MCAP，时长 {task_duration_sec:.6f} 秒", flush=True)
 
+        # 所有任务、所有 MCAP 的纳秒时长统一累加后转换为秒。
         expected_collect_sec = total_duration_ns / 1_000_000_000
         total_mcap_count = sum(detail["mcap_count"] for detail in task_details)
-        allowed_error_sec = total_mcap_count * 0.066
+        allowed_error_sec = 1.0
         actual_error_sec = abs(api_collect_sec - expected_collect_sec)
         print(
             f"[工作台采集时长] 接口={api_collect_sec} 秒，S3重算={expected_collect_sec} 秒，"
@@ -1156,7 +1152,7 @@ class TestWorkbenchData:
         )
 
     @pytest.mark.order(14)
-    @allure.story("步骤3：验证标注总时长")
+    @allure.story("步骤3：任务统计-验证标注总时长")
     def test_annotation_duration_statistics(self):
         """按已标注及后续状态任务的标注片段重算标注总时长。"""
         print("[步骤3] 开始读取工作台标注时长统计接口...", flush=True)
@@ -1168,8 +1164,10 @@ class TestWorkbenchData:
         if not isinstance(trend, list) or not trend:
             pytest.fail("工作台采集时长响应缺少 data.duration_trend[0]")
         try:
-            api_annotation_sec = float(trend[0]["annotation_sec"])
-        except (KeyError, TypeError, ValueError) as exc:
+            api_annotation_sec = Decimal(str(trend[0]["annotation_sec"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             pytest.fail(f"data.duration_trend[0].annotation_sec 不是有效数字：{exc}")
         print(f"[步骤3] 接口标注总时长：{api_annotation_sec} 秒", flush=True)
 
@@ -1209,22 +1207,24 @@ class TestWorkbenchData:
             detail = task_details.setdefault(str(task_no), {"segment_count": 0, "duration_sec": 0.0})
             detail["segment_count"] += 1
             detail["duration_sec"] += duration / 1_000_000_000
-        # 标注片段全部计算完成后，再统一换算为秒并四舍五入。
-        total_annotation_sec = int(total_annotation_ns / 1_000_000_000 + 0.5)
+        # 标注片段全部汇总后，按页面展示规则统一保留两位小数。
+        total_annotation_sec = (
+            Decimal(total_annotation_ns) / Decimal("1000000000")
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         actual_error_sec = abs(api_annotation_sec - total_annotation_sec)
         print(
             f"[步骤3] 标注片段数={len(rows)}，数据库={total_annotation_sec:.6f} 秒，"
             f"接口={api_annotation_sec:.6f} 秒，误差={actual_error_sec:.6f} 秒",
             flush=True,
         )
-        if actual_error_sec > 1e-6:
+        if actual_error_sec > Decimal("0.00"):
             pytest.fail(
                 f"标注总时长不一致：接口={api_annotation_sec}，数据库={total_annotation_sec}，"
                 f"误差={actual_error_sec:.6f} 秒"
             )
         allure.attach(
             json.dumps(
-                {"api_annotation_sec": api_annotation_sec, "db_annotation_sec": total_annotation_sec,
+                {"api_annotation_sec": float(api_annotation_sec), "db_annotation_sec": float(total_annotation_sec),
                  "segment_count": len(rows), "tasks": task_details},
                 ensure_ascii=False, indent=2,
             ),
@@ -1232,7 +1232,7 @@ class TestWorkbenchData:
         )
 
     @pytest.mark.order(15)
-    @allure.story("步骤4：验证 Episode 总个数")
+    @allure.story("步骤4：任务统计-验证 Episode 总个数")
     def test_episode_count_statistics(self):
         """按任务状态和 annotation_segment_items 重算 Episode 数量。"""
         print("[步骤4] 开始读取工作台 Episode 统计接口...", flush=True)
@@ -1288,9 +1288,9 @@ class TestWorkbenchData:
         )
 
     @pytest.mark.order(16)
-    @allure.story("步骤5：验证 Episode 总时长")
+    @allure.story("步骤5：任务统计-验证 Episode 总时长")
     def test_episode_duration_statistics(self):
-        """按已转换任务的 Episode 标注时间范围重算总时长。"""
+        """按全部视频转换产物重算 Episode 总时长。"""
         print("[步骤5] 开始读取工作台转换时长统计接口...", flush=True)
         response = self.api_all.query_duration_stats(period="all")
         assertions.assert_code(response.status_code, 200)
@@ -1300,48 +1300,32 @@ class TestWorkbenchData:
         if not isinstance(trend, list) or not trend:
             pytest.fail("工作台统计响应缺少 data.duration_trend[0]")
         try:
-            api_conversion_sec = float(trend[0]["conversion_sec"])
-        except (KeyError, TypeError, ValueError) as exc:
+            api_conversion_sec = Decimal(str(trend[0]["conversion_sec"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             pytest.fail(f"data.duration_trend[0].conversion_sec 不是有效数字：{exc}")
         print(f"[步骤5] 接口 Episode 总时长：{api_conversion_sec} 秒", flush=True)
 
-        print("[步骤5] 正在查询已转换任务...", flush=True)
-        task_nos = []
-        try:
-            import psycopg2
-            section = self.config["fat-vla"]
-            with psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            ) as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT task_no FROM tasks WHERE status = 5 "
-                        "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
-                    )
-                    task_nos = [str(row[0]).strip() for row in cursor.fetchall()]
-        except Exception as exc:
-            pytest.fail(f"查询已转换任务失败：{exc}")
-
-        db_conversion_sec = self._episode_duration_sec(task_nos)
+        print("[步骤5] 正在汇总全部视频转换产物...", flush=True)
+        db_conversion_sec, episode_count = self._episode_duration_statistics()
         actual_error_sec = abs(api_conversion_sec - db_conversion_sec)
         print(
-            f"[步骤5] 已转换任务数={len(task_nos)}，数据库 Episode 时长={db_conversion_sec:.6f} 秒，"
+            f"[步骤5] 去重后 Episode 数={episode_count}，数据库 Episode 时长={db_conversion_sec:.6f} 秒，"
             f"接口={api_conversion_sec:.6f} 秒，误差={actual_error_sec:.6f} 秒",
             flush=True,
         )
-        if actual_error_sec > 1e-6:
+        if actual_error_sec > Decimal("0.00"):
             pytest.fail(
                 f"Episode 总时长不一致：接口={api_conversion_sec}，"
                 f"数据库={db_conversion_sec}，误差={actual_error_sec:.6f} 秒"
             )
         allure.attach(
             json.dumps(
-                {"api_conversion_sec": api_conversion_sec, "db_episode_sec": db_conversion_sec,
-                 "rounding": "所有 Episode 时长先累加，最后统一四舍五入到秒",
-                 "task_count": len(task_nos),
-                 "task_nos": task_nos},
+                {"api_conversion_sec": float(api_conversion_sec), "db_episode_sec": float(db_conversion_sec),
+                 "episode_count": episode_count,
+                 "aggregation": "每个 task_id + episode_id 取最大 video 时长后汇总",
+                 "rounding": "所有 Episode 时长先累加，最后统一四舍五入到两位小数"},
                 ensure_ascii=False, indent=2,
             ),
             name="Episode 总时长统计对比", attachment_type=allure.attachment_type.JSON,
