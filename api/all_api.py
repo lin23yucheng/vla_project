@@ -23,6 +23,11 @@ class ApiAll():
         url = f"{env}/api/v1/workbench/duration-stats"
         return self.client.get_with_retry(url, params={"period": period})
 
+    def query_workforce_stats(self, period="all"):
+        """查询工作台人效统计。"""
+        url = f"{env}/api/v1/workbench/workforce-stats"
+        return self.client.get_with_retry(url, params={"period": period})
+
     # ==================== 任务管理 ====================
     # 创建任务
     def create_task(self, name, category, scene_tags, robot_config_id):

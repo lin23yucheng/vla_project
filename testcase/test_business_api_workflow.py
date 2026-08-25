@@ -823,6 +823,11 @@ class TestWorkbenchData:
     @classmethod
     def setup_class(cls):
         cls.api_all = all_api.ApiAll(global_client)
+        cls.collection_duration_recalculated_sec = None
+        cls.annotation_duration_recalculated_sec = None
+        cls.episode_count_recalculated = None
+        cls.episode_duration_recalculated_sec = None
+        cls.workforce_people = None
         config_path = Path(__file__).resolve().parent.parent / "config" / "env_config.ini"
         cls.config = configparser.ConfigParser()
         if not cls.config.read(config_path, encoding="utf-8"):
@@ -1120,6 +1125,7 @@ class TestWorkbenchData:
 
         # 所有任务、所有 MCAP 的纳秒时长统一累加后转换为秒。
         expected_collect_sec = total_duration_ns / 1_000_000_000
+        self.__class__.collection_duration_recalculated_sec = expected_collect_sec
         total_mcap_count = sum(detail["mcap_count"] for detail in task_details)
         allowed_error_sec = 1.0
         actual_error_sec = abs(api_collect_sec - expected_collect_sec)
@@ -1211,6 +1217,7 @@ class TestWorkbenchData:
         total_annotation_sec = (
             Decimal(total_annotation_ns) / Decimal("1000000000")
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        self.__class__.annotation_duration_recalculated_sec = total_annotation_sec
         actual_error_sec = abs(api_annotation_sec - total_annotation_sec)
         print(
             f"[步骤3] 标注片段数={len(rows)}，数据库={total_annotation_sec:.6f} 秒，"
@@ -1269,6 +1276,7 @@ class TestWorkbenchData:
             pytest.fail(f"查询 Episode 状态任务失败：{exc}")
 
         db_episode_count = self._episode_count(task_nos)
+        self.__class__.episode_count_recalculated = db_episode_count
         print(
             f"[步骤4] 任务数={len(task_nos)}，数据库 Episode 数={db_episode_count}，"
             f"接口 Episode 数={api_episode_count}",
@@ -1309,6 +1317,7 @@ class TestWorkbenchData:
 
         print("[步骤5] 正在汇总全部视频转换产物...", flush=True)
         db_conversion_sec, episode_count = self._episode_duration_statistics()
+        self.__class__.episode_duration_recalculated_sec = db_conversion_sec
         actual_error_sec = abs(api_conversion_sec - db_conversion_sec)
         print(
             f"[步骤5] 去重后 Episode 数={episode_count}，数据库 Episode 时长={db_conversion_sec:.6f} 秒，"
@@ -1329,4 +1338,379 @@ class TestWorkbenchData:
                 ensure_ascii=False, indent=2,
             ),
             name="Episode 总时长统计对比", attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(17)
+    @allure.story("步骤6：人效统计-验证参与人员")
+    def test_workforce_people_statistics(self):
+        """按人效统计明细中的角色重算参与人员数量。"""
+        print("[步骤6] 开始读取工作台人效统计接口...", flush=True)
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+
+        data = response_data.get("data", {})
+        rows = data.get("rows")
+        summary_people = data.get("summary", {}).get("people")
+        if not isinstance(rows, list):
+            pytest.fail("工作台人效统计响应缺少有效 data.rows 列表")
+        if not isinstance(summary_people, dict):
+            pytest.fail("工作台人效统计响应缺少有效 data.summary.people")
+
+        role_to_summary_key = {
+            "采集工程师": "collection",
+            "标注工程师": "annotation",
+            "质检工程师": "qc",
+            "算法工程师": "algorithm",
+        }
+        expected_people = {
+            "total": len(rows),
+            "collection": 0,
+            "annotation": 0,
+            "qc": 0,
+            "algorithm": 0,
+        }
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                pytest.fail(f"data.rows[{index}] 不是对象")
+            role_names = row.get("role_names", [])
+            if role_names is None:
+                role_names = []
+            if not isinstance(role_names, list):
+                pytest.fail(f"data.rows[{index}].role_names 不是列表")
+            # 一个用户拥有多个目标角色时，按角色分别计数；管理员同时计入所有目标角色。
+            role_names = {str(role).strip() for role in role_names}
+            if "管理员" in role_names:
+                role_names.update(role_to_summary_key)
+            for role, summary_key in role_to_summary_key.items():
+                if role in role_names:
+                    expected_people[summary_key] += 1
+
+        actual_people = {}
+        for key, expected_value in expected_people.items():
+            value = summary_people.get(key)
+            try:
+                actual_value = int(value)
+            except (TypeError, ValueError):
+                pytest.fail(f"data.summary.people.{key} 不是有效整数：{value!r}")
+            if actual_value != expected_value:
+                pytest.fail(
+                    f"参与人员统计不一致：{key} 接口={actual_value}，"
+                    f"按 data.rows 角色重算={expected_value}"
+                )
+            actual_people[key] = actual_value
+
+        print(
+            f"[步骤6] 参与人员统计校验通过：总人数={actual_people['total']}，"
+            f"采集={actual_people['collection']}，标注={actual_people['annotation']}，"
+            f"质检={actual_people['qc']}，算法={actual_people['algorithm']}",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {"summary_people": actual_people, "rows_count": len(rows)},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="参与人员统计对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        self.__class__.workforce_people = actual_people
+
+    @pytest.mark.order(18)
+    @allure.story("步骤7：人效统计-验证采集统计")
+    def test_workforce_collection_statistics(self):
+        """核对采集任务数、采集总时长及按参与人员计算的平均值。"""
+        print("[步骤7] 开始读取工作台人效采集统计接口...", flush=True)
+        if self.collection_duration_recalculated_sec is None:
+            pytest.fail("步骤2未保存采集总时长重算结果，无法验证步骤7")
+        if not isinstance(self.workforce_people, dict):
+            pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤7")
+
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        collect_summary = response_data.get("data", {}).get("summary", {}).get("collect")
+        if not isinstance(collect_summary, dict):
+            pytest.fail("工作台人效统计响应缺少有效 data.summary.collect")
+
+        expected_task_count = len(self._collected_task_nos())
+        try:
+            api_task_count = int(collect_summary["task_count"])
+            api_total_duration_sec = Decimal(str(collect_summary["total_duration_sec"]))
+            api_avg_tasks = Decimal(str(collect_summary["avg_tasks"]))
+            api_avg_duration_sec = Decimal(str(collect_summary["avg_duration_sec"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            pytest.fail(f"data.summary.collect 存在无效统计值：{exc}")
+
+        if api_task_count != expected_task_count:
+            pytest.fail(
+                f"采集任务数不一致：接口={api_task_count}，"
+                f"tasks 表状态 2/3/4/5={expected_task_count}"
+            )
+
+        expected_duration_sec = Decimal(str(self.collection_duration_recalculated_sec))
+        duration_error = abs(api_total_duration_sec - expected_duration_sec)
+        if duration_error > Decimal("1.00"):
+            pytest.fail(
+                f"采集总时长不一致：接口={api_total_duration_sec}，"
+                f"步骤2重算={expected_duration_sec}，误差={duration_error} 秒"
+            )
+
+        collection_people = int(self.workforce_people.get("collection", 0))
+        if collection_people <= 0:
+            pytest.fail(f"步骤6采集人员数量无效：{collection_people}")
+        expected_avg_tasks = (
+            Decimal(expected_task_count) / Decimal(collection_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_avg_duration = (
+            api_total_duration_sec / Decimal(collection_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_tasks = api_avg_tasks.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_duration = api_avg_duration_sec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if actual_avg_tasks != expected_avg_tasks:
+            pytest.fail(
+                f"采集平均任务数不一致：接口={actual_avg_tasks}，"
+                f"任务数/采集人员数({collection_people})={expected_avg_tasks}"
+            )
+        if actual_avg_duration != expected_avg_duration:
+            pytest.fail(
+                f"采集平均时长不一致：接口={actual_avg_duration}，"
+                f"接口采集总时长/采集人员数({collection_people})={expected_avg_duration}"
+            )
+
+        print(
+            f"[步骤7] 采集统计校验通过：任务数={api_task_count}，"
+            f"总时长={api_total_duration_sec} 秒，采集人员数={collection_people}，"
+            f"平均任务数={actual_avg_tasks}，平均时长={actual_avg_duration} 秒",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {
+                    "api": {
+                        "task_count": api_task_count,
+                        "total_duration_sec": str(api_total_duration_sec),
+                        "avg_tasks": str(api_avg_tasks),
+                        "avg_duration_sec": str(api_avg_duration_sec),
+                    },
+                    "expected": {
+                        "task_count": expected_task_count,
+                        "duration_source": "步骤2重算",
+                        "people_count": collection_people,
+                        "avg_tasks": str(expected_avg_tasks),
+                        "avg_duration_sec": str(expected_avg_duration),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="采集统计对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(19)
+    @allure.story("步骤8：人效统计-验证标注统计")
+    def test_workforce_annotation_statistics(self):
+        """核对标注任务数、标注总时长及按参与人员计算的平均值。"""
+        print("[步骤8] 开始读取工作台人效标注统计接口...", flush=True)
+        if self.annotation_duration_recalculated_sec is None:
+            pytest.fail("步骤3未保存标注总时长重算结果，无法验证步骤8")
+        if not isinstance(self.workforce_people, dict):
+            pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤8")
+
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        annotation_summary = response_data.get("data", {}).get("summary", {}).get("annotation")
+        if not isinstance(annotation_summary, dict):
+            pytest.fail("工作台人效统计响应缺少有效 data.summary.annotation")
+
+        try:
+            import psycopg2
+            section = self.config["fat-vla"]
+            with psycopg2.connect(
+                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
+                user=section.get("db_user"), password=section.get("db_password"),
+                dbname=section.get("db_name"), connect_timeout=30,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status IN (3, 4, 5)"
+                    )
+                    expected_task_count = int(cursor.fetchone()[0])
+        except Exception as exc:
+            pytest.fail(f"查询标注任务数失败：{exc}")
+
+        try:
+            api_task_count = int(annotation_summary["task_count"])
+            api_total_duration_sec = Decimal(str(annotation_summary["total_duration_sec"]))
+            api_avg_tasks = Decimal(str(annotation_summary["avg_tasks"]))
+            api_avg_duration_sec = Decimal(str(annotation_summary["avg_duration_sec"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            pytest.fail(f"data.summary.annotation 存在无效统计值：{exc}")
+
+        if api_task_count != expected_task_count:
+            pytest.fail(
+                f"标注任务数不一致：接口={api_task_count}，"
+                f"tasks 表状态 3/4/5={expected_task_count}"
+            )
+
+        expected_duration_sec = self.annotation_duration_recalculated_sec
+        if api_total_duration_sec != expected_duration_sec:
+            pytest.fail(
+                f"标注总时长不一致：接口={api_total_duration_sec}，"
+                f"步骤3重算={expected_duration_sec}"
+            )
+
+        annotation_people = int(self.workforce_people.get("annotation", 0))
+        if annotation_people <= 0:
+            pytest.fail(f"步骤6标注人员数量无效：{annotation_people}")
+        expected_avg_tasks = (
+            Decimal(expected_task_count) / Decimal(annotation_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_avg_duration = (
+            expected_duration_sec / Decimal(annotation_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_tasks = api_avg_tasks.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_duration = api_avg_duration_sec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if actual_avg_tasks != expected_avg_tasks:
+            pytest.fail(
+                f"标注平均任务数不一致：接口={actual_avg_tasks}，"
+                f"任务数/标注人员数({annotation_people})={expected_avg_tasks}"
+            )
+        if actual_avg_duration != expected_avg_duration:
+            pytest.fail(
+                f"标注平均时长不一致：接口={actual_avg_duration}，"
+                f"步骤3标注总时长/标注人员数({annotation_people})={expected_avg_duration}"
+            )
+
+        print(
+            f"[步骤8] 标注统计校验通过：任务数={api_task_count}，"
+            f"总时长={api_total_duration_sec} 秒，标注人员数={annotation_people}，"
+            f"平均任务数={actual_avg_tasks}，平均时长={actual_avg_duration} 秒",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {
+                    "api": {
+                        "task_count": api_task_count,
+                        "total_duration_sec": str(api_total_duration_sec),
+                        "avg_tasks": str(api_avg_tasks),
+                        "avg_duration_sec": str(api_avg_duration_sec),
+                    },
+                    "expected": {
+                        "task_count": expected_task_count,
+                        "duration_source": "步骤3重算",
+                        "people_count": annotation_people,
+                        "avg_tasks": str(expected_avg_tasks),
+                        "avg_duration_sec": str(expected_avg_duration),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="标注统计对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(20)
+    @allure.story("步骤9：人效统计-验证Episode统计")
+    def test_workforce_episode_statistics(self):
+        """核对 Episode 总数、总时长及按参与人员计算的平均值。"""
+        print("[步骤9] 开始读取工作台人效 Episode 统计接口...", flush=True)
+        if self.episode_count_recalculated is None:
+            pytest.fail("步骤4未保存 Episode 总个数重算结果，无法验证步骤9")
+        if self.episode_duration_recalculated_sec is None:
+            pytest.fail("步骤5未保存 Episode 总时长重算结果，无法验证步骤9")
+        if not isinstance(self.workforce_people, dict):
+            pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤9")
+
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        episode_summary = response_data.get("data", {}).get("summary", {}).get("episode")
+        if not isinstance(episode_summary, dict):
+            pytest.fail("工作台人效统计响应缺少有效 data.summary.episode")
+
+        try:
+            api_episode_count = int(episode_summary["task_count"])
+            api_total_duration_sec = Decimal(str(episode_summary["total_duration_sec"]))
+            api_avg_tasks = Decimal(str(episode_summary["avg_tasks"]))
+            api_avg_duration_sec = Decimal(str(episode_summary["avg_duration_sec"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            pytest.fail(f"data.summary.episode 存在无效统计值：{exc}")
+
+        expected_episode_count = int(self.episode_count_recalculated)
+        expected_duration_sec = self.episode_duration_recalculated_sec
+        if api_episode_count != expected_episode_count:
+            pytest.fail(
+                f"Episode 总个数不一致：接口={api_episode_count}，"
+                f"步骤4重算={expected_episode_count}"
+            )
+        if api_total_duration_sec != expected_duration_sec:
+            pytest.fail(
+                f"Episode 总时长不一致：接口={api_total_duration_sec}，"
+                f"步骤5重算={expected_duration_sec}"
+            )
+
+        people_counts = [
+            int(self.workforce_people.get(key, 0))
+            for key in ("collection", "annotation", "qc", "algorithm")
+        ]
+        max_people = max(people_counts, default=0)
+        if max_people <= 0:
+            pytest.fail(f"步骤6参与人员数量无有效最大值：{people_counts}")
+        expected_avg_tasks = (
+            Decimal(expected_episode_count) / Decimal(max_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_avg_duration = (
+            expected_duration_sec / Decimal(max_people)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_tasks = api_avg_tasks.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        actual_avg_duration = api_avg_duration_sec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if actual_avg_tasks != expected_avg_tasks:
+            pytest.fail(
+                f"Episode 平均个数不一致：接口={actual_avg_tasks}，"
+                f"总个数/{max_people}={expected_avg_tasks}"
+            )
+        if actual_avg_duration != expected_avg_duration:
+            pytest.fail(
+                f"Episode 平均时长不一致：接口={actual_avg_duration}，"
+                f"总时长/{max_people}={expected_avg_duration}"
+            )
+
+        print(
+            f"[步骤9] Episode 统计校验通过：总个数={api_episode_count}，"
+            f"总时长={api_total_duration_sec} 秒，最大参与人员数={max_people}，"
+            f"平均个数={actual_avg_tasks}，平均时长={actual_avg_duration} 秒",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {
+                    "api": {
+                        "task_count": api_episode_count,
+                        "total_duration_sec": str(api_total_duration_sec),
+                        "avg_tasks": str(api_avg_tasks),
+                        "avg_duration_sec": str(api_avg_duration_sec),
+                    },
+                    "expected": {
+                        "task_count": expected_episode_count,
+                        "duration_source": "步骤5重算",
+                        "max_people": max_people,
+                        "avg_tasks": str(expected_avg_tasks),
+                        "avg_duration_sec": str(expected_avg_duration),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="Episode 人效统计对比",
+            attachment_type=allure.attachment_type.JSON,
         )
