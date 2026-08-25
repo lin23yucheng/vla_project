@@ -274,9 +274,9 @@ def run_order_tests() -> int:
                 MyLog.info(f"{file_name}: {format_time(seconds)}")
 
         generate_allure_report(total_time)
-        MyLog.info(f"VLA数据验证-整体耗时: {total_time}")
+        MyLog.info(f"VLA_Project-整体耗时: {total_time}")
         MyLog.info("===== 测试任务完成 =====")
-        print(f"\033[32mVLA数据验证-整体耗时: {total_time}\033[0m")
+        print(f"\033[32mVLA_Project-整体耗时: {total_time}\033[0m")
 
     return final_exit_code
 
