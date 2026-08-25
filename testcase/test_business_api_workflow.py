@@ -1356,8 +1356,8 @@ class TestWorkbenchData:
     def test_workforce_collection_statistics(self):
         """核对采集任务数、采集总时长及按参与人员计算的平均值。"""
         print("[步骤7] 开始读取工作台人效采集统计接口...", flush=True)
-        if self.collection_duration_recalculated_sec is None:
-            pytest.fail("步骤2未保存采集总时长重算结果，无法验证步骤7")
+        # 在实际校验前刷新一次数据库基准，避免使用步骤2的过期结果。
+        self.test_collection_duration_statistics()
         if not isinstance(self.workforce_people, dict):
             pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤7")
 
@@ -1449,8 +1449,8 @@ class TestWorkbenchData:
     def test_workforce_annotation_statistics(self):
         """核对标注任务数、标注总时长及按参与人员计算的平均值。"""
         print("[步骤8] 开始读取工作台人效标注统计接口...", flush=True)
-        if self.annotation_duration_recalculated_sec is None:
-            pytest.fail("步骤3未保存标注总时长重算结果，无法验证步骤8")
+        # 在实际校验前刷新一次数据库基准，避免使用步骤3的过期结果。
+        self.test_annotation_duration_statistics()
         if not isinstance(self.workforce_people, dict):
             pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤8")
 
@@ -1550,10 +1550,9 @@ class TestWorkbenchData:
     def test_workforce_episode_statistics(self):
         """核对 Episode 总数、总时长及按参与人员计算的平均值。"""
         print("[步骤9] 开始读取工作台人效 Episode 统计接口...", flush=True)
-        if self.episode_count_recalculated is None:
-            pytest.fail("步骤4未保存 Episode 总个数重算结果，无法验证步骤9")
-        if self.episode_duration_recalculated_sec is None:
-            pytest.fail("步骤5未保存 Episode 总时长重算结果，无法验证步骤9")
+        # Episode 数量和时长在校验前各刷新一次，使用当前数据库数据。
+        self.test_episode_count_statistics()
+        self.test_episode_duration_statistics()
         if not isinstance(self.workforce_people, dict):
             pytest.fail("步骤6未保存参与人员统计结果，无法验证步骤9")
 
