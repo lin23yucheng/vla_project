@@ -931,7 +931,6 @@ class TestWorkbenchData:
                     "    FROM conversion_outputs "
                     "    INNER JOIN tasks ON tasks.id = conversion_outputs.task_id "
                     "    WHERE conversion_outputs.kind = %s "
-                    "      AND tasks.status = 5 "
                     "    GROUP BY conversion_outputs.task_id, conversion_outputs.episode_id"
                     ") AS episode_durations",
                     ("video",),
@@ -1099,6 +1098,7 @@ class TestWorkbenchData:
                 },
                 ensure_ascii=False,
                 indent=2,
+                default=str,
             ),
             name="采集总时长统计对比",
             attachment_type=allure.attachment_type.JSON,
@@ -1178,7 +1178,6 @@ class TestWorkbenchData:
             ),
             name="标注总时长统计对比", attachment_type=allure.attachment_type.JSON,
         )
-
     @pytest.mark.order(15)
     @allure.story("步骤4：任务统计-验证 Episode 总个数")
     def test_episode_count_statistics(self):
@@ -1401,7 +1400,7 @@ class TestWorkbenchData:
             Decimal(expected_task_count) / Decimal(collection_people)
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         expected_avg_duration = (
-            api_total_duration_sec / Decimal(collection_people)
+            expected_duration_sec / Decimal(collection_people)
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         actual_avg_tasks = api_avg_tasks.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         actual_avg_duration = api_avg_duration_sec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -1413,7 +1412,7 @@ class TestWorkbenchData:
         if actual_avg_duration != expected_avg_duration:
             pytest.fail(
                 f"采集平均时长不一致：接口={actual_avg_duration}，"
-                f"接口采集总时长/采集人员数({collection_people})={expected_avg_duration}"
+                f"步骤2重算采集总时长/采集人员数({collection_people})={expected_avg_duration}"
             )
 
         print(
