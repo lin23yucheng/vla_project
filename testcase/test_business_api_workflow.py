@@ -5,6 +5,7 @@ import json
 import configparser
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -22,7 +23,7 @@ assertions = Assert.Assertions()
 global_client = create_lazy_yixiu_client()
 # 填写已有任务编号时，跳过创建、上传和采集完成步骤，直接从步骤 8 开始。
 # 为空字符串时执行完整流程；也可通过 VLA_TASK_NO 环境变量覆盖。
-TASK_NO = "TASK-2026-012"
+TASK_NO = ""
 TASK_NO = os.environ.get("VLA_TASK_NO", TASK_NO).strip()
 UPLOAD_POLL_INTERVAL_SECONDS = 10
 UPLOAD_POLL_TIMEOUT_SECONDS = 30 * 60
@@ -835,25 +836,32 @@ class TestWorkbenchData:
         if not cls.config.has_section("fat-vla"):
             pytest.fail("配置文件缺少 [fat-vla] 节")
 
-    def _database_counts(self):
-        """查询 tasks 总数及各状态数量，连接在查询完成后关闭。"""
+    @contextmanager
+    def _postgres_connection(self):
+        """按环境配置创建 PostgreSQL 连接，并确保离开作用域时关闭。"""
         try:
             import psycopg2
-        except ImportError as exc:
+        except ImportError:
             pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
 
         section = self.config["fat-vla"]
-        connection = None
+        connection = psycopg2.connect(
+            host=section.get("db_host"),
+            port=section.getint("db_port", fallback=5432),
+            user=section.get("db_user"),
+            password=section.get("db_password"),
+            dbname=section.get("db_name"),
+            connect_timeout=30,
+        )
         try:
-            connection = psycopg2.connect(
-                host=section.get("db_host"),
-                port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"),
-                password=section.get("db_password"),
-                dbname=section.get("db_name"),
-                connect_timeout=30,
-            )
-            with connection.cursor() as cursor:
+            yield connection
+        finally:
+            connection.close()
+
+    def _database_counts(self):
+        """查询 tasks 总数及各状态数量，连接在查询完成后关闭。"""
+        try:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT COUNT(*) FROM tasks"
                 )
@@ -866,29 +874,11 @@ class TestWorkbenchData:
                 return counts
         except Exception as exc:
             pytest.fail(f"查询 PostgreSQL tasks 表失败：{exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _collected_task_nos(self):
         """返回已采集、已标注、已质检或已转换任务的 task_no。"""
         try:
-            import psycopg2
-        except ImportError as exc:
-            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
-
-        section = self.config["fat-vla"]
-        connection = None
-        try:
-            connection = psycopg2.connect(
-                host=section.get("db_host"),
-                port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"),
-                password=section.get("db_password"),
-                dbname=section.get("db_name"),
-                connect_timeout=30,
-            )
-            with connection.cursor() as cursor:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT task_no FROM tasks WHERE status IN (2, 3, 4, 5) "
                     "AND task_no IS NOT NULL AND task_no <> '' ORDER BY task_no"
@@ -896,9 +886,6 @@ class TestWorkbenchData:
                 return [str(row[0]).strip() for row in cursor.fetchall() if str(row[0]).strip()]
         except Exception as exc:
             pytest.fail(f"查询已采集任务 task_no 失败：{exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _task_s3_config(self, task_no):
         return S3McapConfig(
@@ -919,22 +906,7 @@ class TestWorkbenchData:
         if not task_nos:
             return []
         try:
-            import psycopg2
-        except ImportError as exc:
-            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
-
-        section = self.config["fat-vla"]
-        connection = None
-        try:
-            connection = psycopg2.connect(
-                host=section.get("db_host"),
-                port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"),
-                password=section.get("db_password"),
-                dbname=section.get("db_name"),
-                connect_timeout=30,
-            )
-            with connection.cursor() as cursor:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT task_no, start_time_ns, end_time_ns "
                     "FROM annotation_segment_items "
@@ -945,27 +917,13 @@ class TestWorkbenchData:
                 return cursor.fetchall()
         except Exception as exc:
             pytest.fail(f"查询 annotation_segment_items 表失败：{exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _episode_count(self, task_nos):
         """统计指定任务下 segment_kind=episode 的标注数量。"""
         if not task_nos:
             return 0
         try:
-            import psycopg2
-        except ImportError as exc:
-            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
-        section = self.config["fat-vla"]
-        connection = None
-        try:
-            connection = psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            )
-            with connection.cursor() as cursor:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT COUNT(*) FROM annotation_segment_items "
                     "WHERE task_no = ANY(%s) AND segment_kind = %s "
@@ -975,31 +933,19 @@ class TestWorkbenchData:
                 return int(cursor.fetchone()[0])
         except Exception as exc:
             pytest.fail(f"查询 episode 标注数量失败：{exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _episode_duration_statistics(self):
         """按视频转换产物统计全部 Episode 时长及去重后的 Episode 数量。"""
         try:
-            import psycopg2
-        except ImportError as exc:
-            pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
-        section = self.config["fat-vla"]
-        connection = None
-        try:
-            connection = psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            )
-            with connection.cursor() as cursor:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT COALESCE(SUM(duration_sec), 0), COUNT(*) "
                     "FROM ("
                     "    SELECT task_id, episode_id, MAX(duration_sec) AS duration_sec "
                     "    FROM conversion_outputs "
+                    "    INNER JOIN tasks ON tasks.id = conversion_outputs.task_id "
                     "    WHERE kind = %s "
+                    "      AND tasks.status = 5 "
                     "    GROUP BY task_id, episode_id"
                     ") AS episode_durations",
                     ("video",),
@@ -1014,9 +960,6 @@ class TestWorkbenchData:
                 )
         except Exception as exc:
             pytest.fail(f"查询 Episode 标注时长失败：{exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     @pytest.mark.order(12)
     @allure.story("步骤1：任务统计-验证任务状态数据")
@@ -1180,13 +1123,7 @@ class TestWorkbenchData:
         print("[步骤3] 正在查询已标注/已质检/已转换任务...", flush=True)
         # 标注时长只统计已标注、已质检、已转换任务。
         try:
-            import psycopg2
-            section = self.config["fat-vla"]
-            with psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            ) as connection:
+            with self._postgres_connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         "SELECT task_no FROM tasks WHERE status IN (3, 4, 5) "
@@ -1259,13 +1196,7 @@ class TestWorkbenchData:
         print("[步骤4] 正在查询已转换任务...", flush=True)
         task_nos = []
         try:
-            import psycopg2
-            section = self.config["fat-vla"]
-            with psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            ) as connection:
+            with self._postgres_connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         "SELECT task_no FROM tasks WHERE status = 5 "
@@ -1530,13 +1461,7 @@ class TestWorkbenchData:
             pytest.fail("工作台人效统计响应缺少有效 data.summary.annotation")
 
         try:
-            import psycopg2
-            section = self.config["fat-vla"]
-            with psycopg2.connect(
-                host=section.get("db_host"), port=section.getint("db_port", fallback=5432),
-                user=section.get("db_user"), password=section.get("db_password"),
-                dbname=section.get("db_name"), connect_timeout=30,
-            ) as connection:
+            with self._postgres_connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         "SELECT COUNT(*) FROM tasks WHERE status IN (3, 4, 5)"
