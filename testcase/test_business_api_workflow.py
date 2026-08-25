@@ -16,7 +16,6 @@ import pytest
 from api import all_api
 from common import Assert
 from common.client_factory import create_lazy_yixiu_client
-from common.s3_mcap import S3McapConfig, S3McapStore
 
 
 assertions = Assert.Assertions()
@@ -887,20 +886,6 @@ class TestWorkbenchData:
         except Exception as exc:
             pytest.fail(f"查询已采集任务 task_no 失败：{exc}")
 
-    def _task_s3_config(self, task_no):
-        return S3McapConfig(
-            endpoint_url=self.config.get("fat-vla", "s3_endpoint"),
-            access_key=self.config.get("fat-vla", "s3_access_key"),
-            secret_key=self.config.get("fat-vla", "s3_secret_key"),
-            bucket=self.config.get("fat-vla", "s3_bucket", fallback="vla-label-studio"),
-            prefix=f"{task_no}/original-data",
-            region=self.config.get("fat-vla", "s3_region", fallback="").strip() or None,
-            read_ahead_bytes=self.config.getint("fat-vla", "s3_read_ahead_bytes", fallback=1024 * 1024),
-            max_range_request_bytes=self.config.getint(
-                "fat-vla", "s3_max_range_request_bytes", fallback=1024 * 1024 * 1024
-            ),
-        )
-
     def _annotation_duration_rows(self, task_nos):
         """查询指定任务的全部标注片段起止纳秒数。"""
         if not task_nos:
@@ -941,12 +926,13 @@ class TestWorkbenchData:
                 cursor.execute(
                     "SELECT COALESCE(SUM(duration_sec), 0), COUNT(*) "
                     "FROM ("
-                    "    SELECT task_id, episode_id, MAX(duration_sec) AS duration_sec "
+                    "    SELECT conversion_outputs.task_id, conversion_outputs.episode_id, "
+                    "           MAX(conversion_outputs.duration_sec) AS duration_sec "
                     "    FROM conversion_outputs "
                     "    INNER JOIN tasks ON tasks.id = conversion_outputs.task_id "
-                    "    WHERE kind = %s "
+                    "    WHERE conversion_outputs.kind = %s "
                     "      AND tasks.status = 5 "
-                    "    GROUP BY task_id, episode_id"
+                    "    GROUP BY conversion_outputs.task_id, conversion_outputs.episode_id"
                     ") AS episode_durations",
                     ("video",),
                 )
@@ -1021,7 +1007,7 @@ class TestWorkbenchData:
     @pytest.mark.order(13)
     @allure.story("步骤2：任务统计-验证总采集时长")
     def test_collection_duration_statistics(self):
-        """按 tasks 状态和 S3 MCAP 时间范围重算总采集时长。"""
+        """按任务转换表中的 MCAP 帧相对时间重算总采集时长。"""
         print("[步骤2] 开始调用采集时长统计接口...", flush=True)
         response = self.api_all.query_duration_stats(period="all")
         assertions.assert_code(response.status_code, 200)
@@ -1031,65 +1017,83 @@ class TestWorkbenchData:
         if not isinstance(trend, list) or not trend:
             pytest.fail("工作台采集时长响应缺少 data.duration_trend[0]")
         try:
-            api_collect_sec = float(trend[0]["collect_sec"])
-        except (KeyError, TypeError, ValueError) as exc:
+            api_collect_sec = Decimal(str(trend[0]["collect_sec"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             pytest.fail(f"data.duration_trend[0].collect_sec 不是有效数字：{exc}")
         print(f"[步骤2] 接口采集总时长：{api_collect_sec} 秒", flush=True)
 
         print("[步骤2] 正在查询符合条件的任务（状态 2/3/4/5）...", flush=True)
         task_nos = self._collected_task_nos()
-        print(f"[步骤2] 共找到 {len(task_nos)} 个任务，开始读取 S3 MCAP...", flush=True)
-        total_duration_ns = 0
+        print(f"[步骤2] 共找到 {len(task_nos)} 个任务，开始查询数据库 MCAP 转换表...", flush=True)
+        total_duration_sec = Decimal("0")
         task_details = []
-        for task_index, task_no in enumerate(task_nos, start=1):
-            print(f"[步骤2] ({task_index}/{len(task_nos)}) 开始处理任务 {task_no}...", flush=True)
-            store = S3McapStore(self._task_s3_config(task_no))
+        try:
+            from psycopg2 import sql
 
-            def report_mcap_progress(stage, source, mcap_index):
-                if stage == "start":
-                    print(f"[步骤2]   MCAP {mcap_index}: 开始解析 {source.object_name}", flush=True)
-                else:
-                    duration_sec = (int(source.image_end_time_ns) - int(source.image_start_time_ns)) / 1_000_000_000
-                    print(f"[步骤2]   MCAP {mcap_index}: 完成，时长 {duration_sec:.6f} 秒", flush=True)
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
+                for task_index, task_no in enumerate(task_nos, start=1):
+                    # TASK-2026-006 -> mcap_video_frames_task_2026_006.
+                    normalized_task_no = str(task_no).strip().lower().replace("-", "_")
+                    if not normalized_task_no or not normalized_task_no.startswith("task_"):
+                        raise ValueError(f"任务编号格式无效，无法定位转换表：{task_no!r}")
+                    table_name = f"mcap_video_frames_{normalized_task_no}"
+                    cursor.execute(
+                        sql.SQL(
+                            "SELECT task_id, task_file_id, MAX(relative_time_sec) AS duration_sec "
+                            "FROM {} GROUP BY task_id, task_file_id ORDER BY task_id, task_file_id"
+                        ).format(sql.Identifier(table_name))
+                    )
+                    rows = cursor.fetchall()
+                    task_duration_sec = Decimal("0")
+                    for _task_id, _task_file_id, duration in rows:
+                        if duration is None:
+                            continue
+                        duration_decimal = Decimal(str(duration))
+                        if duration_decimal < 0:
+                            raise ValueError(
+                                f"任务 {task_no} 转换表 {table_name} 存在负数 MCAP 时长：{duration}"
+                            )
+                        task_duration_sec += duration_decimal
+                    total_duration_sec += task_duration_sec
+                    task_details.append(
+                        {
+                            "task_no": task_no,
+                            "table_name": table_name,
+                            "mcap_count": len(rows),
+                            "duration_sec": float(task_duration_sec),
+                        }
+                    )
+                    print(
+                        f"[步骤2] ({task_index}/{len(task_nos)}) 任务 {task_no} 完成，"
+                        f"{len(rows)} 个 MCAP，时长 {task_duration_sec:.6f} 秒",
+                        flush=True,
+                    )
+        except Exception as exc:
+            pytest.fail(f"查询 MCAP 转换表统计采集时长失败：{exc}")
 
-            sources = store.list_indexed_mcap_sources(progress_callback=report_mcap_progress)
-            task_duration_ns = 0
-            for source in sources:
-                if source.image_start_time_ns is None or source.image_end_time_ns is None:
-                    pytest.fail(f"MCAP 未解析出图片时间范围：{source}")
-                duration_ns = int(source.image_end_time_ns) - int(source.image_start_time_ns)
-                if duration_ns < 0:
-                    pytest.fail(f"MCAP 时间范围无效：{source}")
-                task_duration_ns += duration_ns
-            total_duration_ns += task_duration_ns
-            task_duration_sec = task_duration_ns / 1_000_000_000
-            task_details.append({"task_no": task_no, "mcap_count": len(sources), "duration_sec": task_duration_sec})
-            print(f"[步骤2] ({task_index}/{len(task_nos)}) 任务 {task_no} 完成，{len(sources)} 个 MCAP，时长 {task_duration_sec:.6f} 秒", flush=True)
-
-        # 所有任务、所有 MCAP 的纳秒时长统一累加后转换为秒。
-        expected_collect_sec = total_duration_ns / 1_000_000_000
+        # 所有任务、所有 MCAP 汇总后按页面展示规则统一保留两位小数。
+        expected_collect_sec = total_duration_sec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         self.__class__.collection_duration_recalculated_sec = expected_collect_sec
         total_mcap_count = sum(detail["mcap_count"] for detail in task_details)
-        allowed_error_sec = 1.0
         actual_error_sec = abs(api_collect_sec - expected_collect_sec)
         print(
-            f"[工作台采集时长] 接口={api_collect_sec} 秒，S3重算={expected_collect_sec} 秒，"
-            f"任务数={len(task_nos)}，MCAP数量={total_mcap_count}，"
-            f"允许误差={allowed_error_sec:.6f} 秒，实际误差={actual_error_sec:.6f} 秒",
+            f"[工作台采集时长] 接口={api_collect_sec} 秒，数据库重算={expected_collect_sec} 秒，"
+            f"任务数={len(task_nos)}，MCAP数量={total_mcap_count}，实际误差={actual_error_sec:.2f} 秒",
             flush=True,
         )
-        if actual_error_sec > allowed_error_sec:
+        if actual_error_sec != Decimal("0.00"):
             pytest.fail(
-                f"采集总时长不一致：接口={api_collect_sec}，S3重算={expected_collect_sec}，"
-                f"实际误差={actual_error_sec:.6f} 秒，允许误差={allowed_error_sec:.6f} 秒"
+                f"采集总时长不一致：接口={api_collect_sec}，数据库重算={expected_collect_sec}，"
+                f"实际误差={actual_error_sec:.2f} 秒"
             )
         allure.attach(
             json.dumps(
                 {
                     "api_collect_sec": api_collect_sec,
-                    "s3_collect_sec": expected_collect_sec,
+                    "db_collect_sec": expected_collect_sec,
                     "mcap_count": total_mcap_count,
-                    "allowed_error_sec": allowed_error_sec,
                     "actual_error_sec": actual_error_sec,
                     "tasks": task_details,
                 },
