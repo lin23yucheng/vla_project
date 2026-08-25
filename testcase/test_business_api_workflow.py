@@ -920,16 +920,15 @@ class TestWorkbenchData:
             pytest.fail(f"查询 episode 标注数量失败：{exc}")
 
     def _episode_duration_statistics(self):
-        """按视频转换产物统计全部 Episode 时长及去重后的 Episode 数量。"""
+        """按开发口径统计全部视频转换 Episode 的总时长及数量。"""
         try:
             with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT COALESCE(SUM(duration_sec), 0), COUNT(*) "
+                    "SELECT COALESCE(SUM(dur), 0), COUNT(*) "
                     "FROM ("
                     "    SELECT conversion_outputs.task_id, conversion_outputs.episode_id, "
-                    "           MAX(conversion_outputs.duration_sec) AS duration_sec "
+                    "           MAX(conversion_outputs.duration_sec) AS dur "
                     "    FROM conversion_outputs "
-                    "    INNER JOIN tasks ON tasks.id = conversion_outputs.task_id "
                     "    WHERE conversion_outputs.kind = %s "
                     "    GROUP BY conversion_outputs.task_id, conversion_outputs.episode_id"
                     ") AS episode_durations",
