@@ -22,9 +22,9 @@ ALLURE_REPORT = os.path.join(BASE_DIR, "report", "allure-report")
 # 在这里按顺序填写要执行的测试文件
 TEST_FILES: List[str] = [
     # "testcase/test_gripper_v2_verify.py", # 夹爪
-    # "testcase/test_shake_v3_verify.py",   # 摇操
+    "testcase/test_shake_v3_verify.py",   # 摇操
     # "testcase/test_tianji_v2_verify.py",  # 天机
-    "testcase/test_business_api_workflow.py"  # 业务API工作流
+    # "testcase/test_business_api_workflow.py"  # 业务API工作流
 ]
 
 
@@ -230,7 +230,7 @@ def generate_allure_report(total_time_text: str | None = None) -> None:
 
 
 def run_order_tests() -> int:
-    """按 TEST_FILES 中的顺序依次执行测试，并在结束后生成 Allure 报告。"""
+    """按 TEST_FILES 顺序执行测试；正常结束时生成 Allure 报告。"""
     if not TEST_FILES:
         raise ValueError("TEST_FILES 为空，请先在 run.py 中填写要执行的测试文件路径")
 
@@ -244,6 +244,7 @@ def run_order_tests() -> int:
 
     file_times = {}
     final_exit_code = 0
+    interrupted = False
 
     try:
         for test_file in TEST_FILES:
@@ -255,6 +256,13 @@ def run_order_tests() -> int:
             formatted = format_time(elapsed)
             MyLog.info(f"测试文件 {test_file} 执行完成，耗时: {formatted}")
 
+            if exit_code == pytest.ExitCode.INTERRUPTED:
+                interrupted = True
+                final_exit_code = int(exit_code)
+                MyLog.warning("测试执行被用户中断，跳过后续测试和报告生成")
+                print("\n用户中断测试执行，跳过报告生成")
+                break
+
             if exit_code != 0:
                 final_exit_code = exit_code
                 MyLog.critical(f"执行测试文件 {test_file} 失败，停止后续执行")
@@ -262,8 +270,9 @@ def run_order_tests() -> int:
 
     except KeyboardInterrupt:
         final_exit_code = 130
+        interrupted = True
         MyLog.warning("用户中断测试执行")
-        print("\n用户中断测试执行，正在生成报告...")
+        print("\n用户中断测试执行，跳过报告生成")
 
     finally:
         total_time = format_time(time.time() - start_time)
@@ -273,7 +282,10 @@ def run_order_tests() -> int:
             for file_name, seconds in file_times.items():
                 MyLog.info(f"{file_name}: {format_time(seconds)}")
 
-        generate_allure_report(total_time)
+        if interrupted:
+            MyLog.info("检测到用户中断，跳过 Allure 报告生成")
+        else:
+            generate_allure_report(total_time)
         MyLog.info(f"VLA_Project-整体耗时: {total_time}")
         MyLog.info("===== 测试任务完成 =====")
         print(f"\033[32mVLA_Project-整体耗时: {total_time}\033[0m")
