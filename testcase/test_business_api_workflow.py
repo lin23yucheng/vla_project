@@ -979,9 +979,13 @@ class TestWorkbenchData:
 
                 UNION ALL
 
-                SELECT task_id, creator_id AS user_id, 1 AS is_completed
+                SELECT
+                    task_id,
+                    creator_id AS user_id,
+                    CASE WHEN BOOL_OR(status = 'completed') THEN 1 ELSE 0 END AS is_completed
                 FROM conversion_jobs
-                WHERE status = 'completed' AND creator_id IS NOT NULL
+                WHERE creator_id IS NOT NULL
+                GROUP BY task_id, creator_id
             ),
             totals AS (
                 SELECT user_id, COUNT(*) AS task_count,

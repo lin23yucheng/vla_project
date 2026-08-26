@@ -24,6 +24,7 @@ TEST_FILES: List[str] = [
     # "testcase/test_gripper_v2_verify.py", # 夹爪v2数据验证
     # "testcase/test_shake_v3_verify.py",   # 摇操v3数据验证
     # "testcase/test_tianji_v2_verify.py",  # 天机v2数据验证
+    # "testcase/test_business_api_workflow.py::TestWorkbenchData"  # 工作台数据验证
     "testcase/test_business_api_workflow.py"  # 业务API工作流
 ]
 
@@ -160,17 +161,18 @@ def prepare_report_dirs():
     MyLog.info("已清理历史报告数据")
 
 
-def resolve_test_path(test_file: str) -> str:
-    """将相对路径解析为项目下的绝对路径。"""
-    if os.path.isabs(test_file):
-        return test_file
-    return os.path.join(BASE_DIR, test_file.replace('/', os.sep))
+def resolve_test_path(test_target: str) -> tuple[str, str]:
+    """解析 pytest 目标，并保留可选的 ``::类名`` node id。"""
+    test_file, separator, node_id = test_target.partition("::")
+    if not os.path.isabs(test_file):
+        test_file = os.path.join(BASE_DIR, test_file.replace('/', os.sep))
+    return test_file, f"{test_file}{separator}{node_id}" if separator else test_file
 
 
-def execute_test(test_file: str) -> int:
-    """执行单个测试文件。"""
-    target_path: str = resolve_test_path(test_file)
-    MyLog.info(f"开始执行测试文件: {test_file}")
+def execute_test(test_target: str) -> int:
+    """执行单个 pytest 文件或 class node id。"""
+    target_path, pytest_target = resolve_test_path(test_target)
+    MyLog.info(f"开始执行测试目标: {test_target}")
 
     if not os.path.exists(target_path):
         MyLog.error(f"错误：测试文件不存在: {target_path}")
@@ -179,7 +181,7 @@ def execute_test(test_file: str) -> int:
     pytest_args: List[str] = []
     pytest_args.append("-v")
     pytest_args.append("-s")
-    pytest_args.append(target_path)
+    pytest_args.append(pytest_target)
     pytest_args.append(f"--alluredir={ALLURE_RESULTS}")
 
     policy = WORKFLOW_FAILURE_POLICIES.get(Path(target_path).name)
@@ -187,11 +189,11 @@ def execute_test(test_file: str) -> int:
     exit_code = pytest.main(pytest_args, plugins=plugins)
 
     if exit_code == 0:
-        MyLog.info(f"测试文件 {test_file} 全部通过")
+        MyLog.info(f"测试目标 {test_target} 全部通过")
     elif exit_code == 1:
-        MyLog.error(f"测试文件 {test_file} 存在失败用例")
+        MyLog.error(f"测试目标 {test_target} 存在失败用例")
     else:
-        MyLog.critical(f"测试文件 {test_file} 执行错误，退出码: {exit_code}")
+        MyLog.critical(f"测试目标 {test_target} 执行错误，退出码: {exit_code}")
 
     return exit_code
 
@@ -229,9 +231,10 @@ def generate_allure_report(total_time_text: str | None = None) -> None:
     print(f"测试报告生成成功: {report_url}")
 
 
-def run_order_tests() -> int:
+def run_order_tests(test_targets: List[str] | None = None) -> int:
     """按 TEST_FILES 顺序执行测试；正常结束时生成 Allure 报告。"""
-    if not TEST_FILES:
+    selected_targets = test_targets or TEST_FILES
+    if not selected_targets:
         raise ValueError("TEST_FILES 为空，请先在 run.py 中填写要执行的测试文件路径")
 
     sys.path.append(BASE_DIR)
@@ -240,21 +243,21 @@ def run_order_tests() -> int:
 
     start_time = time.time()
     MyLog.info("===== 开始顺序执行测试任务 =====")
-    MyLog.info(f"执行文件列表: {TEST_FILES}")
+    MyLog.info(f"执行目标列表: {selected_targets}")
 
     file_times = {}
     final_exit_code = 0
     interrupted = False
 
     try:
-        for test_file in TEST_FILES:
+        for test_target in selected_targets:
             file_start_time = time.time()
-            exit_code = execute_test(test_file)
+            exit_code = execute_test(test_target)
             elapsed = time.time() - file_start_time
-            file_times[test_file] = elapsed
+            file_times[test_target] = elapsed
 
             formatted = format_time(elapsed)
-            MyLog.info(f"测试文件 {test_file} 执行完成，耗时: {formatted}")
+            MyLog.info(f"测试目标 {test_target} 执行完成，耗时: {formatted}")
 
             if exit_code == pytest.ExitCode.INTERRUPTED:
                 interrupted = True
@@ -265,7 +268,7 @@ def run_order_tests() -> int:
 
             if exit_code != 0:
                 final_exit_code = exit_code
-                MyLog.critical(f"执行测试文件 {test_file} 失败，停止后续执行")
+                MyLog.critical(f"执行测试目标 {test_target} 失败，停止后续执行")
                 break
 
     except KeyboardInterrupt:
@@ -308,7 +311,19 @@ if __name__ == "__main__":
 
     exit_code = 0
     try:
-        exit_code = run_order_tests()
+        if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+            print(
+                "用法：python run.py [测试文件或 pytest node id]\n"
+                "示例：\n"
+                "  python run.py testcase/test_business_api_workflow.py\n"
+                "  python run.py testcase/test_business_api_workflow.py::TestWorkbenchData\n"
+                "  python run.py testcase/test_business_api_workflow.py::TestBusinessApiWorkflow"
+            )
+            sys.exit(0)
+        command_line_targets = sys.argv[1:]
+        if command_line_targets:
+            MyLog.info(f"使用命令行测试目标: {command_line_targets}")
+        exit_code = run_order_tests(command_line_targets)
     except Exception as exc:
         exit_code = 1
         MyLog.error(f"执行测试任务时发生异常: {exc}", exc_info=True)
