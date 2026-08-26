@@ -957,6 +957,61 @@ class TestWorkbenchData:
         except Exception as exc:
             pytest.fail(f"查询 Episode 标注时长失败：{exc}")
 
+    def _workforce_completion_rows(self):
+        """按采集、标注、质检和转换子任务统计人员完成数及完成率。"""
+        query = """
+            WITH assignments AS (
+                SELECT task_id, collector_id AS user_id,
+                       CASE WHEN status IN (2, 3, 4, 5) THEN 1 ELSE 0 END AS is_completed
+                FROM tasks WHERE collector_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT task_id, annotator_id AS user_id,
+                       CASE WHEN status IN (3, 4, 5) THEN 1 ELSE 0 END AS is_completed
+                FROM tasks WHERE annotator_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT task_id, qc_id AS user_id,
+                       CASE WHEN status IN (4, 5) THEN 1 ELSE 0 END AS is_completed
+                FROM tasks WHERE qc_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT task_id, creator_id AS user_id, 1 AS is_completed
+                FROM conversion_jobs
+                WHERE status = 'completed' AND creator_id IS NOT NULL
+            ),
+            totals AS (
+                SELECT user_id, COUNT(*) AS task_count,
+                       SUM(is_completed) AS completed_task_count
+                FROM assignments
+                GROUP BY user_id
+            )
+            SELECT
+                u.user_id,
+                u.username,
+                u.full_name,
+                COALESCE(t.task_count, 0) AS task_count,
+                COALESCE(t.completed_task_count, 0) AS completed_task_count,
+                ROUND(
+                    COALESCE(t.completed_task_count, 0)::numeric
+                    / NULLIF(COALESCE(t.task_count, 0), 0),
+                    2
+                ) AS completion_rate
+            FROM users u
+            LEFT JOIN totals t ON t.user_id = u.user_id
+            ORDER BY u.user_id
+        """
+        try:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
+                cursor.execute(query)
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as exc:
+            pytest.fail(f"查询人员完成任务数失败：{exc}")
+
     @pytest.mark.order(12)
     @allure.story("步骤1：任务统计-验证任务状态数据")
     def test_task_status_statistics(self):
@@ -1655,7 +1710,7 @@ class TestWorkbenchData:
         )
 
     @pytest.mark.order(21)
-    @allure.story("步骤10：人效统计-验证列表页人员数据")
+    @allure.story("步骤10：人效统计-验证列表页人员各项统计数据")
     def test_workforce_rows_totals(self):
         """汇总人效列表 rows，核对页面总时长、Episode 数量及转换时长。"""
         print("[步骤10] 开始汇总人效列表页人员数据...", flush=True)
@@ -1732,3 +1787,92 @@ class TestWorkbenchData:
             name="人效列表人员数据汇总对比",
             attachment_type=allure.attachment_type.JSON,
         )
+
+    @pytest.mark.order(22)
+    @allure.story("步骤11：人效统计-验证人员完成任务数/完成率")
+    def test_workforce_completion_statistics(self):
+        """逐人员核对人效列表的完成任务数和完成率。"""
+        print("[步骤11] 开始核对人员完成任务数和完成率...", flush=True)
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        api_rows = response_data.get("data", {}).get("rows")
+        if not isinstance(api_rows, list):
+            pytest.fail("工作台人效统计响应缺少有效 data.rows 列表")
+
+        db_rows = self._workforce_completion_rows()
+        db_by_user_id = {
+            str(row.get("user_id")): row
+            for row in db_rows
+            if row.get("user_id") is not None
+        }
+        comparisons = []
+        errors = []
+        for index, api_row in enumerate(api_rows):
+            if not isinstance(api_row, dict):
+                errors.append(f"data.rows[{index}] 不是对象")
+                continue
+            user_id = api_row.get("user_id")
+            if user_id is None or str(user_id).strip() == "":
+                errors.append(f"data.rows[{index}] 缺少有效 user_id")
+                continue
+            user_id_key = str(user_id).strip()
+            full_name = str(api_row.get("name") or "").strip()
+            role_code = str(api_row.get("role_code") or "").strip()
+            db_row = db_by_user_id.get(user_id_key)
+            if db_row is None:
+                errors.append(
+                    f"数据库未找到接口人员：user_id={user_id_key}，name={full_name!r}"
+                )
+                continue
+            try:
+                api_completed = int(api_row.get("completed_tasks", 0) or 0)
+                api_rate = Decimal(str(api_row.get("completion_rate", 0) or 0)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                db_completed = int(db_row["completed_task_count"] or 0)
+                db_rate = Decimal(str(db_row["completion_rate"] or 0)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            except (TypeError, ValueError, InvalidOperation, KeyError) as exc:
+                errors.append(f"人员 {full_name!r} 完成统计存在无效值：{exc}")
+                continue
+            if api_completed != db_completed or api_rate != db_rate:
+                errors.append(
+                    f"人员完成统计不一致：user_id={user_id_key}，name={full_name}，role_code={role_code}，"
+                    f"完成数接口={api_completed}、数据库={db_completed}，"
+                    f"完成率接口={api_rate}、数据库={db_rate}"
+                )
+            comparisons.append(
+                {
+                    "user_id": user_id_key,
+                    "name": full_name,
+                    "role_code": role_code,
+                    "completed_tasks": api_completed,
+                    "completion_rate": str(api_rate),
+                    "matched": not (api_completed != db_completed or api_rate != db_rate),
+                }
+            )
+
+        allure.attach(
+            json.dumps(
+                {"comparisons": comparisons, "errors": errors},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="人员完成任务数和完成率对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        if errors:
+            print(
+                f"[步骤11] 人员完成任务数/完成率校验发现 {len(errors)} 条异常：",
+                flush=True,
+            )
+            for error in errors:
+                print(f"  - {error}", flush=True)
+            pytest.fail(
+                f"人员完成任务数/完成率校验失败，共 {len(errors)} 条异常：\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
+        print(f"[步骤11] 人员完成任务数/完成率校验通过：共 {len(comparisons)} 人", flush=True)
