@@ -788,6 +788,19 @@ class TestBusinessApiWorkflow:
                 flush=True,
             )
             if status == "SUCCEEDED" or status_code == 4:
+                # 页面点击“查看并编辑自动标注结果”时会调用该任务级接口，
+                # 由接口触发/刷新结果落库；自动化流程中也需在任务完成后主动调用一次。
+                result_response = self.api_all.query_auto_labeling_job_result(
+                    self.task_id, self.auto_labeling_job_id
+                )
+                assertions.assert_code(result_response.status_code, 200)
+                result_data = result_response.json()
+                if result_data.get("msg") not in {"success", "ok"}:
+                    pytest.fail(
+                        "刷新自动化标注结果失败："
+                        f"HTTP {result_response.status_code}，响应：{result_data}"
+                    )
+                print("[步骤10] 已刷新自动化标注结果，页面可读取结果", flush=True)
                 return
             if status in {"FAILED", "CANCELED", "CANCELLED", "TIMEOUT"} or status_code in {5, 6, 7, 8}:
                 pytest.fail(f"自动化标注执行失败：{data}")
@@ -1638,5 +1651,84 @@ class TestWorkbenchData:
                 indent=2,
             ),
             name="Episode 人效统计对比",
+            attachment_type=allure.attachment_type.JSON,
+        )
+
+    @pytest.mark.order(21)
+    @allure.story("步骤10：人效统计-验证列表页人员数据")
+    def test_workforce_rows_totals(self):
+        """汇总人效列表 rows，核对页面总时长、Episode 数量及转换时长。"""
+        print("[步骤10] 开始汇总人效列表页人员数据...", flush=True)
+        required_totals = {
+            "collection_duration_recalculated_sec": self.collection_duration_recalculated_sec,
+            "annotation_duration_recalculated_sec": self.annotation_duration_recalculated_sec,
+            "episode_count_recalculated": self.episode_count_recalculated,
+            "episode_duration_recalculated_sec": self.episode_duration_recalculated_sec,
+        }
+        missing_totals = [name for name, value in required_totals.items() if value is None]
+        if missing_totals:
+            pytest.fail(f"步骤2-5未获取完整统计基准：{', '.join(missing_totals)}")
+
+        response = self.api_all.query_workforce_stats(period="all")
+        assertions.assert_code(response.status_code, 200)
+        response_data = response.json()
+        assertions.assert_text(response_data.get("msg", ""), "success")
+        rows = response_data.get("data", {}).get("rows")
+        if not isinstance(rows, list):
+            pytest.fail("工作台人效统计响应缺少有效 data.rows 列表")
+
+        field_names = (
+            "collect_duration_sec",
+            "annotation_duration_sec",
+            "episode_count",
+            "episode_duration_sec",
+            "conversion_duration_sec",
+        )
+        row_totals = {field: Decimal("0") for field in field_names}
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                pytest.fail(f"data.rows[{index}] 不是对象")
+            for field in field_names:
+                value = row.get(field, 0)
+                try:
+                    row_totals[field] += Decimal(str(value or 0))
+                except (TypeError, ValueError, InvalidOperation) as exc:
+                    pytest.fail(f"data.rows[{index}].{field} 不是有效数字：{value!r}，{exc}")
+
+        expected_totals = {
+            "collect_duration_sec": Decimal(str(self.collection_duration_recalculated_sec)),
+            "annotation_duration_sec": Decimal(str(self.annotation_duration_recalculated_sec)),
+            "episode_count": Decimal(str(self.episode_count_recalculated)),
+            "episode_duration_sec": Decimal(str(self.episode_duration_recalculated_sec)),
+            "conversion_duration_sec": Decimal(str(self.episode_duration_recalculated_sec)),
+        }
+        for field, expected in expected_totals.items():
+            actual = row_totals[field]
+            tolerance = Decimal("0.01") if field != "episode_count" else Decimal("0")
+            if abs(actual - expected) > tolerance:
+                pytest.fail(
+                    f"人效列表汇总不一致：{field}，接口 rows 汇总={actual}，"
+                    f"步骤基准={expected}，误差={abs(actual - expected)}"
+                )
+
+        print(
+            f"[步骤10] rows 汇总校验通过：采集={row_totals['collect_duration_sec']} 秒，"
+            f"标注={row_totals['annotation_duration_sec']} 秒，"
+            f"Episode={row_totals['episode_count']} 个，"
+            f"Episode时长={row_totals['episode_duration_sec']} 秒，"
+            f"转换时长={row_totals['conversion_duration_sec']} 秒",
+            flush=True,
+        )
+        allure.attach(
+            json.dumps(
+                {
+                    "row_count": len(rows),
+                    "rows_totals": {key: str(value) for key, value in row_totals.items()},
+                    "expected_totals": {key: str(value) for key, value in expected_totals.items()},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            name="人效列表人员数据汇总对比",
             attachment_type=allure.attachment_type.JSON,
         )

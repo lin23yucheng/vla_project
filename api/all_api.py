@@ -259,6 +259,11 @@ class ApiAll():
         url = f"{env}/api/v1/task-annotations/tasks/{task_id}/auto-labeling/jobs/latest"
         return self.client.get_with_retry(url)
 
+    # 查看并编辑自动标注结果（触发任务级结果加载）
+    def query_auto_labeling_job_result(self, task_id, job_id):
+        url = f"{env}/api/v1/task-annotations/tasks/{task_id}/auto-labeling/jobs/{job_id}"
+        return self.client.get_with_retry(url)
+
     # ==================== 人工质检 ====================
     # 完成质检接口
     def complete_task_qc(self, task_id):
