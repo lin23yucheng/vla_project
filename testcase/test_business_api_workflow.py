@@ -21,13 +21,20 @@ assertions = Assert.Assertions()
 global_client = create_lazy_yixiu_client()
 # 填写已有任务编号时，跳过创建、上传和采集完成步骤，直接从步骤 8 开始。
 # 为空字符串时执行完整流程；也可通过 VLA_TASK_NO 环境变量覆盖。
-TASK_NO = ""
+TASK_NO = "TASK-2026-038"
 TASK_NO = os.environ.get("VLA_TASK_NO", TASK_NO).strip()
 UPLOAD_POLL_INTERVAL_SECONDS = 10
 UPLOAD_POLL_TIMEOUT_SECONDS = 30 * 60
 LOCAL_UPLOAD_PROGRESS_POLL_SECONDS = 30
 AUTO_LABELING_POLL_INTERVAL_SECONDS = 10
 AUTO_LABELING_POLL_TIMEOUT_SECONDS = 60 * 60
+
+
+def format_elapsed_minutes_seconds(seconds):
+    """将耗时格式化为 X 分 X 秒。"""
+    total_seconds = max(0, int(round(seconds)))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    return f"{minutes}分{remaining_seconds}秒"
 
 
 def response_list(response, interface_name):
@@ -149,6 +156,198 @@ def print_active_upload_progress(api_all, task_id):
         )
 
 
+def _first_value(item, *keys):
+    if not isinstance(item, dict):
+        return None
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _auto_segment(item, layer_id, category, job_id, index, playback):
+    """将自动标注结果中的 episode/sub-task 转为工作台 segment 格式。"""
+    if not isinstance(item, dict):
+        return None
+    start_ns = _first_value(item, "startTimeNs", "startTimestampNs", "start_time_ns", "start_timestamp_ns")
+    end_ns = _first_value(item, "endTimeNs", "endTimestampNs", "end_time_ns", "end_timestamp_ns")
+    # 自动标注结果接口可能只返回相对视频的 startSec/endSec。
+    if start_ns is None or end_ns is None:
+        start_sec = _first_value(item, "startSec", "start_sec")
+        end_sec = _first_value(item, "endSec", "end_sec")
+        try:
+            baseline_start = int(playback["baseline_start_time_ns"])
+            if start_sec is not None and end_sec is not None:
+                start_ns = baseline_start + round(float(start_sec) * 1_000_000_000)
+                end_ns = baseline_start + round(float(end_sec) * 1_000_000_000)
+        except (KeyError, TypeError, ValueError) as exc:
+            pytest.fail(f"自动标注结果 startSec/endSec 或 playback 无效：{exc}")
+    if start_ns is None or end_ns is None:
+        return None
+    try:
+        start_ns_int, end_ns_int = int(start_ns), int(end_ns)
+        baseline_start_ns = int(playback["baseline_start_time_ns"])
+    except (KeyError, TypeError, ValueError) as exc:
+        pytest.fail(f"自动标注结果或 playback 缺少有效纳秒时间：{exc}")
+    if end_ns_int < start_ns_int:
+        pytest.fail(f"自动标注片段结束时间早于开始时间：{item}")
+    start_ns, end_ns = str(start_ns_int), str(end_ns_int)
+    relative_start_ns, relative_end_ns = start_ns_int - baseline_start_ns, end_ns_int - baseline_start_ns
+    segment_id_value = _first_value(item, "segmentId", "segment_id", "id")
+    if segment_id_value is None:
+        segment_id_value = f"auto:{job_id}:{category}:{index}"
+    segment_id = str(segment_id_value)
+    description_value = _first_value(item, "description", "prompt", "name", "label", "text")
+    if description_value is None:
+        pytest.fail(
+            f"自动标注结果缺少 description/prompt/name，不能准确回写 {category}[{index}]：{item}"
+        )
+    description = str(description_value)
+    prompt_value = _first_value(item, "prompt") or description
+    layer_value = _first_value(item, "layerId", "layer_id")
+    if layer_value is None:
+        # 简化自动标注结果不携带层级时，由结果所在集合的协议层级确定。
+        layer_value = layer_id
+    source_value = _first_value(item, "source") or "auto"
+    auto_review = item.get("autoReview")
+    if not isinstance(auto_review, dict):
+        auto_review = {"score": 0, "decision": "", "comment": ""}
+    attributes = item.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    segment = dict(item)
+    segment.update({
+        "segmentId": segment_id,
+        "id": segment_id,
+        "layerId": str(layer_value),
+        "category": category,
+        "description": description,
+        "prompt": str(prompt_value),
+        "source": str(source_value),
+        "autoReview": auto_review,
+        "attributes": {
+            **attributes,
+            # 两项由本次接口链路确定，不依赖前端或算法结果重复返回。
+            "autoJobId": str(job_id),
+            "autoResultType": category,
+        },
+        "startTimeNs": start_ns,
+        "endTimeNs": end_ns,
+        "startTimestampNs": start_ns,
+        "endTimestampNs": end_ns,
+    })
+    relative_start_sec = relative_start_ns / 1_000_000_000
+    relative_end_sec = relative_end_ns / 1_000_000_000
+    segment.update({
+        "episodeStartTimeNs": str(relative_start_ns),
+        "episodeEndTimeNs": str(relative_end_ns),
+        "episode_start_time": f"{relative_start_sec:.9f}",
+        "episode_end_time": f"{relative_end_sec:.9f}",
+        "timeline_start_sec": f"{relative_start_sec:.9f}",
+        "timeline_end_sec": f"{relative_end_sec:.9f}",
+        "baseline_camera_key": playback["baseline_camera_key"],
+        "startSec": relative_start_sec,
+        "endSec": relative_end_sec,
+        "start_time": f"{start_ns_int // 1_000_000_000}.{start_ns_int % 1_000_000_000:09d}",
+        "end_time": f"{end_ns_int // 1_000_000_000}.{end_ns_int % 1_000_000_000:09d}",
+    })
+    return segment
+
+
+def _build_auto_segments(result, job_id, playback):
+    episodes = result.get("episodes_annotation") if isinstance(result, dict) else None
+    if not isinstance(episodes, list) or not episodes:
+        return []
+    segments = []
+    for episode_index, episode in enumerate(episodes):
+        episode_item = episode.get("segment", episode) if isinstance(episode, dict) else episode
+        episode_segment = _auto_segment(episode_item, "l1", "episode", job_id, episode_index, playback)
+        if episode_segment:
+            segments.append(episode_segment)
+        subtasks = _first_value(
+            episode,
+            "sub_tasks_annotation",
+            "subtasks_annotation",
+            "sub_tasks",
+            "subtasks",
+            "sub_task_annotation",
+        )
+        if not isinstance(subtasks, list) and isinstance(episode_item, dict):
+            subtasks = _first_value(
+                episode_item,
+                "sub_tasks_annotation",
+                "subtasks_annotation",
+                "sub_tasks",
+                "subtasks",
+            )
+        if isinstance(subtasks, list):
+            for subtask_index, subtask in enumerate(subtasks):
+                subtask_item = subtask.get("segment", subtask) if isinstance(subtask, dict) else subtask
+                segment = _auto_segment(
+                    subtask_item, "l2", "sub_task", job_id, subtask_index, playback
+                )
+                if segment:
+                    segments.append(segment)
+    # 简化结果中 sub_tasks_annotation 与 episodes_annotation 平级返回。
+    if not any(item.get("category") == "sub_task" for item in segments):
+        top_level_subtasks = result.get("sub_tasks_annotation") or result.get("subtasks_annotation") or []
+        if isinstance(top_level_subtasks, list):
+            for subtask_index, subtask in enumerate(top_level_subtasks):
+                subtask_item = subtask.get("segment", subtask) if isinstance(subtask, dict) else subtask
+                segment = _auto_segment(
+                    subtask_item, "l2", "sub_task", job_id, subtask_index, playback
+                )
+                if segment:
+                    segments.append(segment)
+    return segments
+
+
+def _workspace_playback(workspace_data, playlist_data):
+    candidates = [
+        (workspace_data or {}).get("playback"),
+        ((workspace_data or {}).get("annotation") or {}).get("playback"),
+        (playlist_data or {}).get("playback"),
+        playlist_data,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("baseline_start_time_ns"):
+            return candidate
+    # video-playlist 的实际响应将 playback 拆分为 timeline 和 cameras。
+    if isinstance(playlist_data, dict):
+        cameras = playlist_data.get("cameras")
+        timeline = playlist_data.get("timeline") or {}
+        if isinstance(cameras, list) and cameras:
+            requested_key = os.environ.get("VLA_BASELINE_CAMERA_KEY", "").strip()
+            camera = next(
+                (item for item in cameras if item.get("camera_key") == requested_key),
+                None,
+            ) if requested_key else None
+            camera = camera or cameras[0]
+            camera_key = camera.get("camera_key")
+            camera_segments = camera.get("segments") or []
+            camera_segment = camera_segments[0] if camera_segments else {}
+            start_ns = camera_segment.get("global_start_time_ns") or timeline.get("start_time_ns")
+            end_ns = camera_segment.get("global_end_time_ns") or timeline.get("end_time_ns")
+            topic = camera_segment.get("image_topic") or camera_segment.get("topic")
+            sequence = camera_segment.get("sequence", 1)
+            if camera_key and start_ns and end_ns:
+                return {
+                    "baseline_camera_key": camera_key,
+                    "baseline_camera_label": camera_key,
+                    "topic": topic,
+                    "baseline_start_time_ns": str(start_ns),
+                    "baseline_end_time_ns": str(end_ns),
+                    "timeline_duration_sec": str(
+                        timeline.get("duration_sec")
+                        or (int(end_ns) - int(start_ns)) / 1_000_000_000
+                    ),
+                    "gap_policy": "skip_on_playback",
+                    "current_sequence": sequence,
+                }
+    return None
+
+
 @allure.feature("业务接口自动化全流程")
 class TestBusinessApiWorkflow:
     @classmethod
@@ -167,6 +366,8 @@ class TestBusinessApiWorkflow:
         cls.upload_files = []
         cls.auto_labeling_job_id = None
         cls.auto_labeling_result = None
+        cls.auto_labeling_job_result = None
+        cls.annotation_video_duration_sec = None
 
     @pytest.mark.order(1)
     @allure.story("步骤1：创建任务")
@@ -262,6 +463,8 @@ class TestBusinessApiWorkflow:
                 or target_task.get("robotConfigName")
                 or (target_task.get("robot_config") or {}).get("name")
             )
+            scene_tags = target_task.get("scene_tags") or target_task.get("sceneTags") or []
+            self.__class__.scene_tags = scene_tags if isinstance(scene_tags, list) else []
             if not self.task_id or not self.task_name:
                 pytest.fail(f"任务 {TASK_NO} 未包含有效 id 或 name")
             if not self.robot_config_id and self.robot_config_name:
@@ -709,7 +912,10 @@ class TestBusinessApiWorkflow:
                 "robot_config": json.dumps(robot_config, ensure_ascii=False, separators=(",", ":")),
                 "user_prompt": os.environ.get(
                     "VLA_AUTO_LABELING_PROMPT",
-                    "请描述机器人完成的子任务,可选子任务为：夹取物体，移动物体，放下物体",
+                    "请描述机器人完成的子任务,可选子任务为：\n"
+                    "夹取物体：机械臂移动靠近物体，末端夹爪角度减小以夹持物体；\n"
+                    "移动物体：夹取物体后的移动状态；\n"
+                    "放下物体：机械臂末端夹爪张开，放开物体。",
                 ),
                 "video_fps": int(os.environ.get("VLA_AUTO_LABELING_FPS", "30")),
             },
@@ -754,7 +960,10 @@ class TestBusinessApiWorkflow:
                 "robot_config": json.dumps(robot_config, ensure_ascii=False, separators=(",", ":")),
                 "user_prompt": os.environ.get(
                     "VLA_AUTO_LABELING_PROMPT",
-                    "请描述机器人完成的子任务,可选子任务为：夹取物体，移动物体，放下物体",
+                    "请描述机器人完成的子任务,可选子任务为：\n"
+                    "夹取物体：机械臂移动靠近物体，末端夹爪角度减小以夹持物体；\n"
+                    "移动物体：夹取物体后的移动状态；\n"
+                    "放下物体：机械臂末端夹爪张开，放开物体。",
                 ),
                 "video_fps": int(os.environ.get("VLA_AUTO_LABELING_FPS", "30")),
             },
@@ -800,10 +1009,34 @@ class TestBusinessApiWorkflow:
                         "刷新自动化标注结果失败："
                         f"HTTP {result_response.status_code}，响应：{result_data}"
                     )
+                # 保存“查看并编辑自动标注结果”接口的完整响应；该响应是
+                # 组装工作台 segments 的权威自动标注结果来源。
+                self.__class__.auto_labeling_job_result = result_data.get("data", {})
+                elapsed = time.monotonic() - started_at
+                video_duration_text = "未知"
+                playlist_response = self.api_all.query_task_video_playlist(self.task_id)
+                if playlist_response.status_code == 200:
+                    playlist_data = playlist_response.json().get("data", {})
+                    timeline = playlist_data.get("timeline", {}) if isinstance(playlist_data, dict) else {}
+                    try:
+                        video_duration_sec = float(timeline.get("duration_sec"))
+                    except (TypeError, ValueError):
+                        video_duration_sec = None
+                    if video_duration_sec is not None and video_duration_sec >= 0:
+                        self.__class__.annotation_video_duration_sec = video_duration_sec
+                        video_duration_text = format_elapsed_minutes_seconds(video_duration_sec)
+                print(
+                    f"[步骤10] 自动化标注完成，耗时：{format_elapsed_minutes_seconds(elapsed)} "
+                    f"（{elapsed:.2f}秒）；标注视频总时长：{video_duration_text}",
+                    flush=True,
+                )
                 print("[步骤10] 已刷新自动化标注结果，页面可读取结果", flush=True)
                 return
             if status in {"FAILED", "CANCELED", "CANCELLED", "TIMEOUT"} or status_code in {5, 6, 7, 8}:
-                pytest.fail(f"自动化标注执行失败：{data}")
+                elapsed = time.monotonic() - started_at
+                pytest.fail(
+                    f"自动化标注执行失败（已耗时：{format_elapsed_minutes_seconds(elapsed)}）：{data}"
+                )
             if time.monotonic() - started_at >= AUTO_LABELING_POLL_TIMEOUT_SECONDS:
                 pytest.fail(f"自动化标注轮询超时：{AUTO_LABELING_POLL_TIMEOUT_SECONDS} 秒")
             time.sleep(AUTO_LABELING_POLL_INTERVAL_SECONDS)
@@ -818,14 +1051,85 @@ class TestBusinessApiWorkflow:
         data = response.json().get("data", {})
         if data.get("status") != "SUCCEEDED" or data.get("status_code") != 4:
             pytest.fail(f"自动化标注最终状态异常：{data}")
-        episodes = data.get("result", {}).get("episodes_annotation", [])
+        result_data = self.auto_labeling_job_result or data
+        result = result_data.get("result", {}) if isinstance(result_data, dict) else {}
+        episodes = result.get("episodes_annotation", [])
         if not isinstance(episodes, list) or not episodes:
             pytest.fail("自动化标注成功，但 episodes_annotation 为空")
-        self.__class__.auto_labeling_result = data
+        self.__class__.auto_labeling_result = result_data
 
         workspace_response = self.api_all.query_annotation_workspace(self.task_id)
         assertions.assert_code(workspace_response.status_code, 200)
-        assertions.assert_text(workspace_response.json().get("msg", ""), "success")
+        workspace_response_data = workspace_response.json()
+        assertions.assert_text(workspace_response_data.get("msg", ""), "success")
+        workspace_data = workspace_response_data.get("data", {})
+        annotation = workspace_data.get("annotation", {}) if isinstance(workspace_data, dict) else {}
+        annotation_id = annotation.get("annotation_id") or annotation.get("id")
+        if not annotation_id:
+            pytest.fail(f"标注工作区未返回 annotation_id：{workspace_data}")
+
+        playlist_response = self.api_all.query_task_video_playlist(self.task_id)
+        assertions.assert_code(playlist_response.status_code, 200)
+        playlist_data = playlist_response.json().get("data", {})
+        playback = _workspace_playback(workspace_data, playlist_data)
+        if not playback:
+            pytest.fail(
+                "无法从 annotation-workspace 或 video-playlist 获取 playback；"
+                f"workspace={workspace_data}，playlist={playlist_data}"
+            )
+        required_playback_fields = ("baseline_camera_key", "baseline_start_time_ns")
+        missing_playback_fields = [key for key in required_playback_fields if not playback.get(key)]
+        if missing_playback_fields:
+            pytest.fail(f"playback 缺少字段 {missing_playback_fields}：{playback}")
+
+        job_id = data.get("job_id") or self.auto_labeling_job_id
+        if not job_id:
+            pytest.fail("自动标注结果未返回 job_id")
+        segments = _build_auto_segments(result, job_id, playback)
+        if not segments:
+            pytest.fail(
+                "无法从 episodes_annotation 构造可回显的 segments；"
+                f"结果字段：{json.dumps(result, ensure_ascii=False)}"
+            )
+        if not any(segment["category"] == "episode" for segment in segments):
+            pytest.fail("自动标注结果未构造出 episode 分段，拒绝写入")
+
+        tag_vocabulary = (
+            annotation.get("tag_vocabulary")
+            or annotation.get("tagVocabulary")
+            or workspace_data.get("tag_vocabulary")
+            or workspace_data.get("tagVocabulary")
+            or self.scene_tags
+            or []
+        )
+        if not isinstance(tag_vocabulary, list):
+            pytest.fail(f"tag_vocabulary 不是列表：{tag_vocabulary!r}")
+        payload = {
+            "tag_vocabulary": tag_vocabulary,
+            "segments": segments,
+            "deleted_segments": [],
+            "playback": playback,
+            "status": "DRAFT",
+        }
+        allure.attach(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            name="自动标注结果回写 segments 请求参数",
+            attachment_type=allure.attachment_type.JSON,
+        )
+        patch_response = self.api_all.create_task_annotation_segments(
+            annotation_id=annotation_id,
+            tag_vocabulary=tag_vocabulary,
+            segments=segments,
+            playback=playback,
+        )
+        assertions.assert_code(patch_response.status_code, 200)
+        assertions.assert_text(patch_response.json().get("msg", ""), "success")
+        print(
+            f"[步骤11] 已回写自动标注 segments：annotation_id={annotation_id}，"
+            f"episode={sum(item['category'] == 'episode' for item in segments)}，"
+            f"sub_task={sum(item['category'] == 'sub_task' for item in segments)}",
+            flush=True,
+        )
 
 
 @allure.feature("工作台数据校验")
