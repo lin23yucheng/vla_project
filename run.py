@@ -1,15 +1,14 @@
-import json
 import os
+import sys
+import json
+import time
 import shutil
 import signal
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List
-
 import pytest
 
+from typing import List
+from pathlib import Path
+from dataclasses import dataclass
 from common.Log import MyLog, set_log_level
 
 # 设置全局日志级别

@@ -21,7 +21,7 @@ assertions = Assert.Assertions()
 global_client = create_lazy_yixiu_client()
 # 填写已有任务编号时，跳过创建、上传和采集完成步骤，直接从步骤 8 开始。
 # 为空字符串时执行完整流程；也可通过 VLA_TASK_NO 环境变量覆盖。
-TASK_NO = "TASK-2026-038"
+TASK_NO = ""
 TASK_NO = os.environ.get("VLA_TASK_NO", TASK_NO).strip()
 UPLOAD_POLL_INTERVAL_SECONDS = 10
 UPLOAD_POLL_TIMEOUT_SECONDS = 30 * 60
