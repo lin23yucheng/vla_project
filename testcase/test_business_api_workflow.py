@@ -417,6 +417,7 @@ class TestBusinessApiWorkflow:
                 category=self.category_name,
                 scene_tags=self.scene_tags,
                 robot_config_id=self.robot_config_id,
+                pipeline_id="900001",
             )
             assertions.assert_code(response.status_code, 201)
             assertions.assert_text(response.json().get("msg", ""), "success")

@@ -30,7 +30,7 @@ class ApiAll():
 
     # ==================== 任务管理 ====================
     # 创建任务
-    def create_task(self, name, category, scene_tags, robot_config_id):
+    def create_task(self, name, category, scene_tags, robot_config_id, pipeline_id=None):
         url = f"{env}/api/v1/tasks/add"
         payload = {
             "name": name,
@@ -43,6 +43,8 @@ class ApiAll():
             "target_count": 10,
             "priority": "high",
         }
+        if pipeline_id is not None:
+            payload["pipeline_id"] = pipeline_id
 
         response = self.client.post_with_retry(url, json=payload)
         return response
@@ -280,6 +282,7 @@ class ApiAll():
             "task_ids": [str(task_id)],
             "target_format": target_format,
             "quality_labels": quality_labels,
+            "force_reconvert": False,  # 是否强制重新转换
         }
 
         response = self.client.post_with_retry(url, json=payload)
