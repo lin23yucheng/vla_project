@@ -1270,6 +1270,155 @@ class TestWorkbenchData:
         except Exception as exc:
             pytest.fail(f"查询 Episode 标注时长失败：{exc}")
 
+    def _conversion_workforce_statistics(self):
+        """按人员统计其最新完成转换任务的 Episode 数量和时长。"""
+        page_index = 1
+        page_size = 100
+        completed_jobs = {}
+        while True:
+            response = self.api_all.query_conversion_list(
+                status="completed", page_index=page_index, page_size=page_size
+            )
+            assertions.assert_code(response.status_code, 200)
+            response_data = response.json()
+            assertions.assert_text(response_data.get("msg", ""), "success")
+            data = response_data.get("data", {})
+            page_items = data.get("list", [])
+            if not isinstance(page_items, list):
+                pytest.fail("已完成转换列表接口的 data.list 不是列表")
+
+            for index, item in enumerate(page_items):
+                if not isinstance(item, dict):
+                    pytest.fail(
+                        f"已完成转换列表 data.list[{index}] 不是对象"
+                    )
+                job_id = item.get("job_id")
+                task_id = item.get("task_id")
+                if job_id is None or str(job_id).strip() == "":
+                    pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 job_id")
+                if task_id is None or str(task_id).strip() == "":
+                    pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 task_id")
+                completed_jobs[str(job_id).strip()] = str(task_id).strip()
+
+            pages = data.get("pages")
+            if pages is not None:
+                try:
+                    if page_index >= int(pages):
+                        break
+                except (TypeError, ValueError):
+                    pytest.fail(f"已完成转换列表接口 data.pages 无效：{pages!r}")
+            elif len(page_items) < page_size:
+                break
+            page_index += 1
+
+        if not completed_jobs:
+            return {}
+
+        try:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "WITH api_completed_jobs AS ("
+                    "    SELECT DISTINCT job_id "
+                    "    FROM unnest(%s::text[]) AS input(job_id)"
+                    "), completed_jobs AS ("
+                    "    SELECT jobs.job_id::text AS job_id, jobs.task_id, jobs.creator_id, "
+                    "           MAX(outputs.created_at) AS latest_output_created_at, "
+                    "           ROW_NUMBER() OVER ("
+                    "               PARTITION BY jobs.creator_id, jobs.task_id "
+                    "               ORDER BY MAX(outputs.created_at) DESC NULLS LAST, jobs.job_id DESC"
+                    "           ) AS recency_rank "
+                    "    FROM conversion_jobs AS jobs "
+                    "    JOIN api_completed_jobs AS api_jobs "
+                    "      ON jobs.job_id::text = api_jobs.job_id "
+                    "    JOIN conversion_outputs AS outputs "
+                    "      ON outputs.job_id = jobs.job_id "
+                    "     AND outputs.task_id = jobs.task_id "
+                    "     AND outputs.kind = %s "
+                    "    WHERE jobs.status = %s AND jobs.creator_id IS NOT NULL"
+                    "    GROUP BY jobs.job_id, jobs.task_id, jobs.creator_id"
+                    "), latest_jobs AS ("
+                    "    SELECT job_id, task_id, creator_id "
+                    "    FROM completed_jobs WHERE recency_rank = 1"
+                    "), episode_durations AS ("
+                    "    SELECT outputs.job_id::text AS job_id, outputs.task_id, "
+                   "           outputs.episode_id, MAX(outputs.duration_sec) AS duration_sec "
+                    "    FROM conversion_outputs AS outputs "
+                    "    JOIN latest_jobs AS jobs "
+                    "      ON outputs.job_id::text = jobs.job_id "
+                    "     AND outputs.task_id = jobs.task_id "
+                    "    WHERE outputs.kind = %s "
+                    "    GROUP BY outputs.job_id, outputs.task_id, outputs.episode_id"
+                    "), task_episode_counts AS ("
+                    "    SELECT jobs.job_id, jobs.task_id, "
+                    "           COUNT(segments.segment_item_id) AS episode_count "
+                    "    FROM latest_jobs AS jobs "
+                    "    LEFT JOIN annotation_segment_items AS segments "
+                    "      ON segments.task_id = jobs.task_id "
+                    "     AND segments.segment_kind = %s "
+                    "     AND segments.deleted_flag = FALSE "
+                    "    GROUP BY jobs.job_id, jobs.task_id"
+                    "), job_statistics AS ("
+                    "    SELECT jobs.creator_id, jobs.job_id, jobs.task_id, "
+                    "           COALESCE(task_episode_counts.episode_count, 0) AS episode_count, "
+                    "           COALESCE(duration_counts.duration_sec, 0) AS duration_sec "
+                    "    FROM latest_jobs AS jobs "
+                    "    LEFT JOIN task_episode_counts "
+                    "      ON task_episode_counts.job_id = jobs.job_id "
+                    "     AND task_episode_counts.task_id = jobs.task_id "
+                    "    LEFT JOIN ("
+                    "        SELECT job_id, task_id, SUM(duration_sec) AS duration_sec "
+                    "        FROM episode_durations "
+                    "        GROUP BY job_id, task_id"
+                    "    ) AS duration_counts "
+                    "      ON duration_counts.job_id = jobs.job_id "
+                    "     AND duration_counts.task_id = jobs.task_id"
+                    ") "
+                    "SELECT creator_id AS user_id, SUM(episode_count) AS episode_count, "
+                    "       SUM(duration_sec) AS duration_sec "
+                    "FROM job_statistics "
+                    "GROUP BY creator_id",
+                    (list(completed_jobs), "video", "completed", "video", "episode"),
+                )
+                columns = [description[0] for description in cursor.description]
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as exc:
+            pytest.fail(f"查询人员转换 Episode 统计失败：{exc}")
+
+        expected_task_ids = completed_jobs
+        found_jobs = set()
+        try:
+            with self._postgres_connection() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT job_id::text, task_id::text FROM conversion_jobs "
+                    "WHERE job_id::text = ANY(%s) AND status = %s",
+                    (list(completed_jobs), "completed"),
+                )
+                found_jobs = {
+                    str(job_id): str(task_id)
+                    for job_id, task_id in cursor.fetchall()
+                }
+        except Exception as exc:
+            pytest.fail(f"核对已完成转换 job 失败：{exc}")
+        missing_jobs = sorted(set(expected_task_ids) - set(found_jobs))
+        mismatched_tasks = sorted(
+            job_id for job_id, task_id in expected_task_ids.items()
+            if found_jobs.get(job_id) != task_id
+        )
+        if missing_jobs or mismatched_tasks:
+            pytest.fail(
+                "转换列表与数据库 conversion_jobs 不一致："
+                f"缺失 job_id={missing_jobs}，task_id 不匹配 job_id={mismatched_tasks}"
+            )
+
+        return {
+            str(row["user_id"]): {
+                "episode_count": int(row["episode_count"] or 0),
+                "episode_duration_sec": Decimal(str(row["duration_sec"] or 0)),
+                "conversion_duration_sec": Decimal(str(row["duration_sec"] or 0)),
+            }
+            for row in rows
+        }
+
     def _workforce_completion_rows(self):
         """按采集、标注、质检和转换子任务统计人员完成数及完成率。"""
         query = """
@@ -2029,7 +2178,7 @@ class TestWorkbenchData:
     @pytest.mark.order(21)
     @allure.story("步骤10：人效统计-验证列表页人员各项统计数据")
     def test_workforce_rows_totals(self):
-        """汇总人效列表 rows，核对页面总时长、Episode 数量及转换时长。"""
+        """核对人员行汇总的采集/标注时长及逐人转换指标。"""
         print("[步骤10] 开始汇总人效列表页人员数据...", flush=True)
         required_totals = {
             "collection_duration_recalculated_sec": self.collection_duration_recalculated_sec,
@@ -2049,17 +2198,22 @@ class TestWorkbenchData:
         if not isinstance(rows, list):
             pytest.fail("工作台人效统计响应缺少有效 data.rows 列表")
 
-        field_names = (
-            "collect_duration_sec",
-            "annotation_duration_sec",
-            "episode_count",
-            "episode_duration_sec",
-            "conversion_duration_sec",
-        )
+        # 采集、标注时长仍按人员行汇总校验；转换指标不能直接求和。
+        # 同一任务可能被不同人员分别转换，分别计入各自人效后会大于全局唯一 Episode 总量。
+        field_names = ("collect_duration_sec", "annotation_duration_sec")
         row_totals = {field: Decimal("0") for field in field_names}
+        conversion_by_user = self._conversion_workforce_statistics()
+        api_user_ids = set()
+        conversion_comparisons = []
+        conversion_errors = []
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
                 pytest.fail(f"data.rows[{index}] 不是对象")
+            user_id = row.get("user_id")
+            if user_id is None or str(user_id).strip() == "":
+                pytest.fail(f"data.rows[{index}] 缺少有效 user_id")
+            user_id_key = str(user_id).strip()
+            api_user_ids.add(user_id_key)
             for field in field_names:
                 value = row.get(field, 0)
                 try:
@@ -2067,28 +2221,86 @@ class TestWorkbenchData:
                 except (TypeError, ValueError, InvalidOperation) as exc:
                     pytest.fail(f"data.rows[{index}].{field} 不是有效数字：{value!r}，{exc}")
 
+            expected = conversion_by_user.get(
+                user_id_key,
+                {
+                    "episode_count": 0,
+                    "episode_duration_sec": Decimal("0"),
+                    "conversion_duration_sec": Decimal("0"),
+                },
+            )
+            try:
+                actual_episode_count = int(row.get("episode_count", 0) or 0)
+                actual_episode_duration = Decimal(
+                    str(row.get("episode_duration_sec", 0) or 0)
+                )
+                actual_conversion_duration = Decimal(
+                    str(row.get("conversion_duration_sec", 0) or 0)
+                )
+            except (TypeError, ValueError, InvalidOperation) as exc:
+                pytest.fail(f"data.rows[{index}] 转换指标不是有效数字：{exc}")
+
+            matched = (
+                actual_episode_count == expected["episode_count"]
+                and abs(actual_episode_duration - expected["episode_duration_sec"])
+                <= Decimal("0.01")
+                and abs(actual_conversion_duration - expected["conversion_duration_sec"])
+                <= Decimal("0.01")
+            )
+            comparison = {
+                "user_id": user_id_key,
+                "name": str(row.get("name") or "").strip(),
+                "expected": {
+                    "episode_count": expected["episode_count"],
+                    "episode_duration_sec": str(expected["episode_duration_sec"]),
+                    "conversion_duration_sec": str(expected["conversion_duration_sec"]),
+                },
+                "actual": {
+                    "episode_count": actual_episode_count,
+                    "episode_duration_sec": str(actual_episode_duration),
+                    "conversion_duration_sec": str(actual_conversion_duration),
+                },
+                "matched": matched,
+            }
+            conversion_comparisons.append(comparison)
+            if not matched:
+                conversion_errors.append(
+                    f"人员转换指标不一致：user_id={user_id_key}，"
+                    f"name={comparison['name']!r}，"
+                    f"Episode 接口={actual_episode_count}/数据库={expected['episode_count']}，"
+                    f"Episode 时长接口={actual_episode_duration}/数据库={expected['episode_duration_sec']}，"
+                    f"转换时长接口={actual_conversion_duration}/数据库={expected['conversion_duration_sec']}"
+                )
+
+        missing_api_users = sorted(set(conversion_by_user) - api_user_ids)
+        if missing_api_users:
+            conversion_errors.append(
+                f"人效列表缺少已完成转换人员：user_id={missing_api_users}"
+            )
+
         expected_totals = {
             "collect_duration_sec": Decimal(str(self.collection_duration_recalculated_sec)),
             "annotation_duration_sec": Decimal(str(self.annotation_duration_recalculated_sec)),
-            "episode_count": Decimal(str(self.episode_count_recalculated)),
-            "episode_duration_sec": Decimal(str(self.episode_duration_recalculated_sec)),
-            "conversion_duration_sec": Decimal(str(self.episode_duration_recalculated_sec)),
         }
         for field, expected in expected_totals.items():
             actual = row_totals[field]
-            tolerance = Decimal("0.01") if field != "episode_count" else Decimal("0")
+            tolerance = Decimal("0.01")
             if abs(actual - expected) > tolerance:
                 pytest.fail(
                     f"人效列表汇总不一致：{field}，接口 rows 汇总={actual}，"
                     f"步骤基准={expected}，误差={abs(actual - expected)}"
                 )
 
+        if conversion_errors:
+            pytest.fail(
+                f"人效列表人员转换指标校验失败，共 {len(conversion_errors)} 条异常：\n"
+                + "\n".join(f"- {error}" for error in conversion_errors)
+            )
+
         print(
             f"[步骤10] rows 汇总校验通过：采集={row_totals['collect_duration_sec']} 秒，"
             f"标注={row_totals['annotation_duration_sec']} 秒，"
-            f"Episode={row_totals['episode_count']} 个，"
-            f"Episode时长={row_totals['episode_duration_sec']} 秒，"
-            f"转换时长={row_totals['conversion_duration_sec']} 秒",
+            f"人员转换指标已逐人校验，共 {len(conversion_comparisons)} 人",
             flush=True,
         )
         allure.attach(
@@ -2097,6 +2309,7 @@ class TestWorkbenchData:
                     "row_count": len(rows),
                     "rows_totals": {key: str(value) for key, value in row_totals.items()},
                     "expected_totals": {key: str(value) for key, value in expected_totals.items()},
+                    "conversion_comparisons": conversion_comparisons,
                 },
                 ensure_ascii=False,
                 indent=2,

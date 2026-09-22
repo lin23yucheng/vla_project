@@ -1,0 +1,175 @@
+vla_project
+Copyright (c) 2026 Changzhou MICRO-INTELLIGENCE Co., Ltd.
+
+本产品包含或依赖了以下第三方开源软件。相关软件的版权归其各自的作者所有,
+并按其各自的开源许可证授权使用。下方列出了这些软件及其许可证与版权声明。
+
+--------------------------------------------------------------------------------
+Package : allure-pytest
+Version : 2.16.0
+License : Apache-2.0
+Homepage: pkg:pypi/allure-pytest@2.16.0
+License File: LICENSES/Apache-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : allure-python-commons
+Version : 2.16.0
+License : Apache-2.0
+Homepage: pkg:pypi/allure-python-commons@2.16.0
+License File: LICENSES/Apache-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : av
+Version : 17.1.0
+License : BSD-3-Clause
+Homepage: pkg:pypi/av@17.1.0
+Copyright:
+  Copyright retained by original committers. All rights reserved.
+License File: LICENSES/BSD-3-Clause.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : charset-normalizer
+Version : 3.5.1
+License : MIT
+Homepage: pkg:pypi/charset-normalizer@3.5.1
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : idna
+Version : 3.20
+License : BSD-3-Clause
+Homepage: pkg:pypi/idna@3.20
+Copyright:
+  Copyright (c) 2013-2026, Kim Davies and contributors.
+License File: LICENSES/BSD-3-Clause.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : mcap-ros2-support
+Version : 0.5.7
+License : TODO: 未识别到 License
+Homepage: pkg:pypi/mcap-ros2-support@0.5.7
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : mcap
+Version : 1.4.0
+License : TODO: 未识别到 License
+Homepage: pkg:pypi/mcap@1.4.0
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : minio
+Version : 7.2.20
+License : Apache-2.0
+Homepage: pkg:pypi/minio@7.2.20
+License File: LICENSES/Apache-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : numpy
+Version : 2.2.6
+License : BSD-3-Clause
+Homepage: pkg:pypi/numpy@2.2.6
+Copyright:
+  * Copyright (c) 2006, University of Georgia and Pierre G.F. Gerard-Marchant
+License File: LICENSES/BSD-3-Clause.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pillow
+Version : 12.3.0
+License : MIT-CMU
+Homepage: pkg:pypi/pillow@12.3.0
+Copyright:
+  Copyright © 1997-2011 by Secret Labs AB
+  Copyright © 1995-2011 by Fredrik Lundh and contributors
+  Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
+License File: LICENSES/MIT-CMU.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : psycopg2-binary
+Version : 2.9.10
+License : LGPL with exceptions
+Homepage: pkg:pypi/psycopg2-binary@2.9.10
+License File: LICENSES/LGPL.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pyarrow
+Version : 25.0.0
+License : Apache-2.0
+Homepage: pkg:pypi/pyarrow@25.0.0
+Copyright:
+  copyright (c) Google inc and (c) The Chromium Authors and licensed under the
+  Copyright (c) 2013 The Chromium Authors. All rights reserved.
+  Copyright: 2013 Daniel Lemire
+License File: LICENSES/Apache-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pytest-html
+Version : 4.2.0
+License : MPL-2.0
+Homepage: pkg:pypi/pytest-html@4.2.0
+License File: LICENSES/MPL-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pytest-order
+Version : 1.5.0
+License : MIT
+Homepage: pkg:pypi/pytest-order@1.5.0
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pytest-random-order
+Version : 1.2.0
+License : MIT
+Homepage: pkg:pypi/pytest-random-order@1.2.0
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pytest-xdist
+Version : 3.8.0
+License : MIT
+Homepage: pkg:pypi/pytest-xdist@3.8.0
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : pytest
+Version : 9.1.1
+License : MIT
+Homepage: pkg:pypi/pytest@9.1.1
+Copyright:
+  Copyright (c) 2004 Holger Krekel and others
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : requests
+Version : 2.34.2
+License : Apache-2.0
+Homepage: pkg:pypi/requests@2.34.2
+Copyright:
+  Copyright 2019 Kenneth Reitz
+License File: LICENSES/Apache-2.0.txt
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Package : urllib3
+Version : 2.8.0
+License : MIT
+Homepage: pkg:pypi/urllib3@2.8.0
+Copyright:
+  Copyright (c) 2008-2020 Andrey Petrov and contributors.
+License File: LICENSES/MIT.txt
+--------------------------------------------------------------------------------

@@ -289,13 +289,15 @@ class ApiAll():
         return response
 
     # 查询全部数据转换任务列表页
-    def query_conversion_list(self):
+    def query_conversion_list(self, status=None, page_index=1, page_size=100):
         url = f"{env}/api/v1/conversions"
         params = {
             "view": "all",
-            "page_index": 1,
-            "page_size": 100,
+            "page_index": page_index,
+            "page_size": page_size,
         }
+        if status is not None:
+            params["status"] = status
 
         response = self.client.get_no_raise(url, params=params)
         return response
