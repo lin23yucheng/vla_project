@@ -1237,19 +1237,27 @@ class TestWorkbenchData:
             pytest.fail(f"查询 episode 标注数量失败：{exc}")
 
     def _episode_duration_statistics(self):
-        """按开发口径统计全部视频转换 Episode 的总时长及数量。"""
+        """按每个任务最新视频转换 job 的 Episode 统计总时长及数量。"""
         try:
             with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT COALESCE(SUM(dur), 0), COUNT(*) "
-                    "FROM ("
-                    "    SELECT conversion_outputs.task_id, conversion_outputs.episode_id, "
-                    "           MAX(conversion_outputs.duration_sec) AS dur "
+                    "WITH latest_task_jobs AS ("
+                    "    SELECT DISTINCT ON (task_id) task_id, job_id "
                     "    FROM conversion_outputs "
-                    "    WHERE conversion_outputs.kind = %s "
-                    "    GROUP BY conversion_outputs.task_id, conversion_outputs.episode_id"
-                    ") AS episode_durations",
-                    ("video",),
+                    "    WHERE kind = %s "
+                    "    ORDER BY task_id, created_at DESC, job_id DESC"
+                    "), episode_durations AS ("
+                    "    SELECT outputs.task_id, outputs.episode_id, "
+                    "           MAX(outputs.duration_sec) AS dur "
+                    "    FROM conversion_outputs AS outputs "
+                    "    JOIN latest_task_jobs AS jobs "
+                    "      ON outputs.task_id = jobs.task_id "
+                    "     AND outputs.job_id = jobs.job_id "
+                    "    WHERE outputs.kind = %s "
+                    "    GROUP BY outputs.task_id, outputs.episode_id"
+                    ") "
+                    "SELECT COALESCE(SUM(dur), 0), COUNT(*) FROM episode_durations",
+                    ("video", "video"),
                 )
                 total_duration_sec, episode_count = cursor.fetchone()
                 # 所有 Episode 时长汇总后，再按页面规则统一保留两位小数。
@@ -1643,7 +1651,7 @@ class TestWorkbenchData:
             json.dumps(
                 {"api_conversion_sec": float(api_conversion_sec), "db_episode_sec": float(db_conversion_sec),
                  "episode_count": episode_count,
-                 "aggregation": "每个 task_id + episode_id 取最大 video 时长后汇总",
+                 "aggregation": "每个 task_id 先按最新 created_at 取 job_id；在该 job_id 下每个 task_id + episode_id 取最大 video 时长后汇总",
                  "rounding": "所有 Episode 时长先累加，最后统一四舍五入到两位小数"},
                 ensure_ascii=False, indent=2,
             ),
