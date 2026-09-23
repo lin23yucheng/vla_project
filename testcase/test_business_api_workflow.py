@@ -1274,7 +1274,7 @@ class TestWorkbenchData:
         """按人员统计其最新完成转换任务的 Episode 数量和时长。"""
         page_index = 1
         page_size = 100
-        completed_jobs = {}
+        completed_entries = {}
         while True:
             response = self.api_all.query_conversion_list(
                 status="completed", page_index=page_index, page_size=page_size
@@ -1294,11 +1294,26 @@ class TestWorkbenchData:
                     )
                 job_id = item.get("job_id")
                 task_id = item.get("task_id")
+                creator_name = str(item.get("creator_name") or "").strip()
+                finished_at = item.get("finished_at")
                 if job_id is None or str(job_id).strip() == "":
                     pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 job_id")
                 if task_id is None or str(task_id).strip() == "":
                     pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 task_id")
-                completed_jobs[str(job_id).strip()] = str(task_id).strip()
+                if not creator_name:
+                    pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 creator_name")
+                if not finished_at:
+                    pytest.fail(f"已完成转换列表 data.list[{index}] 缺少 finished_at")
+                entry = {
+                    "job_id": str(job_id).strip(),
+                    "task_id": str(task_id).strip(),
+                    "creator_name": creator_name,
+                    "finished_at": str(finished_at),
+                }
+                key = (creator_name, str(task_id).strip())
+                previous = completed_entries.get(key)
+                if previous is None or entry["finished_at"] > previous["finished_at"]:
+                    completed_entries[key] = entry
 
             pages = data.get("pages")
             if pages is not None:
@@ -1311,34 +1326,26 @@ class TestWorkbenchData:
                 break
             page_index += 1
 
-        if not completed_jobs:
+        if not completed_entries:
             return {}
+
+        selected_jobs = {
+            entry["job_id"]: entry["task_id"]
+            for entry in completed_entries.values()
+        }
 
         try:
             with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    "WITH api_completed_jobs AS ("
+                    "WITH selected_jobs AS ("
                     "    SELECT DISTINCT job_id "
                     "    FROM unnest(%s::text[]) AS input(job_id)"
-                    "), completed_jobs AS ("
-                    "    SELECT jobs.job_id::text AS job_id, jobs.task_id, jobs.creator_id, "
-                    "           MAX(outputs.created_at) AS latest_output_created_at, "
-                    "           ROW_NUMBER() OVER ("
-                    "               PARTITION BY jobs.creator_id, jobs.task_id "
-                    "               ORDER BY MAX(outputs.created_at) DESC NULLS LAST, jobs.job_id DESC"
-                    "           ) AS recency_rank "
-                    "    FROM conversion_jobs AS jobs "
-                    "    JOIN api_completed_jobs AS api_jobs "
-                    "      ON jobs.job_id::text = api_jobs.job_id "
-                    "    JOIN conversion_outputs AS outputs "
-                    "      ON outputs.job_id = jobs.job_id "
-                    "     AND outputs.task_id = jobs.task_id "
-                    "     AND outputs.kind = %s "
-                    "    WHERE jobs.status = %s AND jobs.creator_id IS NOT NULL"
-                    "    GROUP BY jobs.job_id, jobs.task_id, jobs.creator_id"
                     "), latest_jobs AS ("
-                    "    SELECT job_id, task_id, creator_id "
-                    "    FROM completed_jobs WHERE recency_rank = 1"
+                    "    SELECT jobs.job_id::text AS job_id, jobs.task_id, jobs.creator_id "
+                    "    FROM conversion_jobs AS jobs "
+                    "    JOIN selected_jobs AS selected "
+                    "      ON jobs.job_id::text = selected.job_id "
+                    "    WHERE jobs.status = %s AND jobs.creator_id IS NOT NULL"
                     "), episode_durations AS ("
                     "    SELECT outputs.job_id::text AS job_id, outputs.task_id, "
                    "           outputs.episode_id, MAX(outputs.duration_sec) AS duration_sec "
@@ -1377,21 +1384,21 @@ class TestWorkbenchData:
                     "       SUM(duration_sec) AS duration_sec "
                     "FROM job_statistics "
                     "GROUP BY creator_id",
-                    (list(completed_jobs), "video", "completed", "video", "episode"),
+                    (list(selected_jobs), "completed", "video", "episode"),
                 )
                 columns = [description[0] for description in cursor.description]
                 rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
         except Exception as exc:
             pytest.fail(f"查询人员转换 Episode 统计失败：{exc}")
 
-        expected_task_ids = completed_jobs
+        expected_task_ids = selected_jobs
         found_jobs = set()
         try:
             with self._postgres_connection() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT job_id::text, task_id::text FROM conversion_jobs "
                     "WHERE job_id::text = ANY(%s) AND status = %s",
-                    (list(completed_jobs), "completed"),
+                    (list(selected_jobs), "completed"),
                 )
                 found_jobs = {
                     str(job_id): str(task_id)
@@ -1413,8 +1420,13 @@ class TestWorkbenchData:
         return {
             str(row["user_id"]): {
                 "episode_count": int(row["episode_count"] or 0),
-                "episode_duration_sec": Decimal(str(row["duration_sec"] or 0)),
-                "conversion_duration_sec": Decimal(str(row["duration_sec"] or 0)),
+                # 与步骤5一致：所有 Episode 时长先累加，最后统一四舍五入到两位小数。
+                "episode_duration_sec": Decimal(str(row["duration_sec"] or 0)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                ),
+                "conversion_duration_sec": Decimal(str(row["duration_sec"] or 0)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                ),
             }
             for row in rows
         }
