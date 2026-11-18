@@ -3,26 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import configparser
+from common.project_config import load_project_config
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
-
-S3_DOWNLOAD_URL_TEMPLATE = (
-    "http://172.16.166.105:9001/api/v1/buckets/vla-label-studio/objects/download"
-    "?prefix={task_no}%2Ffinal-data%2F{folder}%2Fdata%2Fchunk-000%2Fepisode_000000.parquet"
-)
 
 
 def load_s3_login_config(project_root: Path | None = None) -> tuple[str, str, str]:
     """读取当前环境对应的 MinIO 控制台地址与登录凭据。"""
     project_root = project_root or Path(__file__).resolve().parent.parent
-    config_path = project_root / "config" / "env_config.ini"
-
-    config = configparser.ConfigParser()
-    if not config.read(config_path, encoding="utf-8"):
-        raise FileNotFoundError(f"未找到配置文件: {config_path}")
+    config = load_project_config(project_root)
 
     execution_env = config.get("environment", "execution_env", fallback="").strip().lower()
     section = f"{execution_env}-vla"
@@ -80,11 +71,7 @@ def normalize_folder(folder: str) -> str:
 
 def load_task_no_from_env_config(project_root: Path | None = None) -> str:
     project_root = project_root or Path(__file__).resolve().parent.parent
-    config_path = project_root / "config" / "env_config.ini"
-
-    config = configparser.ConfigParser()
-    if not config.read(config_path, encoding="utf-8"):
-        raise FileNotFoundError(f"未找到配置文件: {config_path}")
+    config = load_project_config(project_root)
 
     execution_env = config.get("environment", "execution_env", fallback="").strip().lower()
     if execution_env not in {"dev", "fat", "prod"}:
@@ -101,10 +88,17 @@ def load_task_no_from_env_config(project_root: Path | None = None) -> str:
     return task_no
 
 
-def build_parquet_download_url(task_no: str, folder: str) -> str:
-    """按固定模板替换 task_no 和 folder，不改动 URL 编码格式。"""
+def build_parquet_download_url(task_no: str, folder: str, project_root: Path | None = None) -> str:
+    """使用当前环境的控制台地址和存储桶构造下载地址。"""
+    config = load_project_config(project_root)
+    section = f"{config.get('environment', 'execution_env')}-vla"
+    console_endpoint, _, _ = load_s3_login_config(project_root)
+    bucket = config.get(section, "s3_bucket", fallback="").strip()
+    if not bucket:
+        raise ValueError("Missing s3_bucket in local settings or VLA_S3_BUCKET")
     normalized_folder = normalize_folder(folder)
-    return S3_DOWNLOAD_URL_TEMPLATE.format(task_no=task_no, folder=normalized_folder)
+    prefix = f"{task_no}/final-data/{normalized_folder}/data/chunk-000/episode_000000.parquet"
+    return f"{console_endpoint}/api/v1/buckets/{quote(bucket, safe='')}/objects/download?prefix={quote(prefix, safe='')}"
 
 
 def download_converted_parquet(

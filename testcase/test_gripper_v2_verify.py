@@ -1,6 +1,6 @@
 """夹爪数据 V2 任务校验流程。"""
 
-import configparser
+from common.project_config import load_project_config
 import json
 import os
 import random
@@ -58,11 +58,7 @@ _last_snowflake_13 = 0
 def load_task_context():
     """读取执行环境、任务号和通用 S3 连接配置。"""
     project_root = Path(__file__).resolve().parent.parent
-    config_path = project_root / "config" / "env_config.ini"
-
-    config = configparser.ConfigParser()
-    if not config.read(config_path, encoding="utf-8"):
-        raise FileNotFoundError(f"未找到配置文件: {config_path}")
+    config = load_project_config(project_root)
 
     execution_env = config.get("environment", "execution_env", fallback="").strip().lower()
     if execution_env not in {"dev", "fat", "prod"}:

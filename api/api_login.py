@@ -3,13 +3,10 @@ VLA登录环境封装
 """
 import time
 import requests
-import configparser
-from pathlib import Path
+from common.project_config import load_project_config
 
 # 读取配置
-config = configparser.ConfigParser()
-config_path = Path(__file__).resolve().parent.parent / "config" / "env_config.ini"
-config.read(config_path, encoding="utf-8")
+config = load_project_config()
 
 env = config.get("environment", "execution_env", fallback="").strip().lower()
 if env not in {"dev", "fat", "prod"}:
@@ -19,25 +16,10 @@ section = f"{env}-vla"
 if not config.has_section(section):
     raise ValueError(f"配置文件缺少节: [{section}]")
 
-env_login_map = {
-    "prod": {
-        "token_url": "",
-        "url": "",
-    },
-    "fat": {
-        "token_url": "https://fat-vla-gw.svfactory.com:6143/api/v1/auth/login",
-        "url": "https://fat-vla-gw.svfactory.com:6143",
-    },
-    "dev": {
-        "token_url": "https://dev-vla-gw.svfactory.com:6143/api/v1/auth/login",
-        "url": "https://dev-vla-gw.svfactory.com:6143",
-    },
-}
-
-token_url = env_login_map[env]["token_url"]
-username = "linyucheng"
-password = "123456"
-url = env_login_map[env]["url"]
+url = config.get(section, "api_url", fallback="").rstrip("/")
+token_url = config.get(section, "token_url", fallback="") or (f"{url}/api/v1/auth/login" if url else "")
+username = config.get(section, "username", fallback="")
+password = config.get(section, "password", fallback="")
 
 
 class ApiLogin:
@@ -45,6 +27,8 @@ class ApiLogin:
         pass
 
     def login(self, max_retries=5, retry_delay=3, timeout=60):
+        if not all((url, token_url, username, password)):
+            raise ValueError("Configure API URL, username and password in local settings or VLA_* variables")
         login_data = {"username": username, "password": password}
         login_header = {"content-type": "application/json"}
 

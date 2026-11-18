@@ -27,3 +27,9 @@ config/cookie.txt
 .DS_Store
 Thumbs.db
 
+
+# Private connection settings
+config/*.local.ini
+.env
+.env.*
+!.env.example

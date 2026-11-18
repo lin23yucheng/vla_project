@@ -2,7 +2,7 @@
 
 import os
 import json
-import configparser
+from common.project_config import load_project_config
 import threading
 import time
 from contextlib import contextmanager
@@ -1145,12 +1145,8 @@ class TestWorkbenchData:
         cls.episode_count_recalculated = None
         cls.episode_duration_recalculated_sec = None
         cls.workforce_people = None
-        config_path = Path(__file__).resolve().parent.parent / "config" / "env_config.ini"
-        cls.config = configparser.ConfigParser()
-        if not cls.config.read(config_path, encoding="utf-8"):
-            pytest.fail(f"无法读取配置文件：{config_path}")
-        if not cls.config.has_section("fat-vla"):
-            pytest.fail("配置文件缺少 [fat-vla] 节")
+        cls.config = load_project_config()
+        cls.config_section = f"{cls.config.get('environment', 'execution_env')}-vla"
 
     @contextmanager
     def _postgres_connection(self):
@@ -1160,7 +1156,9 @@ class TestWorkbenchData:
         except ImportError:
             pytest.fail("缺少 PostgreSQL 驱动，请先安装 requirements.txt 中的 psycopg2-binary")
 
-        section = self.config["fat-vla"]
+        section = self.config[self.config_section]
+        if not all(section.get(key) for key in ("db_host", "db_user", "db_password", "db_name")):
+            pytest.fail("Configure database connection in local settings or VLA_DB_* variables")
         connection = psycopg2.connect(
             host=section.get("db_host"),
             port=section.getint("db_port", fallback=5432),

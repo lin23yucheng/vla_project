@@ -17,7 +17,7 @@ class S3McapConfig:
     endpoint_url: str
     access_key: str
     secret_key: str = field(repr=False)
-    bucket: str = "vla-label-studio"
+    bucket: str
     prefix: str = ""
     region: str | None = None
     read_ahead_bytes: int = DEFAULT_READ_AHEAD_BYTES
