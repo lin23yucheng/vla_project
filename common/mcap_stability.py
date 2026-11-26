@@ -502,6 +502,34 @@ def _anomaly(
     }
 
 
+def _ensure_failures_have_anomalies(
+    file_path: Path,
+    errors: list[str],
+    anomalies: list[dict[str, Any]],
+    camera_topics: list[str],
+) -> None:
+    for error in errors:
+        if any(
+            anomaly["anomaly_type"] in error
+            and str(anomaly["actual_value"]) in error
+            for anomaly in anomalies
+        ):
+            continue
+        topic = next((name for name in camera_topics if name in error), "")
+        anomalies.append(
+            _anomaly(
+                file_path,
+                topic,
+                "",
+                "",
+                None,
+                "结构性校验失败",
+                error,
+                "MCAP、metadata 与机器人相机配置一致",
+            )
+        )
+
+
 def load_robot_camera_config(config_path: str | Path) -> tuple[dict[str, str], list[str], list[str]]:
     """Load camera topic labels and configured action/state topics."""
     path = Path(config_path)
@@ -871,6 +899,7 @@ def audit_mcap_file(
             f"{anomaly['anomaly_type']}：实际值={anomaly['actual_value']}，"
             f"阈值={anomaly['threshold']}"
         )
+    _ensure_failures_have_anomalies(path, errors, anomalies, list(camera_labels))
     if not audit_config["header_and_log_share_clock"] and capture_record_delay:
         delay_interpretation = "时钟关系未确认，该差值仅作诊断"
     else:
@@ -1154,6 +1183,7 @@ def write_mcap_csv_reports(
                 camera = file_result["topics"][topic]
                 timing = camera["log_time"]
                 header = camera["header_stamp"]
+                coverage = file_result.get("four_camera_coverage") or {}
                 header_log_offsets = camera.get("header_log_offsets_ns", [])
                 writer.writerow(
                     {
@@ -1190,16 +1220,12 @@ def write_mcap_csv_reports(
                         "header_log_offset_p50_ms": _ms(_percentile(header_log_offsets, 0.5)),
                         "header_log_offset_p95_ms": _ms(_percentile(header_log_offsets, 0.95)),
                         "common_coverage_seconds": (
-                            file_result.get("four_camera_coverage", {}).get("common_duration_ns", 0) / 1e9
-                            if file_result.get("four_camera_coverage")
+                            coverage.get("common_duration_ns", 0) / 1e9
+                            if coverage
                             else None
                         ),
-                        "first_frame_spread_ms": _ms(
-                            file_result.get("four_camera_coverage", {}).get("first_frame_spread_ns")
-                        ),
-                        "last_frame_spread_ms": _ms(
-                            file_result.get("four_camera_coverage", {}).get("last_frame_spread_ns")
-                        ),
+                        "first_frame_spread_ms": _ms(coverage.get("first_frame_spread_ns")),
+                        "last_frame_spread_ms": _ms(coverage.get("last_frame_spread_ns")),
                         "sequence_check_available": file_result.get("sequence_check_available", False),
                         "status": "PASS" if file_result["is_valid"] else "FAIL",
                     }

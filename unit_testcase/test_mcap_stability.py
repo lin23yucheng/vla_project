@@ -9,6 +9,7 @@ from common.mcap_stability import (
     CAMERA_VIEW_ROLES,
     _four_camera_header_skew,
     _event_window_summaries,
+    _ensure_failures_have_anomalies,
     _is_image_schema,
     audit_mcap_file,
     load_robot_camera_config,
@@ -213,3 +214,83 @@ def test_csv_report_writer_creates_expected_headers(tmp_path):
             "file", "episode", "topic", "message_index", "event_index",
             "timestamp_ns", "anomaly_type", "actual_value", "threshold",
         ]
+
+
+def test_csv_summary_handles_missing_four_camera_coverage(tmp_path):
+    topic = "/cam_head/color_compressed"
+    timing = {
+        "observed_rate_hz": None,
+        "minimum_ns": None,
+        "maximum_ns": None,
+        "interval_p50_ns": None,
+        "interval_p95_ns": None,
+        "interval_p99_ns": None,
+        "interval_max_ns": None,
+        "out_of_order_count": 0,
+        "duplicate_count": 0,
+    }
+    result = {
+        "files": [
+            {
+                "file": "empty-camera.mcap",
+                "episode": 4,
+                "is_valid": False,
+                "anomalies": [],
+                "camera_topics": [topic],
+                "four_camera_coverage": None,
+                "topics": {
+                    topic: {
+                        "role": "主视角",
+                        "message_count": 0,
+                        "log_time": timing,
+                        "header_stamp": {"first_ns": None, "last_ns": None},
+                        "header_log_offsets_ns": [],
+                            "sixty_second_trend": [],
+                        "image_dimensions": {},
+                        "image_decode_failures": 1,
+                    }
+                },
+            }
+        ]
+    }
+
+    paths = write_mcap_csv_reports(result, tmp_path)
+
+    with Path(paths["summary_csv"]).open(encoding="utf-8-sig", newline="") as file:
+        row = next(csv.DictReader(file))
+    assert row["first_frame_spread_ms"] == ""
+    assert row["last_frame_spread_ms"] == ""
+    assert row["common_coverage_seconds"] == ""
+
+
+def test_structural_failures_are_written_to_anomalies_csv(tmp_path):
+    errors = [
+        "robot_config.yaml 配置但 MCAP 缺失相机 topic=/cam_head/color_compressed",
+        "MCAP summary 消息数不一致",
+        "相机 topic=/cam_head/color_compressed schema 不匹配",
+        "相机 topic=/cam_head/color_compressed 分辨率不一致",
+        "相机 topic=/cam_head/color_compressed 编码不一致",
+        "metadata.yaml 消息数不一致",
+    ]
+    anomalies = []
+    _ensure_failures_have_anomalies(
+        Path("capture.mcap"), errors, anomalies, ["/cam_head/color_compressed"]
+    )
+    result = {
+        "files": [
+            {
+                "file": "capture.mcap",
+                "episode": 2,
+                "anomalies": anomalies,
+                "camera_topics": [],
+            }
+        ]
+    }
+
+    paths = write_mcap_csv_reports(result, tmp_path)
+
+    with Path(paths["anomalies_csv"]).open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert len(rows) == len(errors)
+    assert all(row["anomaly_type"] == "结构性校验失败" for row in rows)
+    assert all(row["file"] == "capture.mcap" for row in rows)
