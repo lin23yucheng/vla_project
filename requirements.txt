@@ -6,6 +6,7 @@ Pillow==12.3.0
 av==17.1.0
 pyarrow==25.0.0
 minio==7.2.20
+PyYAML==6.0.2
 
 # 测试框架
 allure-pytest==2.16.0

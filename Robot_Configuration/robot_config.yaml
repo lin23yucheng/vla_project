@@ -1,0 +1,107 @@
+version: 1
+
+# 四路视频：均为 sensor_msgs/msg/CompressedImage，约 30fps
+cameras:
+  cam_left:
+    topic: /cam_left/color_compressed
+    label: 左腕相机
+  cam_right:
+    topic: /cam_right/color_compressed
+    label: 右腕相机
+  cam_head:
+    topic: /cam_head/color_compressed
+    label: 头部相机
+  cam_chest:
+    topic: /cam_chest/color_compressed
+    label: 胸部相机
+
+# action：source=joint_state 按 JointState.name[] 取索引；
+#         source=statistics 从 introspection 里按 {interface}.{joint}/{field} 提取。
+# 手臂/身体/头部/夹爪的指令值只在 introspection_data 里，
+# /left_gripper/joint_commands 这类话题只有一个夹爪关节，拿不到手臂关节。
+actions:
+  left_arm:
+    label: 左臂
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [left_joint1, left_joint2, left_joint3, left_joint4, left_joint5, left_joint6, left_joint7]
+    fields: [position, velocity]
+  right_arm:
+    label: 右臂
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [right_joint1, right_joint2, right_joint3, right_joint4, right_joint5, right_joint6, right_joint7]
+    fields: [position, velocity]
+  body:
+    label: 身体
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [body_joint1, body_joint2, body_joint3, body_joint4]
+    fields: [position]
+  head:
+    label: 头部
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [head_joint1, head_joint2]
+    fields: [position]
+  left_gripper:
+    label: 左夹爪
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [left_gripper_joint]
+    fields: [position]
+  right_gripper:
+    label: 右夹爪
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: command_interface
+    joints: [right_gripper_joint]
+    fields: [position]
+
+# state：与 action 同维度，改用 state_interface；state 侧三个字段都有
+states:
+  left_arm:
+    label: 左臂
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: state_interface
+    joints: [left_joint1, left_joint2, left_joint3, left_joint4, left_joint5, left_joint6, left_joint7]
+    fields: [position, velocity, effort]
+  right_arm:
+    label: 右臂
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: state_interface
+    joints: [right_joint1, right_joint2, right_joint3, right_joint4, right_joint5, right_joint6, right_joint7]
+    fields: [position, velocity, effort]
+  body:
+    label: 身体
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: state_interface
+    joints: [body_joint1, body_joint2, body_joint3, body_joint4]
+    fields: [position]
+  head:
+    label: 头部
+    source: statistics
+    topic: /controller_manager/introspection_data/full
+    interface: state_interface
+    joints: [head_joint1, head_joint2]
+    fields: [position]
+  left_gripper:
+    label: 左夹爪
+    source: joint_state
+    topic: /left_gripper/joint_states
+    joints: [gripper_joint]
+    fields: [position]
+  right_gripper:
+    label: 右夹爪
+    source: joint_state
+    topic: /right_gripper/joint_states
+    joints: [gripper_joint]
+    fields: [position]

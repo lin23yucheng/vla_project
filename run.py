@@ -23,7 +23,8 @@ TEST_FILES: List[str] = [
     # "testcase/test_gripper_v2_verify.py", # 夹爪v2数据验证
     # "testcase/test_shake_v3_verify.py",   # 摇操v3数据验证
     # "testcase/test_tianji_v2_verify.py",  # 天机v2数据验证
-    "testcase/test_business_api_workflow.py::TestWorkbenchData"  # 工作台数据验证
+    # "testcase/test_business_api_workflow.py::TestWorkbenchData",  # 工作台数据验证
+    "testcase/test_mcap_stability.py",  # 本地原始 MCAP 稳定性审计
     # "testcase/test_business_api_workflow.py"  # 业务API工作流
 ]
 
