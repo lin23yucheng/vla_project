@@ -1,10 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from common.mcap_stability import (
+    MAX_CAMERA_INTERVAL_NS,
     CAMERA_VIEW_ROLES,
     _four_camera_header_skew,
     _is_image_schema,
     load_robot_camera_config,
+    render_mcap_report,
     _timestamp_summary,
     _window_summaries,
 )
@@ -33,6 +37,12 @@ def test_window_summaries_split_long_capture_by_sixty_seconds():
         1_000_000_000,
         59_000_000_000,
     ]
+
+
+def test_camera_rate_tolerance_is_applied_as_thirty_plus_or_minus_five_fps():
+    assert MAX_CAMERA_INTERVAL_NS == 40_000_000
+    windows = _window_summaries([0, 33_333_333, 66_666_666])
+    assert windows[0]["observed_rate_hz"] == pytest.approx(30)
 
 
 def test_camera_roles_and_ros_image_schema_detection():
@@ -67,3 +77,51 @@ def test_robot_config_supplies_camera_topics_and_joint_state_topics():
     assert camera_labels["/cam_chest/color_compressed"] == "全景（胸部相机）"
     assert "/left_gripper/joint_states" in configured_topics
     assert camera_names == ["cam_chest", "cam_head", "cam_left", "cam_right"]
+
+
+def test_report_puts_verdict_and_camera_metrics_before_warnings():
+    result = {
+        "is_valid": True,
+        "root": "capture",
+        "robot_config": "robot_config.yaml",
+        "camera_fps_expectation": {
+            "target_fps": 30,
+            "accepted_range_fps": [25, 35],
+            "maximum_interval_ms": 40,
+        },
+        "file_count": 1,
+        "valid_file_count": 1,
+        "files": [
+            {
+                "episode": 7,
+                "file": "episode_7/rosbag_0.mcap",
+                "is_valid": True,
+                "camera_topics": ["/cam_head/color_compressed"],
+                "topics": {
+                    "/cam_head/color_compressed": {
+                        "role": "主视角（头部相机）",
+                        "message_count": 100,
+                        "image_dimensions": {"1280x720": 100},
+                        "image_decode_failures": 0,
+                        "log_time": {
+                            "observed_rate_hz": 30.0,
+                            "interval_p50_ns": 33_000_000,
+                            "interval_p95_ns": 34_000_000,
+                            "interval_p99_ns": 35_000_000,
+                            "interval_max_ns": 36_000_000,
+                        },
+                        "sixty_second_trend": [],
+                    }
+                },
+                "warnings": ["未安装夹爪"],
+                "errors": [],
+            }
+        ],
+    }
+
+    report = render_mcap_report(result)
+
+    assert report.index("原始 MCAP 稳定性审计：PASS") < report.index("主视角")
+    assert report.index("主视角") < report.index("数据提示")
+    assert "25-35 FPS" in report
+    assert "未安装夹爪" in report

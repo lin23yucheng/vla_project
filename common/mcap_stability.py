@@ -9,8 +9,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from mcap.reader import make_reader
 import yaml
+from mcap.reader import make_reader
 
 from common.extract_mcap_image import decode_image_for_preview, parse_ros2_image_message
 
@@ -29,6 +29,11 @@ CAMERA_TOPIC_PRIORITY = (
 )
 IMAGE_SCHEMA_SUFFIXES = ("/image", "/compressedimage")
 EXPECTED_CAMERA_SCHEMA = "sensor_msgs/msg/CompressedImage"
+EXPECTED_CAMERA_FPS = 30.0
+CAMERA_FPS_TOLERANCE = 5.0
+MIN_CAMERA_FPS = EXPECTED_CAMERA_FPS - CAMERA_FPS_TOLERANCE
+MAX_CAMERA_FPS = EXPECTED_CAMERA_FPS + CAMERA_FPS_TOLERANCE
+MAX_CAMERA_INTERVAL_NS = round(1_000_000_000 / MIN_CAMERA_FPS)
 TREND_WINDOW_NS = 60_000_000_000
 
 
@@ -121,6 +126,11 @@ def _window_summaries(timestamps: list[int]) -> list[dict[str, Any]]:
             "end_offset_seconds": (window_index + 1) * TREND_WINDOW_NS / 1_000_000_000,
             "message_count": window["message_count"],
             "interval_count": len(window["intervals_ns"]),
+            "observed_rate_hz": (
+                1_000_000_000 / (sum(window["intervals_ns"]) / len(window["intervals_ns"]))
+                if window["intervals_ns"]
+                else None
+            ),
             "interval_mean_ns": (
                 sum(window["intervals_ns"]) / len(window["intervals_ns"])
                 if window["intervals_ns"]
@@ -385,6 +395,18 @@ def audit_mcap_file(
             errors.append(
                 f"相机 topic={topic} schema 应为 {EXPECTED_CAMERA_SCHEMA}，实际为 {sorted(schemas)}"
             )
+        dimensions = topic_results[topic]["image_dimensions"]
+        if len(dimensions) != 1:
+            errors.append(
+                f"相机 topic={topic} 图像分辨率在本轮采集中不一致或没有成功解码帧: "
+                f"{dimensions}"
+            )
+        encodings = topic_results[topic]["image_encodings"]
+        if len(encodings) != 1:
+            errors.append(
+                f"相机 topic={topic} 解码图像格式在本轮采集中不一致或没有成功解码帧: "
+                f"{encodings}"
+            )
     yaml_message_count = (
         rosbag_metadata["file_message_count"]
         if rosbag_metadata and rosbag_metadata["file_message_count"] is not None
@@ -424,6 +446,31 @@ def audit_mcap_file(
     for topic in camera_topics:
         log_time = topic_results[topic]["log_time"]
         header_stamp = topic_results[topic]["header_stamp"]
+        if log_time["observed_rate_hz"] is None:
+            errors.append(f"相机 topic={topic} 消息不足，无法计算有效帧率")
+        elif not MIN_CAMERA_FPS <= log_time["observed_rate_hz"] <= MAX_CAMERA_FPS:
+            errors.append(
+                f"相机 topic={topic} 整段观测帧率 {log_time['observed_rate_hz']:.3f} FPS，"
+                f"超出允许范围 {MIN_CAMERA_FPS:.0f}-{MAX_CAMERA_FPS:.0f} FPS"
+            )
+        if (
+            log_time["interval_max_ns"] is not None
+            and log_time["interval_max_ns"] > MAX_CAMERA_INTERVAL_NS
+        ):
+            longest_gap = log_time["longest_gap"]
+            errors.append(
+                f"相机 topic={topic} 最大帧间隔 {log_time['interval_max_ns'] / 1_000_000:.3f} ms，"
+                f"超过 {MAX_CAMERA_INTERVAL_NS / 1_000_000:.3f} ms，"
+                f"区间 {longest_gap['start_ns']} 至 {longest_gap['end_ns']}"
+            )
+        for window in topic_results[topic]["sixty_second_trend"]:
+            window_rate = window["observed_rate_hz"]
+            if window_rate is not None and not MIN_CAMERA_FPS <= window_rate <= MAX_CAMERA_FPS:
+                errors.append(
+                    f"相机 topic={topic} 在 {window['start_offset_seconds']:.0f}-"
+                    f"{window['end_offset_seconds']:.0f}s 窗口帧率 {window_rate:.3f} FPS，"
+                    f"超出允许范围 {MIN_CAMERA_FPS:.0f}-{MAX_CAMERA_FPS:.0f} FPS"
+                )
         if log_time["out_of_order_count"] or log_time["duplicate_count"]:
             errors.append(
                 f"相机 topic={topic} 的 log_time 存在倒退"
@@ -525,9 +572,114 @@ def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
         "root": str(root_path),
         "robot_config": str(config_path),
         "configured_camera_names": camera_names,
+        "camera_fps_expectation": {
+            "target_fps": EXPECTED_CAMERA_FPS,
+            "tolerance_fps": CAMERA_FPS_TOLERANCE,
+            "accepted_range_fps": [MIN_CAMERA_FPS, MAX_CAMERA_FPS],
+            "maximum_interval_ms": MAX_CAMERA_INTERVAL_NS / 1_000_000,
+        },
         "file_count": len(files),
         "valid_file_count": sum(file["is_valid"] for file in files),
         "camera_episode_comparison": camera_trends,
         "files": files,
         "is_valid": all(file["is_valid"] for file in files),
     }
+
+
+def render_mcap_report(result: dict[str, Any]) -> str:
+    """Render a concise human-readable report while retaining raw JSON separately."""
+    expectation = result["camera_fps_expectation"]
+    status = "PASS" if result["is_valid"] else "FAIL"
+    lines = [
+        f"原始 MCAP 稳定性审计：{status}",
+        f"数据目录：{result['root']}",
+        f"机器人配置：{result['robot_config']}",
+        (
+            f"判定标准：目标 {expectation['target_fps']:.0f} FPS，允许 "
+            f"{expectation['accepted_range_fps'][0]:.0f}-"
+            f"{expectation['accepted_range_fps'][1]:.0f} FPS；"
+            f"单次最大帧间隔 {expectation['maximum_interval_ms']:.1f} ms"
+        ),
+        f"Episode 文件：{result['valid_file_count']}/{result['file_count']} 通过",
+    ]
+
+    for file_result in result["files"]:
+        episode = file_result.get("episode")
+        episode_label = f"Episode {episode}" if episode is not None else "Episode 未知"
+        episode_status = "PASS" if file_result.get("is_valid") else "FAIL"
+        lines.extend(
+            [
+                "",
+                f"{episode_label} [{episode_status}]",
+                f"文件：{file_result['file']}",
+                "视角 | 帧数 | FPS | 间隔 P50/P95/P99 | 最大间隔 | 分辨率 | 解码失败",
+            ]
+        )
+
+        for topic in file_result.get("camera_topics", []):
+            camera = file_result.get("topics", {}).get(topic)
+            if not camera:
+                continue
+            timing = camera["log_time"]
+            interval_values = [
+                timing.get("interval_p50_ns"),
+                timing.get("interval_p95_ns"),
+                timing.get("interval_p99_ns"),
+            ]
+            interval_text = "/".join(
+                f"{value / 1_000_000:.2f}"
+                if value is not None
+                else "N/A"
+                for value in interval_values
+            )
+            maximum_interval = timing.get("interval_max_ns")
+            maximum_text = (
+                f"{maximum_interval / 1_000_000:.2f} ms"
+                if maximum_interval is not None
+                else "N/A"
+            )
+            rate = timing.get("observed_rate_hz")
+            rate_text = f"{rate:.2f}" if rate is not None else "N/A"
+            dimensions = ", ".join(
+                f"{size} ({count})"
+                for size, count in sorted(camera.get("image_dimensions", {}).items())
+            ) or "无有效图像"
+            lines.append(
+                f"{camera.get('role') or topic} | {camera['message_count']} | "
+                f"{rate_text} | {interval_text} ms | {maximum_text} | "
+                f"{dimensions} | {camera.get('image_decode_failures', 'N/A')}"
+            )
+
+        relationship = file_result.get("four_camera_header_time_relationship")
+        if relationship:
+            lines.append(
+                "四路 header.stamp 最近帧差（同一时钟假设）: "
+                f"P50 {relationship['p50_ns'] / 1_000_000:.3f} ms, "
+                f"P95 {relationship['p95_ns'] / 1_000_000:.3f} ms, "
+                f"最大 {relationship['maximum_ns'] / 1_000_000:.3f} ms"
+            )
+
+        window_rows = []
+        for topic in file_result.get("camera_topics", []):
+            camera = file_result.get("topics", {}).get(topic, {})
+            for window in camera.get("sixty_second_trend", []):
+                rate = window.get("observed_rate_hz")
+                rate_text = f"{rate:.2f} FPS" if rate is not None else "N/A"
+                window_rows.append(
+                    f"{camera.get('role') or topic} "
+                    f"{window['start_offset_seconds']:.0f}-"
+                    f"{window['end_offset_seconds']:.0f}s {rate_text}"
+                )
+        if window_rows:
+            lines.append("60 秒窗口帧率：" + "; ".join(window_rows))
+
+        errors = file_result.get("errors", [])
+        warnings = file_result.get("warnings", [])
+        if errors:
+            lines.append("异常：")
+            lines.extend(f"  - {error}" for error in errors)
+        if warnings:
+            lines.append("数据提示（不计入相机审计失败）：")
+            lines.extend(f"  - {warning}" for warning in warnings)
+
+    return "\n".join(lines)
