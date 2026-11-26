@@ -86,6 +86,18 @@ Copy-Item config/env_config.ini config/env_config.local.ini
 
 Parquet 解析结果写入 `parquet_file/parquet_analysis.txt`。省略 `--file` 时，工具默认读取 `parquet_file/` 中最新的 Parquet 文件。
 
+## 原始 MCAP 稳定性审计
+
+将多个 episode 文件夹放在同一目录下，每个 episode 保留 `meta.json`、`rosbag/metadata.yaml` 和单个 MCAP 文件。可以通过独立命令指定本地目录：
+
+```powershell
+.\.venv\Scripts\python.exe -m common.mcap_stability --input-dir 'C:\path\to\episodes'
+```
+
+审计阈值位于 `config/mcap_audit_config.json`，与 `Robot_Configuration/robot_config.yaml` 分开维护。默认以 30 FPS、正负 5 FPS、60 秒统计窗口和 40 ms 最大帧间隔检查四路相机。帧间隔推算的缺帧数是估算值，MCAP 的 `CompressedImage` 消息没有序列号时不能精确确认丢帧。跨相机时间差和 `header.stamp` 到 `log_time` 的差值默认只作诊断，只有确认时钟条件后才可配置阈值判定。
+
+结果默认写入项目 `report/mcap_audit/summary.csv`、`window_summary.csv` 和 `anomalies.csv`，不会写入 MCAP 输入目录。也可用 `--output-dir` 指定报告目录，或用 `--audit-config` 指定另一份审计配置。pytest 入口仍可通过 `VLA_MCAP_ROOT` 和 `VLA_MCAP_REPORT_DIR` 指定输入及报告目录。
+
 ## 仓库结构
 
 ```text

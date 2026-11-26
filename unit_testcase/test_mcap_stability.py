@@ -1,14 +1,20 @@
 from pathlib import Path
 
+import csv
 import pytest
+from mcap.writer import Writer
 
 from common.mcap_stability import (
     MAX_CAMERA_INTERVAL_NS,
     CAMERA_VIEW_ROLES,
     _four_camera_header_skew,
+    _event_window_summaries,
     _is_image_schema,
+    audit_mcap_file,
     load_robot_camera_config,
+    load_audit_config,
     render_mcap_report,
+    write_mcap_csv_reports,
     _timestamp_summary,
     _window_summaries,
 )
@@ -84,6 +90,7 @@ def test_report_puts_verdict_and_camera_metrics_before_warnings():
         "is_valid": True,
         "root": "capture",
         "robot_config": "robot_config.yaml",
+        "audit_config": "mcap_audit_config.json",
         "camera_fps_expectation": {
             "target_fps": 30,
             "accepted_range_fps": [25, 35],
@@ -125,3 +132,84 @@ def test_report_puts_verdict_and_camera_metrics_before_warnings():
     assert report.index("主视角") < report.index("数据提示")
     assert "25-35 FPS" in report
     assert "未安装夹爪" in report
+
+
+def test_event_windows_report_gaps_timestamps_and_delay():
+    config = load_audit_config()
+    events = [
+        {
+            "log_time_ns": 1_000_000_000,
+            "header_stamp_ns": 999_000_000,
+            "header_valid": True,
+            "image_valid": True,
+        },
+        {
+            "log_time_ns": 1_100_000_000,
+            "header_stamp_ns": 1_099_000_000,
+            "header_valid": True,
+            "image_valid": False,
+        },
+    ]
+
+    windows = _event_window_summaries(events, config)
+
+    assert windows[0]["over_threshold_gap_count"] == 1
+    assert windows[0]["estimated_dropped_frames"] == 2
+    assert windows[0]["image_decode_failures"] == 1
+    assert windows[0]["record_delay_p50_ns"] == 1_000_000
+
+
+def test_raw_mcap_scan_detects_log_time_reversal_in_file_order(tmp_path):
+    topic = "/cam_head/color_compressed"
+    mcap_path = tmp_path / "reversed.mcap"
+    with mcap_path.open("wb") as stream:
+        writer = Writer(stream)
+        writer.start()
+        schema_id = writer.register_schema(
+            name="sensor_msgs/msg/CompressedImage",
+            encoding="ros2msg",
+            data=b"",
+        )
+        channel_id = writer.register_channel(
+            topic=topic,
+            message_encoding="cdr",
+            schema_id=schema_id,
+        )
+        for timestamp_ns in (2_000_000_000, 1_000_000_000, 1_100_000_000):
+            writer.add_message(
+                channel_id=channel_id,
+                log_time=timestamp_ns,
+                publish_time=timestamp_ns,
+                data=b"invalid image payload",
+            )
+        writer.finish()
+
+    result = audit_mcap_file(
+        mcap_path,
+        tmp_path,
+        {topic: "主视角"},
+        [],
+        load_audit_config(),
+    )
+
+    reversals = [
+        item for item in result["anomalies"] if item["anomaly_type"] == "log_time_ns 倒退"
+    ]
+    assert len(reversals) == 1
+    assert reversals[0]["message_index"] == 2
+    assert reversals[0]["event_index"] == 2
+    assert any(item["anomaly_type"] == "帧间隔超阈值（疑似丢帧）" for item in result["anomalies"])
+
+
+def test_csv_report_writer_creates_expected_headers(tmp_path):
+    paths = write_mcap_csv_reports(
+        {"files": [{"file": "bad.mcap", "episode": 1, "anomalies": []}]},
+        tmp_path,
+    )
+
+    assert all(Path(path).is_file() for path in paths.values())
+    with Path(paths["anomalies_csv"]).open(encoding="utf-8-sig", newline="") as file:
+        assert next(csv.reader(file)) == [
+            "file", "episode", "topic", "message_index", "event_index",
+            "timestamp_ns", "anomaly_type", "actual_value", "threshold",
+        ]

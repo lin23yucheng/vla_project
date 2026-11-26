@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import csv
+import argparse
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
@@ -29,17 +31,39 @@ CAMERA_TOPIC_PRIORITY = (
 )
 IMAGE_SCHEMA_SUFFIXES = ("/image", "/compressedimage")
 EXPECTED_CAMERA_SCHEMA = "sensor_msgs/msg/CompressedImage"
+DEFAULT_AUDIT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "mcap_audit_config.json"
+DEFAULT_REPORT_DIR = Path(__file__).resolve().parent.parent / "report" / "mcap_audit"
 EXPECTED_CAMERA_FPS = 30.0
 CAMERA_FPS_TOLERANCE = 5.0
 MIN_CAMERA_FPS = EXPECTED_CAMERA_FPS - CAMERA_FPS_TOLERANCE
 MAX_CAMERA_FPS = EXPECTED_CAMERA_FPS + CAMERA_FPS_TOLERANCE
-MAX_CAMERA_INTERVAL_NS = round(1_000_000_000 / MIN_CAMERA_FPS)
+MAX_CAMERA_INTERVAL_NS = 40_000_000
 TREND_WINDOW_NS = 60_000_000_000
 
 
 def _is_image_schema(schema_name: str | None) -> bool:
     normalized = (schema_name or "").strip().lower()
     return normalized.endswith(IMAGE_SCHEMA_SUFFIXES)
+
+
+def load_audit_config(config_path: str | Path = DEFAULT_AUDIT_CONFIG) -> dict[str, Any]:
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"MCAP 审计配置不存在: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+    target_fps = float(config["camera_fps_target"])
+    tolerance = float(config["camera_fps_tolerance"])
+    window_seconds = int(config["window_seconds"])
+    max_interval_ms = float(config["max_frame_interval_ms"])
+    if target_fps <= 0 or tolerance < 0 or window_seconds <= 0 or max_interval_ms <= 0:
+        raise ValueError("MCAP 审计配置中的 FPS、窗口长度和最大间隔必须为正数")
+    config["camera_fps_min"] = max(0.0, target_fps - tolerance)
+    config["camera_fps_max"] = target_fps + tolerance
+    config["window_ns"] = window_seconds * 1_000_000_000
+    config["max_frame_interval_ns"] = round(max_interval_ms * 1_000_000)
+    config["config_path"] = str(path)
+    return config
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -100,7 +124,83 @@ def _timestamp_summary(timestamps: list[int]) -> dict[str, Any]:
     }
 
 
-def _window_summaries(timestamps: list[int]) -> list[dict[str, Any]]:
+def _event_timestamp_anomalies(
+    events: list[dict[str, Any]],
+    file_path: Path,
+    topic: str,
+    timestamp_key: str,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    anomalies = []
+    previous = None
+    for event in events:
+        if timestamp_key == "header_stamp_ns" and not event.get("header_valid"):
+            continue
+        timestamp_ns = event[timestamp_key]
+        if timestamp_ns is None or timestamp_ns <= 0:
+            continue
+        if previous is not None:
+            previous_ns = previous[timestamp_key]
+            interval_ns = timestamp_ns - previous_ns
+            if interval_ns < 0:
+                anomalies.append(
+                    _anomaly(
+                        file_path,
+                        topic,
+                        event["message_index"],
+                        event["event_index"],
+                        timestamp_ns,
+                        f"{timestamp_key} 倒退",
+                        {"previous_ns": previous_ns, "current_ns": timestamp_ns},
+                        ">= previous timestamp",
+                    )
+                )
+            elif interval_ns == 0:
+                anomalies.append(
+                    _anomaly(
+                        file_path,
+                        topic,
+                        event["message_index"],
+                        event["event_index"],
+                        timestamp_ns,
+                        f"{timestamp_key} 重复",
+                        interval_ns,
+                        "> 0 ns",
+                    )
+                )
+            elif timestamp_key == "log_time_ns" and interval_ns > config["max_frame_interval_ns"]:
+                target_interval_ns = 1_000_000_000 / config["camera_fps_target"]
+                estimated_missing = (
+                    max(0, round(interval_ns / target_interval_ns) - 1)
+                    if config["estimate_dropped_frames"]
+                    else None
+                )
+                anomalies.append(
+                    _anomaly(
+                        file_path,
+                        topic,
+                        event["message_index"],
+                        event["event_index"],
+                        timestamp_ns,
+                        "帧间隔超阈值（疑似丢帧）",
+                        {
+                            "interval_ms": interval_ns / 1_000_000,
+                            "estimated_missing_frames": estimated_missing,
+                            "previous_timestamp_ns": previous_ns,
+                        },
+                        config["max_frame_interval_ms"],
+                    )
+                )
+        previous = event
+    return anomalies
+
+
+def _window_summaries(
+    timestamps: list[int],
+    window_ns: int = 60_000_000_000,
+    max_frame_interval_ns: int = 40_000_000,
+    target_fps: float = 30.0,
+) -> list[dict[str, Any]]:
     if not timestamps:
         return []
 
@@ -108,22 +208,28 @@ def _window_summaries(timestamps: list[int]) -> list[dict[str, Any]]:
     windows: dict[int, dict[str, Any]] = {}
     previous_ns = None
     for timestamp_ns in timestamps:
-        window_index = max(0, (timestamp_ns - origin_ns) // TREND_WINDOW_NS)
+        window_index = max(0, (timestamp_ns - origin_ns) // window_ns)
         window = windows.setdefault(
             window_index,
-            {"message_count": 0, "intervals_ns": []},
+            {"message_count": 0, "intervals_ns": [], "gap_events": []},
         )
         window["message_count"] += 1
         if previous_ns is not None:
             interval_ns = timestamp_ns - previous_ns
             if interval_ns > 0:
                 window["intervals_ns"].append(interval_ns)
+                if interval_ns > max_frame_interval_ns:
+                    estimated_missing = max(
+                        0,
+                        round(interval_ns / (1_000_000_000 / target_fps)) - 1,
+                    )
+                    window["gap_events"].append(estimated_missing)
         previous_ns = timestamp_ns
 
     return [
         {
-            "start_offset_seconds": window_index * TREND_WINDOW_NS / 1_000_000_000,
-            "end_offset_seconds": (window_index + 1) * TREND_WINDOW_NS / 1_000_000_000,
+            "start_offset_seconds": window_index * window_ns / 1_000_000_000,
+            "end_offset_seconds": (window_index + 1) * window_ns / 1_000_000_000,
             "message_count": window["message_count"],
             "interval_count": len(window["intervals_ns"]),
             "observed_rate_hz": (
@@ -136,13 +242,107 @@ def _window_summaries(timestamps: list[int]) -> list[dict[str, Any]]:
                 if window["intervals_ns"]
                 else None
             ),
+            "interval_p50_ns": _percentile(window["intervals_ns"], 0.50),
             "interval_p95_ns": _percentile(window["intervals_ns"], 0.95),
+            "interval_p99_ns": _percentile(window["intervals_ns"], 0.99),
             "interval_max_ns": max(window["intervals_ns"])
             if window["intervals_ns"]
             else None,
+            "over_threshold_gap_count": len(window["gap_events"]),
+            "estimated_dropped_frames": sum(window["gap_events"]),
         }
         for window_index, window in sorted(windows.items())
     ]
+
+
+def _event_window_summaries(
+    events: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    valid_log_times = [event["log_time_ns"] for event in events if event["log_time_ns"] > 0]
+    if not valid_log_times:
+        return []
+    origin_ns = min(valid_log_times)
+    windows: dict[int, dict[str, Any]] = {}
+    previous = None
+    for event in events:
+        log_time_ns = event["log_time_ns"]
+        window_index = max(0, (log_time_ns - origin_ns) // config["window_ns"])
+        window = windows.setdefault(
+            window_index,
+            {
+                "message_count": 0,
+                "intervals_ns": [],
+                "over_threshold_gap_count": 0,
+                "estimated_dropped_frames": 0,
+                "timestamp_reversal_count": 0,
+                "timestamp_duplicate_count": 0,
+                "invalid_log_time_count": 0,
+                "invalid_header_stamp_count": 0,
+                "image_decode_failures": 0,
+                "record_delay_ns": [],
+                "timestamps": [],
+            },
+        )
+        window["message_count"] += 1
+        if log_time_ns <= 0:
+            window["invalid_log_time_count"] += 1
+        else:
+            window["timestamps"].append(log_time_ns)
+        if event.get("image_valid") is False:
+            window["image_decode_failures"] += 1
+        if event.get("header_stamp_ns") is not None and not event.get("header_valid"):
+            window["invalid_header_stamp_count"] += 1
+        if event.get("header_valid"):
+            window["record_delay_ns"].append(log_time_ns - event["header_stamp_ns"])
+        if previous is not None and log_time_ns > 0 and previous["log_time_ns"] > 0:
+            interval_ns = log_time_ns - previous["log_time_ns"]
+            if interval_ns < 0:
+                window["timestamp_reversal_count"] += 1
+            elif interval_ns == 0:
+                window["timestamp_duplicate_count"] += 1
+            else:
+                window["intervals_ns"].append(interval_ns)
+                if interval_ns > config["max_frame_interval_ns"]:
+                    window["over_threshold_gap_count"] += 1
+                    if config["estimate_dropped_frames"]:
+                        window["estimated_dropped_frames"] += max(
+                            0,
+                            round(interval_ns / (1_000_000_000 / config["camera_fps_target"])) - 1,
+                        )
+        previous = event
+
+    results = []
+    for index, window in sorted(windows.items()):
+        intervals = window["intervals_ns"]
+        delays = window["record_delay_ns"]
+        results.append(
+            {
+                "start_offset_seconds": index * config["window_seconds"],
+                "end_offset_seconds": (index + 1) * config["window_seconds"],
+                "message_count": window["message_count"],
+                "interval_count": len(intervals),
+                "observed_rate_hz": 1e9 / (sum(intervals) / len(intervals)) if intervals else None,
+                "interval_mean_ns": sum(intervals) / len(intervals) if intervals else None,
+                "interval_p50_ns": _percentile(intervals, 0.5),
+                "interval_p95_ns": _percentile(intervals, 0.95),
+                "interval_p99_ns": _percentile(intervals, 0.99),
+                "interval_max_ns": max(intervals) if intervals else None,
+                "over_threshold_gap_count": window["over_threshold_gap_count"],
+                "estimated_dropped_frames": window["estimated_dropped_frames"],
+                "timestamp_reversal_count": window["timestamp_reversal_count"],
+                "timestamp_duplicate_count": window["timestamp_duplicate_count"],
+                "invalid_log_time_count": window["invalid_log_time_count"],
+                "invalid_header_stamp_count": window["invalid_header_stamp_count"],
+                "image_decode_failures": window["image_decode_failures"],
+                "first_log_time_ns": min(window["timestamps"]) if window["timestamps"] else None,
+                "last_log_time_ns": max(window["timestamps"]) if window["timestamps"] else None,
+                "record_delay_p50_ns": _percentile(delays, 0.5),
+                "record_delay_p95_ns": _percentile(delays, 0.95),
+                "record_delay_max_ns": max(delays) if delays else None,
+            }
+        )
+    return results
 
 
 def _four_camera_header_skew(header_times: dict[str, list[int]]) -> dict[str, Any] | None:
@@ -177,6 +377,33 @@ def _four_camera_header_skew(header_times: dict[str, list[int]]) -> dict[str, An
         "p99_ns": _percentile(skews_ns, 0.99),
         "maximum_ns": max(skews_ns),
     }
+
+
+def _four_camera_skew_windows(
+    header_times: dict[str, list[int]],
+    window_ns: int,
+) -> list[dict[str, Any]]:
+    available = [timestamp for values in header_times.values() for timestamp in values]
+    if len(header_times) != 4 or not available:
+        return []
+    origin_ns = min(available)
+    buckets: dict[int, dict[str, list[int]]] = {}
+    for topic, timestamps in header_times.items():
+        for timestamp_ns in timestamps:
+            index = max(0, (timestamp_ns - origin_ns) // window_ns)
+            buckets.setdefault(index, {}).setdefault(topic, []).append(timestamp_ns)
+    windows = []
+    for index, topics in sorted(buckets.items()):
+        skew = _four_camera_header_skew(topics)
+        if skew is not None:
+            windows.append(
+                {
+                    "start_offset_seconds": index * window_ns / 1_000_000_000,
+                    "end_offset_seconds": (index + 1) * window_ns / 1_000_000_000,
+                    **skew,
+                }
+            )
+    return windows
 
 
 def _load_episode_metadata(mcap_path: Path, root: Path) -> dict[str, Any] | None:
@@ -249,6 +476,29 @@ def _new_topic_record() -> dict[str, Any]:
         "image_decode_failures": 0,
         "image_dimensions": Counter(),
         "image_encodings": Counter(),
+        "events": [],
+    }
+
+
+def _anomaly(
+    file_path: Path,
+    topic: str,
+    message_index: int,
+    event_index: int,
+    timestamp_ns: int | None,
+    kind: str,
+    actual: Any,
+    threshold: Any = None,
+) -> dict[str, Any]:
+    return {
+        "file": str(file_path),
+        "topic": topic,
+        "message_index": message_index,
+        "event_index": event_index,
+        "timestamp_ns": timestamp_ns,
+        "anomaly_type": kind,
+        "actual_value": actual,
+        "threshold": threshold,
     }
 
 
@@ -294,12 +544,14 @@ def audit_mcap_file(
     root: str | Path,
     camera_labels: dict[str, str],
     configured_topics: list[str],
+    audit_config: dict[str, Any],
 ) -> dict[str, Any]:
     """Read one MCAP to EOF, checking CRCs, topics, timestamps, and image decoding."""
     path = Path(mcap_path)
     root_path = Path(root)
     topics: dict[str, dict[str, Any]] = {}
     total_messages = 0
+    anomalies: list[dict[str, Any]] = []
 
     with path.open("rb") as stream:
         reader = make_reader(stream, validate_crcs=True)
@@ -310,15 +562,40 @@ def audit_mcap_file(
             else None
         )
 
-        for schema, channel, message in reader.iter_messages():
+        for schema, channel, message in reader.iter_messages(log_time_order=False):
             total_messages += 1
             topic = channel.topic
             record = topics.setdefault(topic, _new_topic_record())
             record["message_count"] += 1
-            record["log_times"].append(int(message.log_time))
+            message_index = record["message_count"]
+            log_time_ns = int(message.log_time)
+            publish_time_ns = int(message.publish_time)
+            record["log_times"].append(log_time_ns)
             schema_name = schema.name if schema is not None else None
             if schema_name:
                 record["schemas"].add(schema_name)
+
+            event = {
+                "message_index": message_index,
+                "event_index": total_messages,
+                "log_time_ns": log_time_ns,
+                "publish_time_ns": publish_time_ns,
+                "header_stamp_ns": None,
+                "header_valid": None,
+                "sequence": None,
+                "image_valid": None,
+            }
+            record["events"].append(event)
+            if topic in camera_labels and log_time_ns <= 0:
+                anomalies.append(
+                    _anomaly(path, topic, message_index, total_messages, log_time_ns,
+                             "非法 log_time", log_time_ns, "> 0")
+                )
+            if topic in camera_labels and publish_time_ns <= 0:
+                anomalies.append(
+                    _anomaly(path, topic, message_index, total_messages, publish_time_ns,
+                             "非法 publish_time", publish_time_ns, "> 0")
+                )
 
             if not _is_image_schema(schema_name):
                 continue
@@ -326,21 +603,50 @@ def audit_mcap_file(
             image_info = parse_ros2_image_message(message.data, schema_name)
             if image_info is None:
                 record["image_decode_failures"] += 1
+                event["image_valid"] = False
+                anomalies.append(
+                    _anomaly(path, topic, message_index, total_messages, log_time_ns,
+                             "图像消息无法解析", len(message.data), "有效 ROS 图像消息")
+                )
                 continue
 
+            stamp_sec = int(image_info["header_stamp_sec"])
+            stamp_nanosec = int(image_info["header_stamp_nanosec"])
+            header_ns = stamp_sec * 1_000_000_000 + stamp_nanosec
+            event["header_stamp_ns"] = header_ns
+            event["image_valid"] = True
+            event["header_valid"] = (
+                stamp_sec >= 0
+                and 0 <= stamp_nanosec < 1_000_000_000
+                and header_ns > 0
+            )
+            if not event["header_valid"]:
+                anomalies.append(
+                    _anomaly(
+                        path,
+                        topic,
+                        message_index,
+                        total_messages,
+                        header_ns,
+                        "非法 header.stamp",
+                        {"sec": stamp_sec, "nanosec": stamp_nanosec},
+                        "sec >= 0, 0 <= nanosec < 1e9, timestamp > 0",
+                    )
+                )
             try:
                 preview = decode_image_for_preview(image_info)
             except Exception:
                 record["image_decode_failures"] += 1
+                event["image_valid"] = False
+                anomalies.append(
+                    _anomaly(path, topic, message_index, total_messages, log_time_ns,
+                             "图像解码失败", image_info.get("data_length"), "可解码图像")
+                )
                 continue
 
             record["image_dimensions"][f"{preview.width}x{preview.height}"] += 1
             record["image_encodings"][image_info["encoding"]] += 1
-            header_ns = (
-                int(image_info["header_stamp_sec"]) * 1_000_000_000
-                + int(image_info["header_stamp_nanosec"])
-            )
-            if header_ns > 0:
+            if event["header_valid"]:
                 record["header_times"].append(header_ns)
 
     metadata = _load_episode_metadata(path, root_path)
@@ -375,10 +681,17 @@ def audit_mcap_file(
         }
         if is_camera:
             result["header_stamp"] = _timestamp_summary(record["header_times"])
-            result["sixty_second_trend"] = _window_summaries(record["log_times"])
+            result["sixty_second_trend"] = _event_window_summaries(
+                record["events"], audit_config
+            )
             result["image_decode_failures"] = record["image_decode_failures"]
             result["image_dimensions"] = dict(record["image_dimensions"])
             result["image_encodings"] = dict(record["image_encodings"])
+            result["header_log_offsets_ns"] = [
+                event["log_time_ns"] - event["header_stamp_ns"]
+                for event in record["events"]
+                if event.get("header_valid")
+            ]
             image_decode_failures += record["image_decode_failures"]
         topic_results[topic] = result
 
@@ -390,6 +703,16 @@ def audit_mcap_file(
     if missing_camera_topics:
         errors.append(f"robot_config.yaml 配置但 MCAP 缺失或非图像格式的相机 topic: {missing_camera_topics}")
     for topic in camera_topics:
+        anomalies.extend(
+            _event_timestamp_anomalies(
+                topics[topic]["events"], path, topic, "log_time_ns", audit_config
+            )
+        )
+        anomalies.extend(
+            _event_timestamp_anomalies(
+                topics[topic]["events"], path, topic, "header_stamp_ns", audit_config
+            )
+        )
         schemas = topics[topic]["schemas"]
         if schemas != {EXPECTED_CAMERA_SCHEMA}:
             errors.append(
@@ -443,50 +766,128 @@ def audit_mcap_file(
             f"{metadata_only_topics_not_recorded}"
         )
 
-    for topic in camera_topics:
-        log_time = topic_results[topic]["log_time"]
-        header_stamp = topic_results[topic]["header_stamp"]
-        if log_time["observed_rate_hz"] is None:
-            errors.append(f"相机 topic={topic} 消息不足，无法计算有效帧率")
-        elif not MIN_CAMERA_FPS <= log_time["observed_rate_hz"] <= MAX_CAMERA_FPS:
-            errors.append(
-                f"相机 topic={topic} 整段观测帧率 {log_time['observed_rate_hz']:.3f} FPS，"
-                f"超出允许范围 {MIN_CAMERA_FPS:.0f}-{MAX_CAMERA_FPS:.0f} FPS"
-            )
-        if (
-            log_time["interval_max_ns"] is not None
-            and log_time["interval_max_ns"] > MAX_CAMERA_INTERVAL_NS
-        ):
-            longest_gap = log_time["longest_gap"]
-            errors.append(
-                f"相机 topic={topic} 最大帧间隔 {log_time['interval_max_ns'] / 1_000_000:.3f} ms，"
-                f"超过 {MAX_CAMERA_INTERVAL_NS / 1_000_000:.3f} ms，"
-                f"区间 {longest_gap['start_ns']} 至 {longest_gap['end_ns']}"
-            )
-        for window in topic_results[topic]["sixty_second_trend"]:
-            window_rate = window["observed_rate_hz"]
-            if window_rate is not None and not MIN_CAMERA_FPS <= window_rate <= MAX_CAMERA_FPS:
-                errors.append(
-                    f"相机 topic={topic} 在 {window['start_offset_seconds']:.0f}-"
-                    f"{window['end_offset_seconds']:.0f}s 窗口帧率 {window_rate:.3f} FPS，"
-                    f"超出允许范围 {MIN_CAMERA_FPS:.0f}-{MAX_CAMERA_FPS:.0f} FPS"
-                )
-        if log_time["out_of_order_count"] or log_time["duplicate_count"]:
-            errors.append(
-                f"相机 topic={topic} 的 log_time 存在倒退"
-                f"{log_time['out_of_order_count']} 次或重复 {log_time['duplicate_count']} 次"
-            )
-        if header_stamp["out_of_order_count"] or header_stamp["duplicate_count"]:
-            errors.append(
-                f"相机 topic={topic} 的 header.stamp 存在倒退"
-                f"{header_stamp['out_of_order_count']} 次或重复 {header_stamp['duplicate_count']} 次"
-            )
-
     camera_header_times = {
         topic: topics[topic]["header_times"]
         for topic in camera_topics
     }
     camera_time_relationship = _four_camera_header_skew(camera_header_times)
+    camera_skew_windows = _four_camera_skew_windows(
+        camera_header_times, audit_config["window_ns"]
+    )
+    if audit_config["max_cross_camera_skew_ms"] is not None:
+        skew_limit_ns = audit_config["max_cross_camera_skew_ms"] * 1_000_000
+        for window in camera_skew_windows:
+            if window["maximum_ns"] > skew_limit_ns:
+                anomalies.append(
+                    _anomaly(
+                        path,
+                        "四路相机",
+                        0,
+                        0,
+                        None,
+                        "窗口相机时间差超阈值",
+                        {
+                            "window_start_seconds": window["start_offset_seconds"],
+                            "maximum_skew_ms": window["maximum_ns"] / 1_000_000,
+                        },
+                        audit_config["max_cross_camera_skew_ms"],
+                    )
+                )
+    for topic in camera_topics:
+        timing = topic_results[topic]["log_time"]
+        if timing["observed_rate_hz"] is None:
+            errors.append(f"相机 topic={topic} 消息不足，无法计算有效帧率")
+        elif not audit_config["camera_fps_min"] <= timing["observed_rate_hz"] <= audit_config["camera_fps_max"]:
+            anomalies.append(
+                _anomaly(
+                    path, topic, 0, 0, timing["first_ns"], "整段帧率超范围",
+                    timing["observed_rate_hz"],
+                    [audit_config["camera_fps_min"], audit_config["camera_fps_max"]],
+                )
+            )
+            errors.append(
+                f"相机 topic={topic} 整段观测帧率 {timing['observed_rate_hz']:.3f} FPS，"
+                f"超出允许范围 {audit_config['camera_fps_min']:.0f}-"
+                f"{audit_config['camera_fps_max']:.0f} FPS"
+            )
+        for window in topic_results[topic]["sixty_second_trend"]:
+            window_rate = window["observed_rate_hz"]
+            if window_rate is not None and not audit_config["camera_fps_min"] <= window_rate <= audit_config["camera_fps_max"]:
+                anomalies.append(
+                    _anomaly(
+                        path, topic, 0, 0, None, "窗口帧率超范围",
+                        {
+                            "window_start_seconds": window["start_offset_seconds"],
+                            "fps": window_rate,
+                        },
+                        [audit_config["camera_fps_min"], audit_config["camera_fps_max"]],
+                    )
+                )
+                errors.append(
+                    f"相机 topic={topic} 在 {window['start_offset_seconds']:.0f}-"
+                    f"{window['end_offset_seconds']:.0f}s 窗口帧率 {window_rate:.3f} FPS 超出范围"
+                )
+    delay_values = [
+        event["log_time_ns"] - event["header_stamp_ns"]
+        for topic in camera_topics
+        for event in topics[topic]["events"]
+        if event.get("header_valid")
+    ]
+    capture_record_delay = (
+        {
+            "sample_count": len(delay_values),
+            "minimum_ns": min(delay_values),
+            "p50_ns": _percentile(delay_values, 0.5),
+            "p95_ns": _percentile(delay_values, 0.95),
+            "p99_ns": _percentile(delay_values, 0.99),
+            "maximum_ns": max(delay_values),
+            "negative_count": sum(value < 0 for value in delay_values),
+        }
+        if delay_values
+        else None
+    )
+    if (
+        capture_record_delay
+        and audit_config["header_and_log_share_clock"]
+        and audit_config["max_capture_record_delay_ms"] is not None
+    ):
+        threshold_ns = audit_config["max_capture_record_delay_ms"] * 1_000_000
+        for topic in camera_topics:
+            for event in topics[topic]["events"]:
+                header_ns = event["header_stamp_ns"]
+                if not event.get("header_valid"):
+                    continue
+                delay_ns = event["log_time_ns"] - header_ns
+                if delay_ns > threshold_ns:
+                    anomalies.append(
+                        _anomaly(path, topic, event["message_index"], event["event_index"],
+                                 event["log_time_ns"], "采集到记录延迟超阈值",
+                                 delay_ns / 1_000_000,
+                                 audit_config["max_capture_record_delay_ms"])
+                    )
+    for anomaly in anomalies:
+        errors.append(
+            f"{anomaly['topic']} 消息#{anomaly['message_index']} "
+            f"{anomaly['anomaly_type']}：实际值={anomaly['actual_value']}，"
+            f"阈值={anomaly['threshold']}"
+        )
+    if not audit_config["header_and_log_share_clock"] and capture_record_delay:
+        delay_interpretation = "时钟关系未确认，该差值仅作诊断"
+    else:
+        delay_interpretation = "按配置的共同时钟假设解释为采集到记录时间差"
+
+    coverage = {}
+    for topic in camera_topics:
+        header_summary = topic_results[topic]["header_stamp"]
+        coverage[topic] = {
+            "first_ns": header_summary["first_ns"],
+            "last_ns": header_summary["last_ns"],
+            "duration_ns": (
+                header_summary["last_ns"] - header_summary["first_ns"]
+                if header_summary["first_ns"] is not None and header_summary["last_ns"] is not None
+                else None
+            ),
+        }
 
     return {
         "file": str(path),
@@ -506,6 +907,13 @@ def audit_mcap_file(
         "missing_camera_topics": missing_camera_topics,
         "image_decode_failures": image_decode_failures,
         "four_camera_header_time_relationship": camera_time_relationship,
+        "four_camera_skew_windows": camera_skew_windows,
+        "camera_coverage": coverage,
+        "capture_record_delay": capture_record_delay,
+        "capture_record_delay_interpretation": delay_interpretation,
+        "sequence_check_available": False,
+        "sequence_check_note": "sensor_msgs/msg/CompressedImage 的 Header 不包含序列号，无法据此确认丢帧",
+        "anomalies": anomalies,
         "topics": topic_results,
         "warnings": warnings,
         "errors": errors,
@@ -513,7 +921,11 @@ def audit_mcap_file(
     }
 
 
-def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
+def audit_mcap_directory(
+    root: str | Path,
+    audit_config_path: str | Path = DEFAULT_AUDIT_CONFIG,
+    report_dir: str | Path | None = None,
+) -> dict[str, Any]:
     """Audit every MCAP recursively found under an episode directory."""
     root_path = Path(root)
     if not root_path.is_dir():
@@ -524,6 +936,7 @@ def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"目录及子目录下未找到 .mcap 文件: {root_path}")
 
     config_path = Path(__file__).resolve().parent.parent / "Robot_Configuration" / "robot_config.yaml"
+    audit_config = load_audit_config(audit_config_path)
     camera_labels, configured_topics, camera_names = load_robot_camera_config(config_path)
 
     files = []
@@ -535,13 +948,27 @@ def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
                     root_path,
                     camera_labels,
                     configured_topics,
+                    audit_config,
                 )
             )
         except Exception as exc:
+            error_text = f"MCAP 完整遍历失败: {type(exc).__name__}: {exc}"
             files.append(
                 {
                     "file": str(mcap_path),
-                    "errors": [f"MCAP 完整遍历失败: {type(exc).__name__}: {exc}"],
+                    "errors": [error_text],
+                    "anomalies": [
+                        {
+                            "file": str(mcap_path),
+                            "topic": "",
+                            "message_index": "",
+                            "event_index": "",
+                            "timestamp_ns": "",
+                            "anomaly_type": "文件解析失败",
+                            "actual_value": error_text,
+                            "threshold": "文件应能完整读取",
+                        }
+                    ],
                     "is_valid": False,
                 }
             )
@@ -568,15 +995,17 @@ def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
                 }
             )
 
-    return {
+    result = {
         "root": str(root_path),
         "robot_config": str(config_path),
+        "audit_config": audit_config["config_path"],
         "configured_camera_names": camera_names,
         "camera_fps_expectation": {
-            "target_fps": EXPECTED_CAMERA_FPS,
-            "tolerance_fps": CAMERA_FPS_TOLERANCE,
-            "accepted_range_fps": [MIN_CAMERA_FPS, MAX_CAMERA_FPS],
-            "maximum_interval_ms": MAX_CAMERA_INTERVAL_NS / 1_000_000,
+            "target_fps": audit_config["camera_fps_target"],
+            "tolerance_fps": audit_config["camera_fps_tolerance"],
+            "accepted_range_fps": [audit_config["camera_fps_min"], audit_config["camera_fps_max"]],
+            "maximum_interval_ms": audit_config["max_frame_interval_ms"],
+            "window_seconds": audit_config["window_seconds"],
         },
         "file_count": len(files),
         "valid_file_count": sum(file["is_valid"] for file in files),
@@ -584,6 +1013,262 @@ def audit_mcap_directory(root: str | Path) -> dict[str, Any]:
         "files": files,
         "is_valid": all(file["is_valid"] for file in files),
     }
+    _add_cross_camera_coverage(result)
+    _add_episode_trends(result)
+    selected_report_dir = Path(report_dir) if report_dir else DEFAULT_REPORT_DIR
+    result["report_files"] = write_mcap_csv_reports(result, selected_report_dir)
+    return result
+
+
+def _add_cross_camera_coverage(result: dict[str, Any]) -> None:
+    for file_result in result["files"]:
+        coverage = file_result.get("camera_coverage", {})
+        spans = [
+            value
+            for value in coverage.values()
+            if value.get("first_ns") is not None and value.get("last_ns") is not None
+        ]
+        if not spans:
+            file_result["four_camera_coverage"] = None
+            continue
+        common_start = max(item["first_ns"] for item in spans)
+        common_end = min(item["last_ns"] for item in spans)
+        file_result["four_camera_coverage"] = {
+            "common_start_ns": common_start,
+            "common_end_ns": common_end,
+            "common_duration_ns": max(0, common_end - common_start),
+            "first_frame_spread_ns": max(item["first_ns"] for item in spans)
+            - min(item["first_ns"] for item in spans),
+            "last_frame_spread_ns": max(item["last_ns"] for item in spans)
+            - min(item["last_ns"] for item in spans),
+            "per_camera": coverage,
+        }
+
+
+def _add_episode_trends(result: dict[str, Any]) -> None:
+    trends = {}
+    ordered_files = sorted(
+        result["files"],
+        key=lambda item: (
+            item.get("episode") is None,
+            item.get("episode") if item.get("episode") is not None else item.get("file", ""),
+        ),
+    )
+    all_topics = sorted(
+        {
+            topic
+            for file_result in ordered_files
+            for topic in file_result.get("camera_topics", [])
+        }
+    )
+    for topic_name in all_topics:
+        rows = []
+        for file_result in ordered_files:
+            camera = file_result.get("topics", {}).get(topic_name)
+            if camera is None:
+                continue
+            timing = camera["log_time"]
+            rows.append(
+                {
+                    "episode": file_result.get("episode"),
+                    "file": file_result["file"],
+                    "fps": timing["observed_rate_hz"],
+                    "max_interval_ns": timing["interval_max_ns"],
+                    "decode_failures": camera.get("image_decode_failures", 0),
+                }
+            )
+            file_result.setdefault("within_episode_trends", {})[topic_name] = {
+                "fps_direction": _direction(
+                    [window["observed_rate_hz"] for window in camera.get("sixty_second_trend", [])]
+                ),
+                "max_interval_direction": _direction(
+                    [window["interval_max_ns"] for window in camera.get("sixty_second_trend", [])]
+                ),
+            }
+        trends[topic_name] = {
+            "episodes": rows,
+            "fps_direction": _direction([row["fps"] for row in rows]),
+            "max_interval_direction": _direction(
+                [row["max_interval_ns"] for row in rows]
+            ),
+            "interpretation": "描述性趋势，轮次动作/环境不同，不能单独归因于版本变化",
+        }
+    result["episode_trends"] = trends
+
+
+def _direction(values: list[float | int | None]) -> str:
+    usable = [value for value in values if value is not None]
+    if len(usable) < 2:
+        return "样本不足"
+    if all(right >= left for left, right in zip(usable, usable[1:])) and any(
+        right > left for left, right in zip(usable, usable[1:])
+    ):
+        return "逐轮上升"
+    if all(right <= left for left, right in zip(usable, usable[1:])) and any(
+        right < left for left, right in zip(usable, usable[1:])
+    ):
+        return "逐轮下降"
+    return "无单向趋势"
+
+
+def write_mcap_csv_reports(
+    result: dict[str, Any],
+    output_dir: str | Path,
+) -> dict[str, str]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    summary_path = output_path / "summary.csv"
+    window_path = output_path / "window_summary.csv"
+    anomalies_path = output_path / "anomalies.csv"
+
+    summary_fields = [
+        "episode", "file", "topic", "role", "message_count", "fps",
+        "duration_seconds", "first_header_ns", "last_header_ns",
+        "p50_interval_ms", "p95_interval_ms", "p99_interval_ms",
+        "max_interval_ms", "over_threshold_gap_count", "estimated_dropped_frames",
+        "resolution_counts", "decode_failures", "timestamp_reversals",
+        "timestamp_duplicates", "header_log_offset_p50_ms", "header_log_offset_p95_ms",
+        "common_coverage_seconds", "first_frame_spread_ms", "last_frame_spread_ms",
+        "sequence_check_available", "status",
+    ]
+    window_fields = [
+        "episode", "file", "topic", "role", "window_start_seconds",
+        "window_end_seconds", "message_count", "fps", "p50_interval_ms",
+        "p95_interval_ms", "p99_interval_ms", "max_interval_ms",
+        "over_threshold_gap_count", "estimated_dropped_frames",
+        "decode_failures", "timestamp_reversals", "timestamp_duplicates",
+        "invalid_log_time_count", "invalid_header_stamp_count",
+        "record_delay_p50_ms", "record_delay_p95_ms", "record_delay_max_ms",
+        "four_camera_skew_p95_ms", "four_camera_skew_max_ms",
+    ]
+    anomaly_fields = [
+        "file", "episode", "topic", "message_index", "event_index",
+        "timestamp_ns", "anomaly_type", "actual_value", "threshold",
+    ]
+
+    with summary_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=summary_fields)
+        writer.writeheader()
+        for file_result in result["files"]:
+            for topic in file_result.get("camera_topics", []):
+                camera = file_result["topics"][topic]
+                timing = camera["log_time"]
+                header = camera["header_stamp"]
+                header_log_offsets = camera.get("header_log_offsets_ns", [])
+                writer.writerow(
+                    {
+                        "episode": file_result.get("episode"),
+                        "file": file_result["file"],
+                        "topic": topic,
+                        "role": camera.get("role"),
+                        "message_count": camera["message_count"],
+                        "fps": timing["observed_rate_hz"],
+                        "duration_seconds": (
+                            (timing["maximum_ns"] - timing["minimum_ns"]) / 1e9
+                            if timing["minimum_ns"] is not None
+                            else None
+                        ),
+                        "first_header_ns": header["first_ns"],
+                        "last_header_ns": header["last_ns"],
+                        "p50_interval_ms": _ms(timing["interval_p50_ns"]),
+                        "p95_interval_ms": _ms(timing["interval_p95_ns"]),
+                        "p99_interval_ms": _ms(timing["interval_p99_ns"]),
+                        "max_interval_ms": _ms(timing["interval_max_ns"]),
+                        "over_threshold_gap_count": sum(
+                            1 for item in file_result.get("anomalies", [])
+                            if item["topic"] == topic and item["anomaly_type"] == "帧间隔超阈值（疑似丢帧）"
+                        ),
+                        "estimated_dropped_frames": sum(
+                            item["actual_value"].get("estimated_missing_frames") or 0
+                            for item in file_result.get("anomalies", [])
+                            if item["topic"] == topic and isinstance(item["actual_value"], dict)
+                        ),
+                        "resolution_counts": json.dumps(camera["image_dimensions"], ensure_ascii=False),
+                        "decode_failures": camera["image_decode_failures"],
+                        "timestamp_reversals": timing["out_of_order_count"],
+                        "timestamp_duplicates": timing["duplicate_count"],
+                        "header_log_offset_p50_ms": _ms(_percentile(header_log_offsets, 0.5)),
+                        "header_log_offset_p95_ms": _ms(_percentile(header_log_offsets, 0.95)),
+                        "common_coverage_seconds": (
+                            file_result.get("four_camera_coverage", {}).get("common_duration_ns", 0) / 1e9
+                            if file_result.get("four_camera_coverage")
+                            else None
+                        ),
+                        "first_frame_spread_ms": _ms(
+                            file_result.get("four_camera_coverage", {}).get("first_frame_spread_ns")
+                        ),
+                        "last_frame_spread_ms": _ms(
+                            file_result.get("four_camera_coverage", {}).get("last_frame_spread_ns")
+                        ),
+                        "sequence_check_available": file_result.get("sequence_check_available", False),
+                        "status": "PASS" if file_result["is_valid"] else "FAIL",
+                    }
+                )
+
+    with window_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=window_fields)
+        writer.writeheader()
+        for file_result in result["files"]:
+            for topic in file_result.get("camera_topics", []):
+                camera = file_result["topics"][topic]
+                for window in camera["sixty_second_trend"]:
+                    matching_skew = next(
+                        (
+                            item
+                            for item in file_result.get("four_camera_skew_windows", [])
+                            if item["start_offset_seconds"] == window["start_offset_seconds"]
+                        ),
+                        None,
+                    )
+                    writer.writerow(
+                        {
+                            "episode": file_result.get("episode"),
+                            "file": file_result["file"],
+                            "topic": topic,
+                            "role": camera.get("role"),
+                            "window_start_seconds": window["start_offset_seconds"],
+                            "window_end_seconds": window["end_offset_seconds"],
+                            "message_count": window["message_count"],
+                            "fps": window["observed_rate_hz"],
+                            "p50_interval_ms": _ms(window["interval_p50_ns"]),
+                            "p95_interval_ms": _ms(window["interval_p95_ns"]),
+                            "p99_interval_ms": _ms(window["interval_p99_ns"]),
+                            "max_interval_ms": _ms(window["interval_max_ns"]),
+                            "over_threshold_gap_count": window["over_threshold_gap_count"],
+                            "estimated_dropped_frames": window["estimated_dropped_frames"],
+                            "decode_failures": window["image_decode_failures"],
+                            "timestamp_reversals": window["timestamp_reversal_count"],
+                            "timestamp_duplicates": window["timestamp_duplicate_count"],
+                            "invalid_log_time_count": window["invalid_log_time_count"],
+                            "invalid_header_stamp_count": window["invalid_header_stamp_count"],
+                            "record_delay_p50_ms": _ms(window["record_delay_p50_ns"]),
+                            "record_delay_p95_ms": _ms(window["record_delay_p95_ns"]),
+                            "record_delay_max_ms": _ms(window["record_delay_max_ns"]),
+                            "four_camera_skew_p95_ms": (
+                                _ms(matching_skew["p95_ns"]) if matching_skew else None
+                            ),
+                            "four_camera_skew_max_ms": (
+                                _ms(matching_skew["maximum_ns"]) if matching_skew else None
+                            ),
+                        }
+                    )
+
+    with anomalies_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=anomaly_fields)
+        writer.writeheader()
+        for file_result in result["files"]:
+            for anomaly in file_result.get("anomalies", []):
+                writer.writerow({"episode": file_result.get("episode"), **anomaly})
+
+    return {
+        "summary_csv": str(summary_path),
+        "window_summary_csv": str(window_path),
+        "anomalies_csv": str(anomalies_path),
+    }
+
+
+def _ms(value: int | float | None) -> float | None:
+    return value / 1_000_000 if value is not None else None
 
 
 def render_mcap_report(result: dict[str, Any]) -> str:
@@ -594,6 +1279,7 @@ def render_mcap_report(result: dict[str, Any]) -> str:
         f"原始 MCAP 稳定性审计：{status}",
         f"数据目录：{result['root']}",
         f"机器人配置：{result['robot_config']}",
+        f"审计阈值配置：{result.get('audit_config', '未记录')}",
         (
             f"判定标准：目标 {expectation['target_fps']:.0f} FPS，允许 "
             f"{expectation['accepted_range_fps'][0]:.0f}-"
@@ -658,6 +1344,34 @@ def render_mcap_report(result: dict[str, Any]) -> str:
                 f"P95 {relationship['p95_ns'] / 1_000_000:.3f} ms, "
                 f"最大 {relationship['maximum_ns'] / 1_000_000:.3f} ms"
             )
+        skew_windows = file_result.get("four_camera_skew_windows", [])
+        if skew_windows:
+            lines.append(
+                "四路时间差窗口 P95："
+                + "; ".join(
+                    f"{window['start_offset_seconds']:.0f}-"
+                    f"{window['end_offset_seconds']:.0f}s "
+                    f"{window['p95_ns'] / 1_000_000:.3f} ms"
+                    for window in skew_windows
+                )
+            )
+        coverage = file_result.get("four_camera_coverage")
+        if coverage:
+            lines.append(
+                "四路共同有效覆盖："
+                f"{coverage['common_duration_ns'] / 1e9:.3f}s；"
+                f"首帧跨度 {coverage['first_frame_spread_ns'] / 1e6:.3f} ms，"
+                f"末帧跨度 {coverage['last_frame_spread_ns'] / 1e6:.3f} ms"
+            )
+        delay = file_result.get("capture_record_delay")
+        if delay:
+            lines.append(
+                "header.stamp 到 log_time 差值（"
+                f"{file_result.get('capture_record_delay_interpretation', '诊断')}）："
+                f"P50 {_ms(delay['p50_ns']):.3f} ms，P95 {_ms(delay['p95_ns']):.3f} ms，"
+                f"最大 {_ms(delay['maximum_ns']):.3f} ms"
+            )
+        lines.append(file_result.get("sequence_check_note", "序列号检查未配置"))
 
         window_rows = []
         for topic in file_result.get("camera_topics", []):
@@ -671,8 +1385,18 @@ def render_mcap_report(result: dict[str, Any]) -> str:
                     f"{window['end_offset_seconds']:.0f}s {rate_text}"
                 )
         if window_rows:
-            lines.append("60 秒窗口帧率：" + "; ".join(window_rows))
-
+            window_seconds = expectation.get("window_seconds", 60)
+            lines.append(f"{window_seconds} 秒窗口帧率：" + "; ".join(window_rows))
+        within_trends = file_result.get("within_episode_trends", {})
+        if within_trends:
+            lines.append(
+                "本轮窗口趋势："
+                + "; ".join(
+                    f"{file_result['topics'][topic].get('role') or topic} "
+                    f"FPS {trend['fps_direction']}，最大间隔 {trend['max_interval_direction']}"
+                    for topic, trend in within_trends.items()
+                )
+            )
         errors = file_result.get("errors", [])
         warnings = file_result.get("warnings", [])
         if errors:
@@ -682,4 +1406,41 @@ def render_mcap_report(result: dict[str, Any]) -> str:
             lines.append("数据提示（不计入相机审计失败）：")
             lines.extend(f"  - {warning}" for warning in warnings)
 
+    if result.get("episode_trends"):
+        lines.extend(["", "连续多轮趋势（描述性，不单独判失败）："])
+        for topic, trend in result["episode_trends"].items():
+            lines.append(
+                f"{topic}: FPS {trend['fps_direction']}，"
+                f"最大间隔 {trend['max_interval_direction']}"
+            )
+
+    if result.get("report_files"):
+        lines.extend(
+            [
+                "",
+                "CSV 报告：",
+                f"  汇总：{result['report_files']['summary_csv']}",
+                f"  分窗口：{result['report_files']['window_summary_csv']}",
+                f"  异常明细：{result['report_files']['anomalies_csv']}",
+            ]
+        )
     return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="审计机器人原始 MCAP 相机数据")
+    parser.add_argument("--input-dir", required=True, help="包含 episode 子目录的 MCAP 根目录")
+    parser.add_argument(
+        "--audit-config",
+        default=str(DEFAULT_AUDIT_CONFIG),
+        help="独立 MCAP 审计 JSON 配置路径",
+    )
+    parser.add_argument("--output-dir", help="CSV 输出目录，默认写入项目 report/mcap_audit")
+    args = parser.parse_args(argv)
+    result = audit_mcap_directory(args.input_dir, args.audit_config, args.output_dir)
+    print(render_mcap_report(result))
+    return 0 if result["is_valid"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

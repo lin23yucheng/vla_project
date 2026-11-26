@@ -6,8 +6,7 @@ from pathlib import Path
 
 import allure
 
-from common.mcap_stability import audit_mcap_directory
-from common.mcap_stability import render_mcap_report
+from common.mcap_stability import audit_mcap_directory, render_mcap_report
 
 
 DEFAULT_MCAP_ROOT = Path(r"C:\Users\admin\Desktop\mcap文件")
@@ -15,7 +14,8 @@ DEFAULT_MCAP_ROOT = Path(r"C:\Users\admin\Desktop\mcap文件")
 
 def test_raw_mcap_stability():
     mcap_root = Path(os.environ.get("VLA_MCAP_ROOT", str(DEFAULT_MCAP_ROOT)))
-    result = audit_mcap_directory(mcap_root)
+    report_root = os.environ.get("VLA_MCAP_REPORT_DIR")
+    result = audit_mcap_directory(mcap_root, report_dir=report_root)
     summary_report = render_mcap_report(result)
     raw_report = json.dumps(result, ensure_ascii=False, indent=2)
     allure.attach(

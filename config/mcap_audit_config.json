@@ -1,0 +1,10 @@
+{
+  "camera_fps_target": 30,
+  "camera_fps_tolerance": 5,
+  "window_seconds": 60,
+  "max_frame_interval_ms": 40,
+  "estimate_dropped_frames": true,
+  "header_and_log_share_clock": false,
+  "max_cross_camera_skew_ms": null,
+  "max_capture_record_delay_ms": null
+}
