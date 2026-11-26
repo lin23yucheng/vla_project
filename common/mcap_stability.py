@@ -509,11 +509,7 @@ def _ensure_failures_have_anomalies(
     camera_topics: list[str],
 ) -> None:
     for error in errors:
-        if any(
-            anomaly["anomaly_type"] in error
-            and str(anomaly["actual_value"]) in error
-            for anomaly in anomalies
-        ):
+        if any(_anomaly_explains_error(anomaly, error) for anomaly in anomalies):
             continue
         topic = next((name for name in camera_topics if name in error), "")
         anomalies.append(
@@ -528,6 +524,18 @@ def _ensure_failures_have_anomalies(
                 "MCAP、metadata 与机器人相机配置一致",
             )
         )
+
+
+def _anomaly_explains_error(anomaly: dict[str, Any], error: str) -> bool:
+    anomaly_type = anomaly["anomaly_type"]
+    if anomaly_type in error:
+        return True
+    equivalent_error_phrases = {
+        "整段帧率超范围": "整段观测帧率",
+        "窗口帧率超范围": "窗口帧率",
+    }
+    phrase = equivalent_error_phrases.get(anomaly_type)
+    return phrase is not None and phrase in error
 
 
 def load_robot_camera_config(config_path: str | Path) -> tuple[dict[str, str], list[str], list[str]]:

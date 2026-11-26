@@ -294,3 +294,52 @@ def test_structural_failures_are_written_to_anomalies_csv(tmp_path):
     assert len(rows) == len(errors)
     assert all(row["anomaly_type"] == "结构性校验失败" for row in rows)
     assert all(row["file"] == "capture.mcap" for row in rows)
+
+
+def test_frame_rate_errors_do_not_duplicate_existing_anomaly_rows(tmp_path):
+    topic = "/cam_head/color_compressed"
+    anomalies = [
+        {
+            "file": "capture.mcap",
+            "topic": topic,
+            "message_index": 0,
+            "event_index": 0,
+            "timestamp_ns": 1_000_000_000,
+            "anomaly_type": "整段帧率超范围",
+            "actual_value": 20.0,
+            "threshold": [25.0, 35.0],
+        },
+        {
+            "file": "capture.mcap",
+            "topic": topic,
+            "message_index": 0,
+            "event_index": 0,
+            "timestamp_ns": None,
+            "anomaly_type": "窗口帧率超范围",
+            "actual_value": {"window_start_seconds": 0, "fps": 20.0},
+            "threshold": [25.0, 35.0],
+        },
+    ]
+    errors = [
+        f"相机 topic={topic} 整段观测帧率 20.000 FPS，超出允许范围 25-35 FPS",
+        f"相机 topic={topic} 在 0-60s 窗口帧率 20.000 FPS 超出范围",
+    ]
+
+    _ensure_failures_have_anomalies(Path("capture.mcap"), errors, anomalies, [topic])
+    paths = write_mcap_csv_reports(
+        {
+            "files": [
+                {
+                    "file": "capture.mcap",
+                    "episode": 3,
+                    "anomalies": anomalies,
+                    "camera_topics": [],
+                }
+            ]
+        },
+        tmp_path,
+    )
+
+    with Path(paths["anomalies_csv"]).open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert [row["anomaly_type"] for row in rows] == ["整段帧率超范围", "窗口帧率超范围"]
